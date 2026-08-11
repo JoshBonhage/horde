@@ -1,0 +1,356 @@
+//! Blitting a pane's row cache into the ratatui buffer, plus its border and title.
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect as TRect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Widget};
+use unicode_width::UnicodeWidthChar;
+
+use super::{color, rstyle};
+use crate::proto::{attrs, AgentState, PaneInfo, Row};
+use crate::theme::Theme;
+
+/// Draws one pane's cells. `rows` is the client's cache for that pane.
+pub struct PaneView<'a> {
+    pub rows: &'a [Row],
+    pub theme: &'a Theme,
+}
+
+impl Widget for PaneView<'_> {
+    fn render(self, area: TRect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // Paint the pane background first so short rows do not show the page through.
+        let bg = Style::default().bg(color(self.theme.bg));
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) {
+                    cell.set_symbol(" ");
+                    cell.set_style(bg);
+                }
+            }
+        }
+
+        for (y, row) in self.rows.iter().enumerate().take(area.height as usize) {
+            let mut x: u16 = 0;
+            let py = area.y + y as u16;
+
+            for run in &row.runs {
+                let style = rstyle(run.fg, run.bg, run.attrs);
+                for ch in run.text.chars() {
+                    let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+
+                    // Zero-width marks (combining accents, variation selectors, skin-tone
+                    // modifiers) belong to the cell before them, not a cell of their own.
+                    if w == 0 {
+                        if x > 0 {
+                            if let Some(prev) = buf.cell_mut((area.x + x - 1, py)) {
+                                let mut s = prev.symbol().to_string();
+                                s.push(ch);
+                                prev.set_symbol(&s);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if x >= area.width {
+                        break;
+                    }
+                    if let Some(cell) = buf.cell_mut((area.x + x, py)) {
+                        cell.set_char(ch);
+                        cell.set_style(style);
+                    }
+                    // A double-width glyph owns the following cell; blanking it stops
+                    // ratatui writing a stray character into the right half.
+                    if w == 2 {
+                        if x + 1 < area.width {
+                            if let Some(next) = buf.cell_mut((area.x + x + 1, py)) {
+                                next.set_symbol("");
+                                next.set_style(style);
+                            }
+                        } else {
+                            // No room for the second half; leave the cell blank rather
+                            // than let the glyph spill past the pane edge.
+                            if let Some(cell) = buf.cell_mut((area.x + x, py)) {
+                                cell.set_symbol(" ");
+                            }
+                        }
+                    }
+                    x += w as u16;
+                }
+                if x >= area.width {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Spinner frames for a working agent. Braille cycles smoothly and reads as motion even at
+/// a low refresh rate.
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+pub fn spinner_frame(tick: usize) -> &'static str {
+    SPINNER[tick % SPINNER.len()]
+}
+
+/// Border and inline title for a pane.
+///
+/// The title lives in the top border rather than on its own row, which buys back a line of
+/// terminal for every pane on screen.
+pub fn pane_frame(
+    pane: &PaneInfo,
+    focused: bool,
+    zoomed: bool,
+    theme: &Theme,
+    tick: usize,
+    animate: bool,
+) -> Block<'static> {
+    let border_color = if focused { theme.ui.border_focus } else { theme.ui.border };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    spans.push(Span::styled(" ", Style::default().fg(color(border_color))));
+
+    // State glyph, coloured by state. A working agent animates so motion, not just colour,
+    // distinguishes it — useful when several panes are busy.
+    if let Some(agent) = &pane.agent {
+        let (glyph, c) = match agent.state {
+            AgentState::Working => (
+                if animate { spinner_frame(tick) } else { agent.state.glyph() },
+                theme.ui.working,
+            ),
+            AgentState::Blocked => (agent.state.glyph(), theme.ui.blocked),
+            AgentState::Done => (agent.state.glyph(), theme.ui.done),
+            AgentState::Idle => (agent.state.glyph(), theme.ui.idle),
+            AgentState::Unknown => (agent.state.glyph(), theme.ui.unknown),
+        };
+        spans.push(Span::styled(glyph.to_string(), Style::default().fg(color(c))));
+        spans.push(Span::raw(" "));
+    }
+
+    let title_style = if focused {
+        Style::default().fg(color(theme.ui.text)).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color(theme.ui.text_dim))
+    };
+    spans.push(Span::styled(pane.title.clone(), title_style));
+
+    if let Some(agent) = &pane.agent {
+        let detail = match agent.state {
+            // Elapsed time matters while working; otherwise the label is more informative.
+            AgentState::Working => format!(" {}", fmt_elapsed(agent.elapsed)),
+            AgentState::Blocked => " needs you".to_string(),
+            _ => format!(" {}", agent.state.label()),
+        };
+        let c = match agent.state {
+            AgentState::Working => theme.ui.working,
+            AgentState::Blocked => theme.ui.blocked,
+            AgentState::Done => theme.ui.done,
+            _ => theme.ui.text_faint,
+        };
+        spans.push(Span::styled(detail, Style::default().fg(color(c))));
+    }
+
+    if pane.exited {
+        spans.push(Span::styled(
+            " exited".to_string(),
+            Style::default().fg(color(theme.ui.text_faint)),
+        ));
+    }
+    if pane.scroll_offset > 0 {
+        spans.push(Span::styled(
+            format!(" ↑{}", pane.scroll_offset),
+            Style::default().fg(color(theme.ui.accent_alt)),
+        ));
+    }
+    if zoomed {
+        spans.push(Span::styled(" zoom".to_string(), Style::default().fg(color(theme.ui.accent))));
+    }
+
+    spans.push(Span::styled(" ", Style::default().fg(color(border_color))));
+
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color(border_color)).bg(color(theme.ui.bg)))
+        .title(Line::from(spans))
+}
+
+/// `45s`, `2m18s`, `1h04m`.
+pub fn fmt_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// True when a style has a given attribute bit. Kept here so the attribute bit layout has
+/// one reader.
+pub fn has_attr(a: u8, bit: u8) -> bool {
+    a & bit != 0
+}
+
+pub fn modifiers(a: u8) -> Modifier {
+    let mut m = Modifier::empty();
+    if has_attr(a, attrs::BOLD) {
+        m |= Modifier::BOLD;
+    }
+    if has_attr(a, attrs::DIM) {
+        m |= Modifier::DIM;
+    }
+    if has_attr(a, attrs::ITALIC) {
+        m |= Modifier::ITALIC;
+    }
+    if has_attr(a, attrs::UNDERLINE) {
+        m |= Modifier::UNDERLINED;
+    }
+    if has_attr(a, attrs::STRIKEOUT) {
+        m |= Modifier::CROSSED_OUT;
+    }
+    if has_attr(a, attrs::HIDDEN) {
+        m |= Modifier::HIDDEN;
+    }
+    m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{Rgb, Run};
+
+    fn row(text: &str) -> Row {
+        Row {
+            runs: vec![Run {
+                text: text.to_string(),
+                fg: Rgb::new(255, 255, 255),
+                bg: Rgb::new(0, 0, 0),
+                attrs: 0,
+            }],
+        }
+    }
+
+    fn render(rows: &[Row], w: u16, h: u16) -> Buffer {
+        let area = TRect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::horde();
+        PaneView { rows, theme: &theme }.render(area, &mut buf);
+        buf
+    }
+
+    fn line_of(buf: &Buffer, y: u16, w: u16) -> String {
+        (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect()
+    }
+
+    #[test]
+    fn renders_plain_ascii() {
+        let buf = render(&[row("hello")], 10, 1);
+        assert_eq!(line_of(&buf, 0, 10), "hello     ");
+    }
+
+    #[test]
+    fn wide_characters_occupy_two_cells() {
+        // CJK is double width; the second cell must be blanked, not filled with the glyph.
+        let buf = render(&[row("日本")], 6, 1);
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "日");
+        assert_eq!(buf.cell((1, 0)).unwrap().symbol(), "");
+        assert_eq!(buf.cell((2, 0)).unwrap().symbol(), "本");
+        assert_eq!(buf.cell((3, 0)).unwrap().symbol(), "");
+    }
+
+    #[test]
+    fn combining_marks_attach_to_the_preceding_cell() {
+        // A true zero-width mark (combining acute) must not consume a cell of its own.
+        let buf = render(&[row("e\u{0301}x")], 6, 1);
+        let first = buf.cell((0, 0)).unwrap().symbol();
+        assert_eq!(first, "e\u{0301}", "the accent should join its base letter");
+        assert_eq!(buf.cell((1, 0)).unwrap().symbol(), "x");
+    }
+
+    #[test]
+    fn emoji_with_a_modifier_occupies_whatever_the_emulator_assigned() {
+        // `unicode-width` reports skin-tone modifiers (U+1F3FB..U+1F3FF) as width 2 rather
+        // than zero, so 👍🏽 spans four columns rather than two. That looks wrong in
+        // isolation, but the mirror deliberately reproduces exactly what the emulator laid
+        // out — diverging here would put the rendered cursor in the wrong column.
+        //
+        // The invariants that actually matter are: no panic, and no overflow.
+        let buf = render(&[row("👍🏽x")], 8, 1);
+        let rendered: String = (0..8).map(|x| buf.cell((x, 0)).unwrap().symbol()).collect();
+        assert!(rendered.contains('👍'));
+        assert!(rendered.contains('x'));
+        assert_eq!(
+            (0..8).filter(|&x| buf.cell((x, 0)).unwrap().symbol() == "").count(),
+            2,
+            "each double-width glyph should blank exactly one trailing cell"
+        );
+    }
+
+    #[test]
+    fn content_is_clipped_to_the_area() {
+        let buf = render(&[row("abcdefghij")], 4, 1);
+        assert_eq!(line_of(&buf, 0, 4), "abcd");
+    }
+
+    #[test]
+    fn a_wide_char_straddling_the_edge_is_blanked_not_spilled() {
+        // Only one column left, but the glyph needs two.
+        let buf = render(&[row("a日")], 2, 1);
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "a");
+        assert_eq!(buf.cell((1, 0)).unwrap().symbol(), " ", "half a glyph must not render");
+    }
+
+    #[test]
+    fn rows_beyond_the_area_are_ignored() {
+        let buf = render(&[row("one"), row("two"), row("three")], 5, 2);
+        assert_eq!(line_of(&buf, 0, 5), "one  ");
+        assert_eq!(line_of(&buf, 1, 5), "two  ");
+    }
+
+    #[test]
+    fn short_rows_are_padded_with_the_theme_background() {
+        let buf = render(&[row("hi")], 5, 1);
+        let cell = buf.cell((4, 0)).unwrap();
+        assert_eq!(cell.symbol(), " ");
+        assert_eq!(cell.style().bg, Some(color(Theme::horde().bg)));
+    }
+
+    #[test]
+    fn zero_size_area_is_a_noop() {
+        let area = TRect::new(0, 0, 0, 0);
+        let mut buf = Buffer::empty(TRect::new(0, 0, 4, 1));
+        let theme = Theme::horde();
+        PaneView { rows: &[row("x")], theme: &theme }.render(area, &mut buf);
+        assert_eq!(line_of(&buf, 0, 4), "    ");
+    }
+
+    #[test]
+    fn elapsed_formats_across_magnitudes() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(45), "45s");
+        assert_eq!(fmt_elapsed(60), "1m00s");
+        assert_eq!(fmt_elapsed(138), "2m18s");
+        assert_eq!(fmt_elapsed(3600), "1h00m");
+        assert_eq!(fmt_elapsed(3900), "1h05m");
+    }
+
+    #[test]
+    fn spinner_cycles_without_panicking_on_large_ticks() {
+        assert_eq!(spinner_frame(0), SPINNER[0]);
+        assert_eq!(spinner_frame(SPINNER.len()), SPINNER[0]);
+        assert_eq!(spinner_frame(usize::MAX), SPINNER[usize::MAX % SPINNER.len()]);
+    }
+
+    #[test]
+    fn attribute_bits_map_to_modifiers() {
+        assert!(modifiers(attrs::BOLD).contains(Modifier::BOLD));
+        assert!(modifiers(attrs::UNDERLINE).contains(Modifier::UNDERLINED));
+        let both = modifiers(attrs::BOLD | attrs::ITALIC);
+        assert!(both.contains(Modifier::BOLD) && both.contains(Modifier::ITALIC));
+        assert!(modifiers(0).is_empty());
+    }
+}

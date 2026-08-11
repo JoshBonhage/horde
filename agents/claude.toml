@@ -1,0 +1,63 @@
+# Claude Code screen manifest.
+#
+# This is the FALLBACK tier. Run `horde integration install claude` to wire up lifecycle
+# hooks, which report state authoritatively and make everything below unnecessary.
+#
+# Patterns are single-quoted TOML literals so regex backslashes need no escaping.
+# Matching is case-insensitive and `^`/`$` bind to line boundaries.
+#
+# Patterns marked VERIFIED were read off a live Claude Code 2.1.227 session. The rest are
+# inferred; use `horde agent explain <pane>` to see the snapshot and the rule that fired.
+#
+# Rule order is load-bearing. The `❯` input caret stays on screen *while Claude is
+# working*, so an idle rule matching the caret would win over the working rule if it came
+# first. Blocked is checked before both, because a permission menu also renders a caret.
+
+name = "claude"
+
+# `claude` on disk is often a symlink to a versioned binary, so the process name alone is
+# not dependable — the `detect` patterns carry most of the weight.
+processes = ["claude"]
+
+detect = [
+  'esc to interrupt',          # VERIFIED
+  'shift\+tab to cycle',       # VERIFIED
+  '⏵⏵',                        # VERIFIED (mode indicator)
+  'Claude Code',
+  '\? for shortcuts',
+]
+
+# Blocked is deliberately strict: only a visible approval, question, or permission UI
+# counts. Silence is never treated as blocked.
+#
+# `❯\s*\d+\.` matches a numbered selection menu, which is distinct from the bare `❯` input
+# caret — matching the bare caret here would mark every idle pane as blocked.
+[[rules]]
+name = "blocked-permission"
+state = "blocked"
+any = [
+  'Do you want to (proceed|continue|make this edit|create|run)',
+  'Do you trust the files',
+  'Would you like to proceed',
+  '❯\s*\d+\.\s',
+  'No, and tell Claude',
+]
+
+# VERIFIED: `esc to interrupt` is appended to the mode line while a turn is running and
+# removed the moment it finishes.
+[[rules]]
+name = "working-esc-to-interrupt"
+state = "working"
+any = ['esc to interrupt']
+
+# VERIFIED: at rest the composer is a bare `❯` line framed by horizontal rules, with the
+# mode line beneath it.
+[[rules]]
+name = "idle-prompt"
+state = "idle"
+any = [
+  '^❯',
+  'shift\+tab to cycle',
+  '(auto mode|accept edits|plan mode) on',
+  '\? for shortcuts',
+]

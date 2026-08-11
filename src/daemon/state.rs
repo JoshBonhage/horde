@@ -1,0 +1,822 @@
+//! Session model: spaces own tabs, tabs own panes, panes tile inside a tab's layout.
+//!
+//! This module also owns all screen geometry. The client is a renderer that draws where it
+//! is told, which keeps one source of truth for where a pane lives and means PTY sizes and
+//! drawn rects can never disagree.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Result};
+
+use super::layout::Layout;
+use super::pane::Pane;
+use crate::config::Config;
+use crate::proto::{
+    Dir, PaneId, PaneInfo, Rect, SpaceId, SpaceInfo, Snapshot, TabId, TabInfo, ViewState,
+    PROTOCOL_VERSION,
+};
+
+/// Fallback geometry while nothing is attached, so panes still hold a workable size.
+const DETACHED_COLS: u16 = 120;
+const DETACHED_ROWS: u16 = 40;
+
+pub struct Space {
+    pub id: SpaceId,
+    pub name: String,
+    pub cwd: PathBuf,
+    pub tabs: Vec<TabId>,
+    pub focused_tab: Option<TabId>,
+}
+
+pub struct Tab {
+    pub id: TabId,
+    pub space: SpaceId,
+    pub name: String,
+    pub layout: Layout,
+    pub focused_pane: Option<PaneId>,
+}
+
+/// Where each region of the screen sits. Computed once per relayout.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Chrome {
+    pub tabbar: Rect,
+    pub sidebar: Rect,
+    pub bus: Rect,
+    pub status: Rect,
+    /// Region the pane tree tiles into.
+    pub panes: Rect,
+}
+
+pub struct Session {
+    pub spaces: Vec<Space>,
+    pub tabs: Vec<Tab>,
+    pub panes: HashMap<PaneId, Pane>,
+    pub focused_space: Option<SpaceId>,
+    pub view: ViewState,
+    pub chrome: Chrome,
+    /// Last size reported by a client; retained while detached.
+    pub client_cols: u16,
+    pub client_rows: u16,
+
+    next_space: SpaceId,
+    next_tab: TabId,
+    next_pane: PaneId,
+}
+
+impl Session {
+    pub fn new(cfg: &Config) -> Session {
+        Session {
+            spaces: Vec::new(),
+            tabs: Vec::new(),
+            panes: HashMap::new(),
+            focused_space: None,
+            view: ViewState {
+                sidebar_open: cfg.sidebar,
+                bus_open: cfg.bus,
+                sidebar_width: cfg.sidebar_width,
+                bus_width: cfg.bus_width,
+                zoom: None,
+            },
+            chrome: Chrome::default(),
+            client_cols: DETACHED_COLS,
+            client_rows: DETACHED_ROWS,
+            next_space: 1,
+            next_tab: 1,
+            next_pane: 1,
+        }
+    }
+
+    // -- lookups ----------------------------------------------------------
+
+    pub fn space(&self, id: SpaceId) -> Option<&Space> {
+        self.spaces.iter().find(|s| s.id == id)
+    }
+
+    pub fn space_mut(&mut self, id: SpaceId) -> Option<&mut Space> {
+        self.spaces.iter_mut().find(|s| s.id == id)
+    }
+
+    pub fn tab(&self, id: TabId) -> Option<&Tab> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    pub fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    pub fn focused_tab(&self) -> Option<TabId> {
+        self.space(self.focused_space?)?.focused_tab
+    }
+
+    pub fn focused_pane(&self) -> Option<PaneId> {
+        self.tab(self.focused_tab()?)?.focused_pane
+    }
+
+    /// Panes in the currently visible tab, in stable visual order.
+    pub fn visible_panes(&self) -> Vec<PaneId> {
+        self.focused_tab()
+            .and_then(|t| self.tab(t))
+            .map(|t| t.layout.panes())
+            .unwrap_or_default()
+    }
+
+    pub fn find_space_by_name(&self, name: &str) -> Option<SpaceId> {
+        self.spaces.iter().find(|s| s.name == name).map(|s| s.id)
+    }
+
+    // -- creation ---------------------------------------------------------
+
+    pub fn create_space(&mut self, cfg: &Config, name: Option<&str>, cwd: &Path) -> Result<SpaceId> {
+        let id = self.next_space;
+        self.next_space += 1;
+
+        let base = name.map(|s| s.to_string()).unwrap_or_else(|| {
+            cwd.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("space{id}"))
+        });
+        let name = self.unique_space_name(&base);
+
+        self.spaces.push(Space {
+            id,
+            name,
+            cwd: cwd.to_path_buf(),
+            tabs: Vec::new(),
+            focused_tab: None,
+        });
+        if self.focused_space.is_none() {
+            self.focused_space = Some(id);
+        }
+        self.create_tab(cfg, id, None)?;
+        Ok(id)
+    }
+
+    fn unique_space_name(&self, base: &str) -> String {
+        if self.find_space_by_name(base).is_none() {
+            return base.to_string();
+        }
+        for n in 2.. {
+            let cand = format!("{base}-{n}");
+            if self.find_space_by_name(&cand).is_none() {
+                return cand;
+            }
+        }
+        unreachable!()
+    }
+
+    pub fn create_tab(&mut self, cfg: &Config, space: SpaceId, name: Option<&str>) -> Result<TabId> {
+        let cwd = self.space(space).ok_or_else(|| anyhow!("no such space"))?.cwd.clone();
+        let id = self.next_tab;
+        self.next_tab += 1;
+
+        let n = self.space(space).map(|s| s.tabs.len()).unwrap_or(0) + 1;
+        self.tabs.push(Tab {
+            id,
+            space,
+            name: name.map(|s| s.to_string()).unwrap_or_else(|| format!("{n}")),
+            layout: Layout::new(),
+            focused_pane: None,
+        });
+        if let Some(s) = self.space_mut(space) {
+            s.tabs.push(id);
+            s.focused_tab = Some(id);
+        }
+
+        let pane = self.spawn_pane(cfg, space, id, &cfg.shell.clone(), &cwd)?;
+        if let Some(t) = self.tab_mut(id) {
+            t.layout = Layout::single(pane);
+            t.focused_pane = Some(pane);
+        }
+        self.relayout(cfg);
+        Ok(id)
+    }
+
+    /// Spawn a pane without attaching it to a layout. Used by restore, which builds the
+    /// tree itself after every pane exists.
+    pub fn spawn_pane_public(
+        &mut self,
+        cfg: &Config,
+        space: SpaceId,
+        tab: TabId,
+        cmd: &str,
+        cwd: &Path,
+    ) -> Result<PaneId> {
+        self.spawn_pane(cfg, space, tab, cmd, cwd)
+    }
+
+    fn spawn_pane(
+        &mut self,
+        cfg: &Config,
+        space: SpaceId,
+        tab: TabId,
+        cmd: &str,
+        cwd: &Path,
+    ) -> Result<PaneId> {
+        let id = self.next_pane;
+        self.next_pane += 1;
+        // Real size is applied by the relayout that follows; this is just a starting point.
+        let pane = Pane::spawn(
+            id,
+            tab,
+            space,
+            cmd,
+            cwd,
+            80,
+            24,
+            cfg.scrollback,
+            &crate::config::socket_path(),
+        )?;
+        self.panes.insert(id, pane);
+        Ok(id)
+    }
+
+    /// Split the focused pane (or `target`) and put a new pane beside it.
+    pub fn split(
+        &mut self,
+        cfg: &Config,
+        target: Option<PaneId>,
+        dir: Dir,
+        cmd: Option<&str>,
+    ) -> Result<PaneId> {
+        let target = target.or_else(|| self.focused_pane()).ok_or_else(|| anyhow!("no pane"))?;
+        let pane = self.panes.get(&target).ok_or_else(|| anyhow!("no such pane"))?;
+        let (space, tab) = (pane.space, pane.tab);
+        // New panes inherit the cwd of the pane they split from, which is what you want
+        // when fanning out work in one project.
+        let cwd = pane.cwd.clone();
+        let cmd = cmd.map(|s| s.to_string()).unwrap_or_else(|| cfg.shell.clone());
+
+        // Zoom hides siblings, so splitting while zoomed would put the new pane somewhere
+        // invisible. Drop the zoom first.
+        if self.view.zoom.is_some() {
+            self.view.zoom = None;
+            self.relayout(cfg);
+        }
+
+        let area = self.chrome.panes;
+        let new_id = self.next_pane;
+        let fits = self
+            .tab(tab)
+            .map(|t| {
+                let mut probe = t.layout.clone();
+                probe.split(target, dir, new_id, area)
+            })
+            .unwrap_or(false);
+        if !fits {
+            return Err(anyhow!("not enough room to split — try zooming out or closing a pane"));
+        }
+
+        let pane_id = self.spawn_pane(cfg, space, tab, &cmd, &cwd)?;
+        if let Some(t) = self.tab_mut(tab) {
+            t.layout.split(target, dir, pane_id, area);
+            t.focused_pane = Some(pane_id);
+        }
+        self.relayout(cfg);
+        Ok(pane_id)
+    }
+
+    // -- destruction ------------------------------------------------------
+
+    pub fn close_pane(&mut self, cfg: &Config, pane: PaneId) -> Result<()> {
+        let Some(p) = self.panes.get_mut(&pane) else { return Ok(()) };
+        let tab_id = p.tab;
+        p.kill();
+        self.panes.remove(&pane);
+
+        if self.view.zoom == Some(pane) {
+            self.view.zoom = None;
+        }
+
+        let mut tab_empty = false;
+        if let Some(t) = self.tab_mut(tab_id) {
+            t.layout.close(pane);
+            if t.focused_pane == Some(pane) {
+                // Focus the first survivor rather than leaving the tab focus dangling.
+                t.focused_pane = t.layout.panes().first().copied();
+            }
+            tab_empty = t.layout.is_empty();
+        }
+        if tab_empty {
+            self.close_tab(cfg, tab_id)?;
+        }
+        self.relayout(cfg);
+        Ok(())
+    }
+
+    pub fn close_tab(&mut self, cfg: &Config, tab: TabId) -> Result<()> {
+        let Some(t) = self.tab(tab) else { return Ok(()) };
+        let space_id = t.space;
+        let panes = t.layout.panes();
+        for p in panes {
+            if let Some(pane) = self.panes.get_mut(&p) {
+                pane.kill();
+            }
+            self.panes.remove(&p);
+        }
+        self.tabs.retain(|t| t.id != tab);
+
+        let mut space_empty = false;
+        if let Some(s) = self.space_mut(space_id) {
+            let idx = s.tabs.iter().position(|&t| t == tab);
+            s.tabs.retain(|&t| t != tab);
+            if s.focused_tab == Some(tab) {
+                // Prefer the tab that took this one's place, else the one before it.
+                s.focused_tab = idx
+                    .and_then(|i| s.tabs.get(i).or_else(|| s.tabs.get(i.saturating_sub(1))))
+                    .copied();
+            }
+            space_empty = s.tabs.is_empty();
+        }
+        if space_empty {
+            self.close_space(cfg, space_id)?;
+        }
+        self.relayout(cfg);
+        Ok(())
+    }
+
+    pub fn close_space(&mut self, cfg: &Config, space: SpaceId) -> Result<()> {
+        let tabs: Vec<TabId> =
+            self.space(space).map(|s| s.tabs.clone()).unwrap_or_default();
+        for t in tabs {
+            let panes = self.tab(t).map(|t| t.layout.panes()).unwrap_or_default();
+            for p in panes {
+                if let Some(pane) = self.panes.get_mut(&p) {
+                    pane.kill();
+                }
+                self.panes.remove(&p);
+            }
+            self.tabs.retain(|x| x.id != t);
+        }
+        let idx = self.spaces.iter().position(|s| s.id == space);
+        self.spaces.retain(|s| s.id != space);
+        if self.focused_space == Some(space) {
+            self.focused_space = idx
+                .and_then(|i| self.spaces.get(i).or_else(|| self.spaces.get(i.saturating_sub(1))))
+                .map(|s| s.id);
+        }
+        self.relayout(cfg);
+        Ok(())
+    }
+
+    /// Reap panes whose child exited. Returns the ids removed.
+    ///
+    /// A pane whose command exited is closed the way tmux does it — the pane goes away and
+    /// its space is reclaimed by its neighbours.
+    pub fn reap_exited(&mut self, cfg: &Config) -> Vec<PaneId> {
+        let dead: Vec<PaneId> = self
+            .panes
+            .values()
+            .filter(|p| p.exited.is_some())
+            .map(|p| p.id)
+            .collect();
+        for p in &dead {
+            let _ = self.close_pane(cfg, *p);
+        }
+        dead
+    }
+
+    // -- focus and navigation --------------------------------------------
+
+    pub fn focus_pane(&mut self, pane: PaneId) -> bool {
+        let Some(p) = self.panes.get(&pane) else { return false };
+        let (space, tab) = (p.space, p.tab);
+        self.focused_space = Some(space);
+        if let Some(s) = self.space_mut(space) {
+            s.focused_tab = Some(tab);
+        }
+        if let Some(t) = self.tab_mut(tab) {
+            t.focused_pane = Some(pane);
+        }
+        true
+    }
+
+    pub fn focus_dir(&mut self, dir: Dir) -> bool {
+        // While zoomed there are no visible neighbours to move to.
+        if self.view.zoom.is_some() {
+            return false;
+        }
+        let Some(tab) = self.focused_tab() else { return false };
+        let Some(from) = self.focused_pane() else { return false };
+        let area = self.chrome.panes;
+        let Some(next) = self.tab(tab).and_then(|t| t.layout.focus_dir(from, dir, area)) else {
+            return false;
+        };
+        if let Some(t) = self.tab_mut(tab) {
+            t.focused_pane = Some(next);
+        }
+        true
+    }
+
+    pub fn focus_space(&mut self, space: SpaceId) -> bool {
+        if self.space(space).is_none() {
+            return false;
+        }
+        self.focused_space = Some(space);
+        true
+    }
+
+    pub fn cycle_space(&mut self, delta: i32) -> bool {
+        if self.spaces.is_empty() {
+            return false;
+        }
+        let cur = self
+            .focused_space
+            .and_then(|id| self.spaces.iter().position(|s| s.id == id))
+            .unwrap_or(0);
+        let n = self.spaces.len() as i32;
+        let next = (cur as i32 + delta).rem_euclid(n) as usize;
+        self.focused_space = Some(self.spaces[next].id);
+        true
+    }
+
+    pub fn cycle_tab(&mut self, delta: i32) -> bool {
+        let Some(space) = self.focused_space else { return false };
+        let Some(s) = self.space(space) else { return false };
+        if s.tabs.is_empty() {
+            return false;
+        }
+        let cur = s
+            .focused_tab
+            .and_then(|id| s.tabs.iter().position(|&t| t == id))
+            .unwrap_or(0);
+        let n = s.tabs.len() as i32;
+        let next = (cur as i32 + delta).rem_euclid(n) as usize;
+        let tab = s.tabs[next];
+        if let Some(s) = self.space_mut(space) {
+            s.focused_tab = Some(tab);
+        }
+        true
+    }
+
+    pub fn goto_tab(&mut self, index: usize) -> bool {
+        let Some(space) = self.focused_space else { return false };
+        let Some(&tab) = self.space(space).and_then(|s| s.tabs.get(index)) else { return false };
+        if let Some(s) = self.space_mut(space) {
+            s.focused_tab = Some(tab);
+        }
+        true
+    }
+
+    /// Next pane anywhere in the session whose agent wants attention.
+    ///
+    /// Ordering follows the sidebar, and the search starts after the currently focused
+    /// pane so pressing it repeatedly walks the queue instead of sticking on one agent.
+    pub fn next_attention(&self) -> Option<PaneId> {
+        let ordered = self.attention_order();
+        if ordered.is_empty() {
+            return None;
+        }
+        let cur = self.focused_pane();
+        let start = cur
+            .and_then(|c| ordered.iter().position(|&p| p == c))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        for k in 0..ordered.len() {
+            let p = ordered[(start + k) % ordered.len()];
+            if Some(p) != cur {
+                return Some(p);
+            }
+        }
+        ordered.first().copied()
+    }
+
+    fn attention_order(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        for s in &self.spaces {
+            for &t in &s.tabs {
+                if let Some(tab) = self.tab(t) {
+                    for p in tab.layout.panes() {
+                        if let Some(pane) = self.panes.get(&p) {
+                            if pane
+                                .agent
+                                .as_ref()
+                                .is_some_and(|a| a.state.needs_attention())
+                            {
+                                out.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // -- layout mutation --------------------------------------------------
+
+    pub fn resize_pane(&mut self, cfg: &Config, dir: Dir, cells: u16) -> bool {
+        let Some(tab) = self.focused_tab() else { return false };
+        let Some(pane) = self.focused_pane() else { return false };
+        let area = self.chrome.panes;
+        let ok = self
+            .tab_mut(tab)
+            .map(|t| t.layout.resize(pane, dir, cells, area))
+            .unwrap_or(false);
+        if ok {
+            self.relayout(cfg);
+        }
+        ok
+    }
+
+    pub fn swap_dir(&mut self, cfg: &Config, dir: Dir) -> bool {
+        let Some(tab) = self.focused_tab() else { return false };
+        let Some(from) = self.focused_pane() else { return false };
+        let area = self.chrome.panes;
+        let Some(other) = self.tab(tab).and_then(|t| t.layout.focus_dir(from, dir, area)) else {
+            return false;
+        };
+        let ok = self.tab_mut(tab).map(|t| t.layout.swap(from, other)).unwrap_or(false);
+        if ok {
+            self.relayout(cfg);
+        }
+        ok
+    }
+
+    pub fn toggle_zoom(&mut self, cfg: &Config) -> bool {
+        let Some(pane) = self.focused_pane() else { return false };
+        self.view.zoom = if self.view.zoom == Some(pane) { None } else { Some(pane) };
+        self.relayout(cfg);
+        true
+    }
+
+    pub fn toggle_sidebar(&mut self, cfg: &Config) {
+        self.view.sidebar_open = !self.view.sidebar_open;
+        self.relayout(cfg);
+    }
+
+    pub fn toggle_bus(&mut self, cfg: &Config) {
+        self.view.bus_open = !self.view.bus_open;
+        self.relayout(cfg);
+    }
+
+    pub fn set_client_size(&mut self, cfg: &Config, cols: u16, rows: u16) {
+        self.client_cols = cols.max(20);
+        self.client_rows = rows.max(6);
+        self.relayout(cfg);
+    }
+
+    /// Apply a named preset to the focused tab, spawning or closing panes to match.
+    pub fn apply_preset(&mut self, cfg: &Config, name: &str) -> Result<()> {
+        let want = Layout::preset_pane_count(name)
+            .ok_or_else(|| anyhow!("unknown layout {name:?} (solo, duo, trio, dev, quad)"))?;
+        let tab = self.focused_tab().ok_or_else(|| anyhow!("no tab"))?;
+        let mut have = self.tab(tab).map(|t| t.layout.panes()).unwrap_or_default();
+
+        // Grow or shrink to the required pane count before rebuilding the tree, so the
+        // preset always gets exactly the panes it expects.
+        while have.len() > want {
+            let victim = have.pop().unwrap();
+            if let Some(p) = self.panes.get_mut(&victim) {
+                p.kill();
+            }
+            self.panes.remove(&victim);
+            if let Some(t) = self.tab_mut(tab) {
+                t.layout.close(victim);
+            }
+        }
+        while have.len() < want {
+            let (space, cwd) = {
+                let t = self.tab(tab).ok_or_else(|| anyhow!("no tab"))?;
+                let cwd = self
+                    .space(t.space)
+                    .map(|s| s.cwd.clone())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                (t.space, cwd)
+            };
+            let id = self.spawn_pane(cfg, space, tab, &cfg.shell.clone(), &cwd)?;
+            have.push(id);
+        }
+
+        let layout = Layout::preset(name, &have)
+            .ok_or_else(|| anyhow!("could not build layout {name:?}"))?;
+        if let Some(t) = self.tab_mut(tab) {
+            t.layout = layout;
+            t.focused_pane = have.first().copied();
+        }
+        self.view.zoom = None;
+        self.relayout(cfg);
+        Ok(())
+    }
+
+    // -- geometry ---------------------------------------------------------
+
+    /// Recompute chrome and pane rects, then push the new sizes to the PTYs.
+    ///
+    /// Every structural change funnels through here, which is why a pane's PTY size and
+    /// its drawn rect can never drift apart.
+    pub fn relayout(&mut self, cfg: &Config) {
+        let (cols, rows) = (self.client_cols, self.client_rows);
+        let mut c = Chrome::default();
+
+        let mut top = 0u16;
+        let mut bottom = rows;
+        // Only spend a row on the tab bar when the focused space actually has tabs.
+        let has_tabs = self
+            .focused_space
+            .and_then(|s| self.space(s))
+            .map(|s| !s.tabs.is_empty())
+            .unwrap_or(false);
+        if cfg.tab_bar && has_tabs && rows > 4 {
+            c.tabbar = Rect::new(0, 0, cols, 1);
+            top += 1;
+        }
+        if cfg.status_bar && rows > 4 {
+            bottom -= 1;
+            c.status = Rect::new(0, bottom, cols, 1);
+        }
+
+        let body_h = bottom.saturating_sub(top);
+        let mut left = 0u16;
+        let mut right = cols;
+
+        // Panels only appear when there is room left for a usable pane area.
+        if self.view.sidebar_open {
+            let w = self.view.sidebar_width.min(cols / 3);
+            if w >= 14 {
+                c.sidebar = Rect::new(0, top, w, body_h);
+                left += w;
+            }
+        }
+        if self.view.bus_open {
+            let w = self.view.bus_width.min(cols / 3);
+            if right.saturating_sub(left) > w + 20 {
+                right -= w;
+                c.bus = Rect::new(right, top, w, body_h);
+            }
+        }
+
+        c.panes = Rect::new(left, top, right.saturating_sub(left), body_h);
+        self.chrome = c;
+
+        // Push geometry into the panes of the focused tab, and resize the PTYs.
+        let Some(tab_id) = self.focused_tab() else { return };
+        let area = c.panes;
+        let zoom = self.view.zoom;
+
+        let assignments: Vec<(PaneId, Rect)> = match zoom {
+            Some(z) if self.tab(tab_id).is_some_and(|t| t.layout.contains(z)) => {
+                vec![(z, area)]
+            }
+            _ => self
+                .tab(tab_id)
+                .map(|t| {
+                    let geo = t.layout.geometry(area);
+                    geo.order.into_iter().filter_map(|p| geo.panes.get(&p).map(|r| (p, *r))).collect()
+                })
+                .unwrap_or_default(),
+        };
+
+        for (pane, cell) in assignments {
+            let content = if cfg.pane_titles { cell.inset(1) } else { cell };
+            if let Some(p) = self.panes.get_mut(&pane) {
+                let _ = p.resize(content.w, content.h);
+            }
+        }
+    }
+
+    /// Cell and content rects for the panes currently on screen.
+    pub fn visible_rects(&self, cfg: &Config) -> Vec<(PaneId, Rect, Rect)> {
+        let Some(tab_id) = self.focused_tab() else { return Vec::new() };
+        let area = self.chrome.panes;
+        let cells: Vec<(PaneId, Rect)> = match self.view.zoom {
+            Some(z) if self.tab(tab_id).is_some_and(|t| t.layout.contains(z)) => vec![(z, area)],
+            _ => self
+                .tab(tab_id)
+                .map(|t| {
+                    let geo = t.layout.geometry(area);
+                    geo.order.into_iter().filter_map(|p| geo.panes.get(&p).map(|r| (p, *r))).collect()
+                })
+                .unwrap_or_default(),
+        };
+        cells
+            .into_iter()
+            .map(|(p, cell)| {
+                let content = if cfg.pane_titles { cell.inset(1) } else { cell };
+                (p, cell, content)
+            })
+            .collect()
+    }
+
+    // -- snapshot ---------------------------------------------------------
+
+    pub fn snapshot(&self, cfg: &Config) -> Snapshot {
+        let rects: HashMap<PaneId, (Rect, Rect)> = self
+            .visible_rects(cfg)
+            .into_iter()
+            .map(|(p, cell, content)| (p, (cell, content)))
+            .collect();
+
+        let panes = self
+            .panes
+            .values()
+            .map(|p| {
+                let (cell, content) = rects.get(&p.id).copied().unwrap_or_default();
+                PaneInfo {
+                    id: p.id,
+                    tab: p.tab,
+                    space: p.space,
+                    title: p.display_name(),
+                    cwd: p.cwd.to_string_lossy().to_string(),
+                    cell,
+                    content,
+                    cols: p.cols,
+                    rows: p.rows,
+                    agent: p.agent.as_ref().map(|a| a.info()),
+                    exited: p.exited.is_some(),
+                    scroll_offset: p.scroll_offset(),
+                    wants_mouse: p.wants_mouse(),
+                    bracketed_paste: p.bracketed_paste(),
+                }
+            })
+            .collect();
+
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|t| TabInfo {
+                id: t.id,
+                space: t.space,
+                name: t.name.clone(),
+                panes: t.layout.panes(),
+                focused_pane: t.focused_pane,
+            })
+            .collect();
+
+        let spaces = self
+            .spaces
+            .iter()
+            .map(|s| {
+                let mut agent_count = 0;
+                let mut attention_count = 0;
+                for &t in &s.tabs {
+                    if let Some(tab) = self.tab(t) {
+                        for p in tab.layout.panes() {
+                            if let Some(a) = self.panes.get(&p).and_then(|p| p.agent.as_ref()) {
+                                agent_count += 1;
+                                if a.state.needs_attention() {
+                                    attention_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                SpaceInfo {
+                    id: s.id,
+                    name: s.name.clone(),
+                    cwd: s.cwd.to_string_lossy().to_string(),
+                    tabs: s.tabs.clone(),
+                    focused_tab: s.focused_tab,
+                    agent_count,
+                    attention_count,
+                }
+            })
+            .collect();
+
+        Snapshot {
+            protocol: PROTOCOL_VERSION,
+            spaces,
+            tabs,
+            panes,
+            focused_space: self.focused_space,
+            focused_tab: self.focused_tab(),
+            focused_pane: self.focused_pane(),
+            view: self.view,
+            sidebar: self.chrome.sidebar,
+            bus: self.chrome.bus,
+            status: self.chrome.status,
+            tabbar: self.chrome.tabbar,
+        }
+    }
+}
+
+/// Agent state attached to a pane. Populated in phase 2; declared here because `Pane` and
+/// the snapshot both refer to it.
+#[derive(Debug, Clone)]
+pub struct AgentRuntime {
+    pub kind: String,
+    pub name: String,
+    pub state: crate::proto::AgentState,
+    pub since: std::time::Instant,
+    pub authority: String,
+    pub reason: String,
+    /// True once the user has looked at this pane since it finished.
+    pub seen: bool,
+    /// Native session id reported by an integration, used to resume after a restart.
+    pub session_id: Option<String>,
+    /// Messages held back because the agent was mid-stream.
+    pub queued: Vec<crate::proto::Message>,
+}
+
+impl AgentRuntime {
+    pub fn info(&self) -> crate::proto::AgentInfo {
+        crate::proto::AgentInfo {
+            kind: self.kind.clone(),
+            name: self.name.clone(),
+            state: self.state,
+            elapsed: self.since.elapsed().as_secs(),
+            authority: self.authority.clone(),
+            reason: self.reason.clone(),
+        }
+    }
+}

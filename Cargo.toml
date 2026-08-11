@@ -1,0 +1,44 @@
+[package]
+name = "horde"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "An agent-aware terminal multiplexer"
+
+[[bin]]
+name = "horde"
+path = "src/main.rs"
+
+[dependencies]
+# VT emulation. Driven manually via vte::ansi::Processor -- we do not use
+# alacritty's own event_loop or tty modules.
+alacritty_terminal = "0.26"
+vte = "0.15"
+
+# PTY spawn / resize / writer. Kept separate from the emulator so the emulator
+# stays swappable.
+portable-pty = "0.9"
+
+# UI
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+unicode-width = "0.2"
+
+# Runtime + protocol
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "signal", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+
+# Config + manifests
+toml = "0.9"
+regex = "1"
+dirs = "6"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+tokio-stream = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,40 @@
+# OpenAI Codex CLI screen manifest.
+#
+# Untested locally — codex is not installed on this machine. Refine with
+# `horde agent explain <pane>`, which prints the snapshot and the rule that fired.
+
+name = "codex"
+processes = ["codex"]
+
+detect = [
+  'Codex',
+  'esc to interrupt',
+]
+
+[[rules]]
+name = "blocked-approval"
+state = "blocked"
+any = [
+  'Allow command\?',
+  'Do you want to allow',
+  'Approve this',
+  '\[y/n\]',
+  '❯\s*1\.\s*Yes',
+]
+
+[[rules]]
+name = "working"
+state = "working"
+any = [
+  'esc to interrupt',
+  '\bthinking\b',
+  '\bWorking\b',
+]
+
+[[rules]]
+name = "idle-prompt"
+state = "idle"
+any = [
+  '^\s*│\s*>',
+  'send a message',
+]

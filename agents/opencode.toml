@@ -1,0 +1,32 @@
+# opencode screen manifest. Untested locally.
+
+name = "opencode"
+processes = ["opencode"]
+
+detect = [
+  'opencode',
+]
+
+[[rules]]
+name = "blocked-approval"
+state = "blocked"
+any = [
+  'Do you want to',
+  'Allow\b.*\?',
+  '❯\s*1\.\s*Yes',
+  '\[y/n\]',
+]
+
+[[rules]]
+name = "working"
+state = "working"
+any = [
+  'esc to interrupt',
+  '\bWorking\b',
+  '\bThinking\b',
+]
+
+[[rules]]
+name = "idle-prompt"
+state = "idle"
+any = ['^\s*│\s*>', '^\s*>\s*$']

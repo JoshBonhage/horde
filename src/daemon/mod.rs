@@ -1,0 +1,718 @@
+//! The daemon: owns every PTY, every emulator, and the session shape.
+//!
+//! One task owns the `Session` outright and everything reaches it through a channel. That
+//! avoids holding a mutex across awaits, and makes the tick loop the only place panes are
+//! pumped — so pane damage is consumed exactly once per frame.
+
+pub mod agents;
+pub mod bus;
+pub mod layout;
+pub mod manifest;
+pub mod pane;
+pub mod persist;
+pub mod rpc;
+pub mod state;
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::config::{socket_path, Config};
+use crate::framing;
+use crate::proto::{
+    ClientFrame, Cmd, CursorPos, Dir, Event, NoticeLevel, PaneId, Request, Response, RowUpdate,
+    ServerFrame, PROTOCOL_VERSION,
+};
+use state::Session;
+
+/// Render cadence. 16ms coalesces output bursts into one frame without visible lag.
+const TICK: Duration = Duration::from_millis(16);
+/// Detection cadence, in ticks. Probing the foreground process is comparatively expensive,
+/// so it runs far less often than rendering.
+const DETECT_EVERY: u32 = 40;
+/// Ticks of quiet before the session shape is written to disk.
+const SAVE_DELAY: u32 = 60;
+
+type ClientId = u64;
+
+pub enum DaemonMsg {
+    Rpc { req: Request, reply: oneshot::Sender<Response> },
+    Attach { id: ClientId, cols: u16, rows: u16, out: mpsc::UnboundedSender<ServerFrame> },
+    Frame { id: ClientId, frame: ClientFrame },
+    Detached { id: ClientId },
+}
+
+struct Client {
+    out: mpsc::UnboundedSender<ServerFrame>,
+    /// Panes this client has not received a full grid for yet.
+    needs_full: Vec<PaneId>,
+}
+
+pub struct Engine {
+    pub cfg: Config,
+    pub session: Session,
+    pub bus: bus::Bus,
+    pub agents: agents::Detector,
+    clients: HashMap<ClientId, Client>,
+    /// Set when the shape changed and clients need a fresh snapshot.
+    dirty_shape: bool,
+    pending_events: Vec<Event>,
+}
+
+impl Engine {
+    /// Queue an event for delivery to attached clients on the next tick.
+    pub fn emit(&mut self, ev: Event) {
+        self.pending_events.push(ev);
+    }
+
+    pub fn notice(&mut self, level: NoticeLevel, text: impl Into<String>) {
+        self.emit(Event::Notice { level, text: text.into() });
+    }
+
+    /// Mark the session shape as changed so clients get a new snapshot.
+    pub fn touch(&mut self) {
+        self.dirty_shape = true;
+    }
+
+    // Field-splitting wrappers. `self.agents.scan(&mut self.session, ...)` cannot borrow
+    // two fields of `self` through a method call, so destructure instead.
+    fn detect(&mut self) -> Vec<Event> {
+        let Engine { agents, session, cfg, .. } = self;
+        agents.scan(session, cfg)
+    }
+
+    pub fn mark_seen(&mut self, pane: PaneId) {
+        let Engine { agents, session, .. } = self;
+        agents.mark_seen(session, pane);
+    }
+
+    fn flush_bus(&mut self) -> Vec<Event> {
+        let Engine { bus, session, cfg, .. } = self;
+        bus.flush_queued(session, cfg)
+    }
+}
+
+pub async fn run(cfg: Config, warnings: Vec<String>) -> Result<()> {
+    let socket = socket_path();
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    ensure_socket_free(&socket).await?;
+
+    // Unix sockets cap the path at ~104 bytes on macOS, and the raw OS error for that is
+    // just "path must be shorter than SUN_LEN", which explains nothing.
+    if socket.as_os_str().len() > 100 {
+        return Err(anyhow!(
+            "socket path is too long for the OS ({} bytes, limit ~100): {}\n\
+             set HORDE_SOCKET to somewhere shorter, e.g. HORDE_SOCKET=/tmp/horde.sock",
+            socket.as_os_str().len(),
+            socket.display()
+        ));
+    }
+
+    let listener = UnixListener::bind(&socket)
+        .with_context(|| format!("could not bind {}", socket.display()))?;
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let engine = tokio::spawn(engine_loop(cfg, warnings, rx));
+
+    let accept_tx = tx.clone();
+    let accept = tokio::spawn(async move {
+        let mut next_id: ClientId = 1;
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let id = next_id;
+                    next_id += 1;
+                    let tx = accept_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = serve_conn(stream, id, tx).await {
+                            log_line(&format!("connection {id} ended: {e}"));
+                        }
+                    });
+                }
+                Err(e) => {
+                    log_line(&format!("accept failed: {e}"));
+                    return;
+                }
+            }
+        }
+    });
+
+    let result = tokio::select! {
+        r = engine => r.map_err(|e| anyhow!("engine panicked: {e}")).and_then(|r| r),
+        _ = accept => Ok(()),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
+    // Leave no stale socket behind for the next start to trip over.
+    let _ = std::fs::remove_file(&socket);
+    result
+}
+
+/// Remove the socket if it is stale, or refuse to start if a daemon already owns it.
+async fn ensure_socket_free(socket: &PathBuf) -> Result<()> {
+    if !socket.exists() {
+        return Ok(());
+    }
+    match UnixStream::connect(socket).await {
+        Ok(_) => Err(anyhow!(
+            "a horde daemon is already running on {} (run `horde stop` first)",
+            socket.display()
+        )),
+        Err(_) => {
+            // Nothing is listening, so the file is left over from a crash.
+            std::fs::remove_file(socket)
+                .with_context(|| format!("could not remove stale socket {}", socket.display()))?;
+            Ok(())
+        }
+    }
+}
+
+async fn engine_loop(
+    cfg: Config,
+    warnings: Vec<String>,
+    mut rx: mpsc::UnboundedReceiver<DaemonMsg>,
+) -> Result<()> {
+    let session = Session::new(&cfg);
+    let agents = agents::Detector::new(&cfg);
+    let mut eng = Engine {
+        session,
+        bus: bus::Bus::new(crate::config::bus_log_path()),
+        agents,
+        cfg,
+        clients: HashMap::new(),
+        dirty_shape: true,
+        pending_events: Vec::new(),
+    };
+
+    match persist::load(&crate::config::state_path()) {
+        Ok(Some(saved)) => {
+            if let Err(e) = persist::restore(&mut eng, saved) {
+                log_line(&format!("restore failed, starting fresh: {e}"));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => log_line(&format!("could not read saved state: {e}")),
+    }
+    if eng.session.spaces.is_empty() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cfg = eng.cfg.clone();
+        eng.session.create_space(&cfg, None, &cwd)?;
+    }
+
+    for w in warnings {
+        eng.notice(NoticeLevel::Warn, w);
+    }
+
+    let mut ticker = tokio::time::interval(TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks: u32 = 0;
+    let mut save_countdown: u32 = 0;
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                let Some(msg) = msg else { break };
+                if handle_msg(&mut eng, msg) {
+                    break;
+                }
+                save_countdown = SAVE_DELAY;
+            }
+            _ = ticker.tick() => {
+                ticks = ticks.wrapping_add(1);
+                tick(&mut eng, ticks);
+                if save_countdown > 0 {
+                    save_countdown -= 1;
+                    if save_countdown == 0 {
+                        if let Err(e) = persist::save(&eng, &crate::config::state_path()) {
+                            log_line(&format!("could not save state: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = persist::save(&eng, &crate::config::state_path());
+    Ok(())
+}
+
+/// Returns true when the daemon should shut down.
+fn handle_msg(eng: &mut Engine, msg: DaemonMsg) -> bool {
+    match msg {
+        DaemonMsg::Rpc { req, reply } => {
+            let stop = req.method == "server.stop";
+            let resp = rpc::dispatch(eng, req);
+            let _ = reply.send(resp);
+            if stop {
+                return true;
+            }
+        }
+        DaemonMsg::Attach { id, cols, rows, out } => {
+            let panes: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+            eng.clients.insert(id, Client { out, needs_full: panes });
+            let cfg = eng.cfg.clone();
+            eng.session.set_client_size(&cfg, cols, rows);
+            eng.dirty_shape = true;
+        }
+        DaemonMsg::Detached { id } => {
+            eng.clients.remove(&id);
+        }
+        DaemonMsg::Frame { id, frame } => handle_client_frame(eng, id, frame),
+    }
+    false
+}
+
+fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
+    let cfg = eng.cfg.clone();
+    match frame {
+        ClientFrame::Ping => {}
+        ClientFrame::Detach => {
+            eng.clients.remove(&id);
+        }
+        ClientFrame::Resize { cols, rows } => {
+            eng.session.set_client_size(&cfg, cols, rows);
+            // Every pane moved, so nothing the client has cached is still valid.
+            let panes: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+            for p in &panes {
+                if let Some(pane) = eng.session.panes.get_mut(p) {
+                    pane.request_full_repaint();
+                }
+            }
+            if let Some(c) = eng.clients.get_mut(&id) {
+                c.needs_full = panes;
+            }
+            eng.dirty_shape = true;
+        }
+        ClientFrame::Input { pane, bytes } => {
+            if let Some(p) = eng.session.panes.get_mut(&pane) {
+                let _ = p.write_input(&bytes);
+            }
+            // Typing at a pane counts as looking at it, which clears a `done` badge.
+            eng.mark_seen(pane);
+        }
+        ClientFrame::Focus { pane } => {
+            if eng.session.focus_pane(pane) {
+                eng.mark_seen(pane);
+                eng.dirty_shape = true;
+            }
+        }
+        ClientFrame::Command(cmd) => apply_cmd(eng, cmd),
+    }
+}
+
+pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
+    let cfg = eng.cfg.clone();
+    // Errors are collected rather than reported inline: `eng.session` is borrowed for the
+    // duration of most arms, so `eng.notice` cannot be called from inside them.
+    let mut problems: Vec<(NoticeLevel, String)> = Vec::new();
+    let mut seen: Option<PaneId> = None;
+
+    match cmd {
+        Cmd::SplitRight | Cmd::SplitDown => {
+            let dir = if cmd == Cmd::SplitRight { Dir::Right } else { Dir::Down };
+            if let Err(e) = eng.session.split(&cfg, None, dir, None) {
+                problems.push((NoticeLevel::Warn, e.to_string()));
+            }
+        }
+        Cmd::ClosePane => {
+            if let Some(p) = eng.session.focused_pane() {
+                let _ = eng.session.close_pane(&cfg, p);
+            }
+        }
+        Cmd::FocusDir(d) => {
+            eng.session.focus_dir(d);
+            seen = eng.session.focused_pane();
+        }
+        Cmd::Resize { dir, cells } => {
+            eng.session.resize_pane(&cfg, dir, cells);
+        }
+        Cmd::ToggleZoom => {
+            eng.session.toggle_zoom(&cfg);
+        }
+        Cmd::SwapDir(d) => {
+            eng.session.swap_dir(&cfg, d);
+        }
+        Cmd::NewTab => {
+            if let Some(space) = eng.session.focused_space {
+                if let Err(e) = eng.session.create_tab(&cfg, space, None) {
+                    problems.push((NoticeLevel::Error, e.to_string()));
+                }
+            }
+        }
+        Cmd::NextTab => {
+            eng.session.cycle_tab(1);
+        }
+        Cmd::PrevTab => {
+            eng.session.cycle_tab(-1);
+        }
+        Cmd::GotoTab(i) => {
+            eng.session.goto_tab(i);
+        }
+        Cmd::CloseTab => {
+            if let Some(t) = eng.session.focused_tab() {
+                let _ = eng.session.close_tab(&cfg, t);
+            }
+        }
+        Cmd::NewSpace { name } => {
+            // Inherit the current space's directory: a new space is nearly always more
+            // work on the same project, not work where the daemon happened to start.
+            let cwd = eng
+                .session
+                .focused_space
+                .and_then(|s| eng.session.space(s))
+                .map(|s| s.cwd.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            if let Err(e) = eng.session.create_space(&cfg, name.as_deref(), &cwd) {
+                problems.push((NoticeLevel::Error, e.to_string()));
+            }
+        }
+        Cmd::FocusSpace(id) => {
+            eng.session.focus_space(id);
+        }
+        Cmd::NextSpace => {
+            eng.session.cycle_space(1);
+        }
+        Cmd::PrevSpace => {
+            eng.session.cycle_space(-1);
+        }
+        Cmd::ToggleSidebar => eng.session.toggle_sidebar(&cfg),
+        Cmd::ToggleBus => eng.session.toggle_bus(&cfg),
+        Cmd::JumpAttention => match eng.session.next_attention() {
+            Some(p) => {
+                eng.session.focus_pane(p);
+                seen = Some(p);
+            }
+            None => problems.push((NoticeLevel::Info, "no agent needs attention".into())),
+        },
+        Cmd::Scroll { pane, lines } => {
+            if let Some(p) = eng.session.panes.get_mut(&pane) {
+                p.scroll(lines);
+            }
+        }
+        Cmd::ScrollBottom { pane } => {
+            if let Some(p) = eng.session.panes.get_mut(&pane) {
+                p.scroll_bottom();
+            }
+        }
+        Cmd::FocusPane(p) => {
+            if eng.session.focus_pane(p) {
+                seen = Some(p);
+            }
+        }
+        Cmd::RenamePane { pane, name } => {
+            if let Some(p) = eng.session.panes.get_mut(&pane) {
+                p.name = if name.is_empty() { None } else { Some(name) };
+            }
+        }
+        Cmd::SpawnAgent { cmd, name, split } => {
+            let dir = split.unwrap_or(Dir::Right);
+            match eng.session.split(&cfg, None, dir, Some(&cmd)) {
+                Ok(id) => {
+                    if let (Some(n), Some(p)) = (name, eng.session.panes.get_mut(&id)) {
+                        p.name = Some(n);
+                    }
+                }
+                Err(e) => problems.push((NoticeLevel::Warn, e.to_string())),
+            }
+        }
+        Cmd::ApplyLayout { preset } => {
+            if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
+                problems.push((NoticeLevel::Warn, e.to_string()));
+            }
+        }
+    }
+
+    if let Some(p) = seen {
+        eng.mark_seen(p);
+    }
+    for (level, text) in problems {
+        eng.notice(level, text);
+    }
+    eng.dirty_shape = true;
+}
+
+/// One frame: pump panes, run detection on a slower cadence, broadcast.
+fn tick(eng: &mut Engine, ticks: u32) {
+    let theme = eng.cfg.theme.clone();
+    let pane_ids: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+    for id in &pane_ids {
+        if let Some(p) = eng.session.panes.get_mut(id) {
+            p.pump(&theme);
+        }
+    }
+
+    if ticks % DETECT_EVERY == 0 {
+        let mut events = eng.detect();
+        // A message held back for a busy agent may now be deliverable.
+        events.extend(eng.flush_bus());
+        for ev in events {
+            eng.pending_events.push(ev);
+        }
+    }
+
+    let cfg = eng.cfg.clone();
+    let exited = eng.session.reap_exited(&cfg);
+    for p in &exited {
+        eng.pending_events.push(Event::PaneExited { pane: *p, status: 0 });
+        eng.dirty_shape = true;
+    }
+    if !exited.is_empty() && eng.session.spaces.is_empty() {
+        // The last pane closed; recreate a space so horde is never left unusable.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let _ = eng.session.create_space(&cfg, None, &cwd);
+        eng.dirty_shape = true;
+    }
+
+    broadcast(eng);
+}
+
+fn broadcast(eng: &mut Engine) {
+    if eng.clients.is_empty() {
+        // Nothing attached: drain dirty rows anyway so they cannot pile up unboundedly.
+        let ids: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+        for id in ids {
+            if let Some(p) = eng.session.panes.get_mut(&id) {
+                p.take_dirty();
+            }
+        }
+        eng.pending_events.clear();
+        return;
+    }
+
+    let cfg = eng.cfg.clone();
+    let snapshot = if eng.dirty_shape {
+        eng.dirty_shape = false;
+        Some(Box::new(eng.session.snapshot(&cfg)))
+    } else {
+        None
+    };
+
+    // Only panes on screen are worth sending; the rest keep running invisibly.
+    let visible: Vec<PaneId> = eng.session.visible_panes();
+    let focused = eng.session.focused_pane();
+
+    // Take dirty rows once, then fan the same payload out to every client.
+    let mut updates: Vec<(PaneId, Vec<RowUpdate>, Option<CursorPos>)> = Vec::new();
+    for id in &visible {
+        let Some(p) = eng.session.panes.get_mut(id) else { continue };
+        let dirty = p.take_dirty();
+        if dirty.is_empty() {
+            continue;
+        }
+        let rows: Vec<RowUpdate> = dirty
+            .iter()
+            .filter_map(|&y| p.row(y).map(|r| RowUpdate { y, row: r.clone() }))
+            .collect();
+        let mut cursor = p.cursor();
+        cursor.visible = cursor.visible && Some(*id) == focused;
+        updates.push((*id, rows, Some(cursor)));
+    }
+
+    // Which panes each client still needs in full, claimed before building payloads so the
+    // session borrow and the clients borrow never overlap.
+    let per_client: Vec<(ClientId, Vec<PaneId>)> = eng
+        .clients
+        .iter_mut()
+        .map(|(cid, c)| {
+            let need: Vec<PaneId> =
+                c.needs_full.iter().copied().filter(|p| visible.contains(p)).collect();
+            c.needs_full.retain(|p| !visible.contains(p));
+            (*cid, need)
+        })
+        .collect();
+
+    let union: HashSet<PaneId> = per_client.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    let mut full_grids: HashMap<PaneId, (Vec<RowUpdate>, CursorPos)> = HashMap::new();
+    for p in union {
+        let Some(pane) = eng.session.panes.get(&p) else { continue };
+        let rows: Vec<RowUpdate> = pane
+            .mirror()
+            .iter()
+            .enumerate()
+            .map(|(y, r)| RowUpdate { y: y as u16, row: r.clone() })
+            .collect();
+        let mut cursor = pane.cursor();
+        cursor.visible = cursor.visible && Some(p) == focused;
+        full_grids.insert(p, (rows, cursor));
+    }
+
+    let events = std::mem::take(&mut eng.pending_events);
+    let mut gone = Vec::new();
+
+    for (cid, need_full) in per_client {
+        let Some(client) = eng.clients.get(&cid) else { continue };
+        let ok = (|| {
+            if let Some(snap) = &snapshot {
+                client.out.send(ServerFrame::Snapshot(snap.clone())).ok()?;
+            }
+            for p in &need_full {
+                if let Some((rows, cursor)) = full_grids.get(p) {
+                    client
+                        .out
+                        .send(ServerFrame::Rows {
+                            pane: *p,
+                            rows: rows.clone(),
+                            cursor: Some(*cursor),
+                        })
+                        .ok()?;
+                }
+            }
+            for (p, rows, cursor) in &updates {
+                // A pane just sent in full is already current; skip the duplicate.
+                if need_full.contains(p) {
+                    continue;
+                }
+                client
+                    .out
+                    .send(ServerFrame::Rows { pane: *p, rows: rows.clone(), cursor: *cursor })
+                    .ok()?;
+            }
+            for ev in &events {
+                client.out.send(ServerFrame::Event(ev.clone())).ok()?;
+            }
+            Some(())
+        })();
+        if ok.is_none() {
+            gone.push(cid);
+        }
+    }
+
+    for c in gone {
+        eng.clients.remove(&c);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection handling
+// ---------------------------------------------------------------------------
+
+/// A connection speaks newline JSON until it asks to `attach`, after which it switches to
+/// postcard frames in both directions for the rest of its life.
+async fn serve_conn(
+    stream: UnixStream,
+    id: ClientId,
+    tx: mpsc::UnboundedSender<DaemonMsg>,
+) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let req: Request = match serde_json::from_str(trimmed) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = Response::err("", "bad_request", format!("invalid JSON: {e}"));
+                write_json(&mut write_half, &resp).await?;
+                continue;
+            }
+        };
+
+        if req.method == "attach" {
+            let protocol = req.params.get("protocol").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let cols = req.params.get("cols").and_then(|v| v.as_u64()).unwrap_or(120) as u16;
+            let rows = req.params.get("rows").and_then(|v| v.as_u64()).unwrap_or(40) as u16;
+
+            if protocol != PROTOCOL_VERSION {
+                // Both halves ship in one binary, so this only bites across versions.
+                let bye = ServerFrame::Bye {
+                    reason: format!(
+                        "protocol mismatch: client speaks v{protocol}, daemon speaks \
+                         v{PROTOCOL_VERSION}. Run `horde stop`, then `horde`."
+                    ),
+                };
+                framing::write_frame(&mut write_half, &bye).await?;
+                return Ok(());
+            }
+
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerFrame>();
+            tx.send(DaemonMsg::Attach { id, cols, rows, out: out_tx })
+                .map_err(|_| anyhow!("engine gone"))?;
+
+            // Writer task drains render frames to the socket.
+            let writer = tokio::spawn(async move {
+                while let Some(frame) = out_rx.recv().await {
+                    if framing::write_frame(&mut write_half, &frame).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let read_result = async {
+                loop {
+                    let frame: ClientFrame = framing::read_frame(&mut reader).await?;
+                    let detached = matches!(frame, ClientFrame::Detach);
+                    tx.send(DaemonMsg::Frame { id, frame })
+                        .map_err(|_| anyhow!("engine gone"))?;
+                    if detached {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+            }
+            .await;
+
+            let _ = tx.send(DaemonMsg::Detached { id });
+            writer.abort();
+            return read_result;
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(DaemonMsg::Rpc { req, reply: reply_tx }).map_err(|_| anyhow!("engine gone"))?;
+        match reply_rx.await {
+            Ok(resp) => write_json(&mut write_half, &resp).await?,
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
+async fn write_json<W: AsyncWriteExt + Unpin>(w: &mut W, resp: &Response) -> Result<()> {
+    let mut buf = serde_json::to_vec(resp)?;
+    buf.push(b'\n');
+    w.write_all(&buf).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Append a line to the daemon log. The daemon has no terminal of its own, so anything
+/// worth knowing about goes here.
+pub fn log_line(msg: &str) {
+    use std::io::Write;
+    let path = crate::config::log_path();
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} {msg}", clock_string());
+    }
+}
+
+/// `HH:MM:SS` in UTC, without pulling in a date crate for log lines nobody diffs.
+fn clock_string() -> String {
+    let secs = now_millis() / 1000;
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}

@@ -1,0 +1,407 @@
+//! Lifecycle-hook integration.
+//!
+//! With hooks installed, an agent reports its own state and horde stops guessing from the
+//! screen. That is the difference between "probably working" and "definitely working".
+//!
+//! Installing is **merge-safe**: it only ever adds or replaces horde's own hook entries and
+//! leaves every other tool's hooks (and the user's) untouched.
+
+use anyhow::{anyhow, Context, Result};
+use serde_json::{json, Value};
+use std::io::Read;
+use std::path::PathBuf;
+
+use crate::proto::AgentState;
+
+/// Claude Code hook events horde cares about, and the state each implies.
+///
+/// `SessionStart` reports identity rather than state — it is where the session id for
+/// `--resume` comes from.
+const CLAUDE_EVENTS: &[(&str, Option<AgentState>)] = &[
+    ("SessionStart", None),
+    ("UserPromptSubmit", Some(AgentState::Working)),
+    ("PreToolUse", Some(AgentState::Working)),
+    ("Notification", Some(AgentState::Blocked)),
+    ("Stop", Some(AgentState::Idle)),
+];
+
+fn claude_settings_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot find your home directory"))?;
+    Ok(home.join(".claude").join("settings.json"))
+}
+
+fn horde_binary() -> Result<String> {
+    // Absolute path, so hooks work regardless of the agent's PATH.
+    let exe = std::env::current_exe().context("cannot determine the horde binary path")?;
+    Ok(exe.to_string_lossy().to_string())
+}
+
+/// True when a hook command belongs to horde.
+fn is_horde_command(cmd: &str) -> bool {
+    cmd.contains(" hook claude ") || cmd.contains(" hook ")
+}
+
+pub fn install(agent: &str) -> Result<()> {
+    if agent != "claude" {
+        return Err(anyhow!(
+            "only `claude` has a hook integration so far; other agents use screen detection"
+        ));
+    }
+    let path = claude_settings_path()?;
+    let bin = horde_binary()?;
+
+    let mut settings: Value = match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?,
+        _ => json!({}),
+    };
+    if !settings.is_object() {
+        return Err(anyhow!("{} does not contain a JSON object", path.display()));
+    }
+
+    // Back up before touching a file horde does not own.
+    if path.exists() {
+        let backup = path.with_extension("json.horde-backup");
+        std::fs::copy(&path, &backup)
+            .with_context(|| format!("could not back up to {}", backup.display()))?;
+    }
+
+    let hooks = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        return Err(anyhow!("the `hooks` key in {} is not an object", path.display()));
+    }
+    let hooks = hooks.as_object_mut().unwrap();
+
+    let mut added = 0;
+    for (event, _) in CLAUDE_EVENTS {
+        let entry = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
+        let Some(arr) = entry.as_array_mut() else {
+            return Err(anyhow!("hooks.{event} in {} is not an array", path.display()));
+        };
+
+        // Drop any previous horde entry for this event so reinstalling is idempotent and
+        // never accumulates duplicates.
+        arr.retain(|group| {
+            !group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|inner| {
+                    inner.iter().any(|h| {
+                        h.get("command").and_then(|c| c.as_str()).is_some_and(is_horde_command)
+                    })
+                })
+                .unwrap_or(false)
+        });
+
+        arr.push(json!({
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": format!("{bin} hook claude {event}"),
+                "timeout": 5
+            }]
+        }));
+        added += 1;
+    }
+
+    let text = serde_json::to_string_pretty(&settings)?;
+    // Write via a temp file then rename, so an interrupted write cannot corrupt settings.
+    let tmp = path.with_extension("json.horde-tmp");
+    std::fs::write(&tmp, text + "\n")?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("could not write {}", path.display()))?;
+
+    println!("installed {added} hooks into {}", path.display());
+    println!("existing hooks from other tools were left untouched");
+    println!("restart any running Claude Code sessions for hooks to take effect");
+    Ok(())
+}
+
+pub fn uninstall(agent: &str) -> Result<()> {
+    if agent != "claude" {
+        return Err(anyhow!("unknown integration {agent:?}"));
+    }
+    let path = claude_settings_path()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => {
+            println!("nothing to remove");
+            return Ok(());
+        }
+    };
+    let mut settings: Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+
+    let mut removed = 0;
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_event, entry) in hooks.iter_mut() {
+            if let Some(arr) = entry.as_array_mut() {
+                let before = arr.len();
+                arr.retain(|group| {
+                    !group
+                        .get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|inner| {
+                            inner.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .is_some_and(is_horde_command)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                removed += before - arr.len();
+            }
+        }
+        // Leave no empty arrays behind.
+        hooks.retain(|_, v| !v.as_array().map(|a| a.is_empty()).unwrap_or(false));
+    }
+
+    std::fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
+    println!("removed {removed} horde hooks from {}", path.display());
+    Ok(())
+}
+
+/// Payload a Claude Code hook delivers on stdin. Only the fields horde reads are named.
+#[derive(Debug, Default)]
+struct HookInput {
+    event: String,
+    session_id: Option<String>,
+    /// Present when the event came from a subagent rather than the main conversation.
+    agent_id: Option<String>,
+}
+
+fn parse_hook_input(text: &str) -> HookInput {
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return HookInput::default() };
+    HookInput {
+        event: v.get("hook_event_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        session_id: v
+            .get("session_id")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        agent_id: v
+            .get("agent_id")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    }
+}
+
+/// What a hook firing should do.
+#[derive(Debug, PartialEq)]
+enum HookAction {
+    Report { state: Option<AgentState>, session: bool },
+    /// Deliberately do nothing.
+    Ignore(&'static str),
+}
+
+/// Decide what to do about one hook firing.
+///
+/// `event_arg` is what the hook config passed; `payload.event` is what Claude reported. The
+/// payload wins when present, since it is the authority on what actually happened.
+fn decide(event_arg: &str, payload: &HookInput) -> HookAction {
+    let event = if payload.event.is_empty() { event_arg } else { payload.event.as_str() };
+
+    // A subagent's lifecycle says nothing about whether the pane needs you.
+    if payload.agent_id.is_some() {
+        return HookAction::Ignore("subagent event");
+    }
+    // SubagentStop can arrive after the main turn has already stopped (recap and
+    // away-summary both do this), so treating it as activity would revive an idle pane.
+    if event == "SubagentStop" {
+        return HookAction::Ignore("SubagentStop cannot revive an idle pane");
+    }
+
+    match CLAUDE_EVENTS.iter().find(|(e, _)| *e == event) {
+        Some((_, state)) => HookAction::Report { state: *state, session: event == "SessionStart" },
+        None => HookAction::Ignore("event not mapped"),
+    }
+}
+
+/// Called by an installed hook. Reads the payload on stdin and reports to the daemon.
+///
+/// This must never fail loudly: a hook that errors would surface inside the agent's own
+/// output. Every path exits 0.
+pub fn run_hook(agent: &str, event: &str) -> Result<()> {
+    if agent != "claude" {
+        return Ok(());
+    }
+    let mut text = String::new();
+    let _ = std::io::stdin().read_to_string(&mut text);
+    let payload = parse_hook_input(&text);
+
+    // Outside a horde pane there is nothing to report to.
+    let Ok(pane) = std::env::var("HORDE_PANE") else { return Ok(()) };
+
+    match decide(event, &payload) {
+        HookAction::Ignore(_) => Ok(()),
+        HookAction::Report { state, session } => {
+            let mut params = json!({ "pane": pane.parse::<u32>().unwrap_or(0) });
+            if let Some(s) = state {
+                params["state"] = Value::from(s.label());
+            } else {
+                // SessionStart carries no state, but the daemon requires one; `idle` is
+                // accurate at the moment a session opens.
+                params["state"] = Value::from("idle");
+            }
+            if session || payload.session_id.is_some() {
+                if let Some(sid) = payload.session_id {
+                    params["session"] = Value::from(sid);
+                }
+            }
+            // Failure here is not the agent's problem; stay silent.
+            let _ = super::call("pane.report_agent", params);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_events_to_states() {
+        let p = HookInput::default();
+        assert_eq!(
+            decide("UserPromptSubmit", &p),
+            HookAction::Report { state: Some(AgentState::Working), session: false }
+        );
+        assert_eq!(
+            decide("Notification", &p),
+            HookAction::Report { state: Some(AgentState::Blocked), session: false }
+        );
+        assert_eq!(
+            decide("Stop", &p),
+            HookAction::Report { state: Some(AgentState::Idle), session: false }
+        );
+        assert_eq!(
+            decide("SessionStart", &p),
+            HookAction::Report { state: None, session: true }
+        );
+    }
+
+    #[test]
+    fn subagent_stop_never_revives_an_idle_pane() {
+        // Claude's recap and away-summary can emit SubagentStop after the turn ended.
+        // Treating it as activity would flip a finished pane back to working.
+        let p = HookInput { event: "SubagentStop".into(), ..Default::default() };
+        assert!(matches!(decide("Stop", &p), HookAction::Ignore(_)));
+    }
+
+    #[test]
+    fn subagent_events_are_ignored() {
+        let p = HookInput {
+            event: "Stop".into(),
+            agent_id: Some("sub-1".into()),
+            ..Default::default()
+        };
+        assert!(matches!(decide("Stop", &p), HookAction::Ignore(_)));
+    }
+
+    #[test]
+    fn the_payload_event_wins_over_the_argument() {
+        // The hook config could be stale; Claude's own report is authoritative.
+        let p = HookInput { event: "Notification".into(), ..Default::default() };
+        assert_eq!(
+            decide("Stop", &p),
+            HookAction::Report { state: Some(AgentState::Blocked), session: false }
+        );
+    }
+
+    #[test]
+    fn unmapped_events_are_ignored() {
+        let p = HookInput { event: "PostToolUse".into(), ..Default::default() };
+        assert!(matches!(decide("PostToolUse", &p), HookAction::Ignore(_)));
+    }
+
+    #[test]
+    fn parses_a_realistic_payload() {
+        let p = parse_hook_input(
+            r#"{"hook_event_name":"SessionStart","session_id":"abc-123",
+                "transcript_path":"/tmp/x.jsonl","source":"startup"}"#,
+        );
+        assert_eq!(p.event, "SessionStart");
+        assert_eq!(p.session_id.as_deref(), Some("abc-123"));
+        assert!(p.agent_id.is_none());
+    }
+
+    #[test]
+    fn garbage_or_empty_stdin_does_not_panic() {
+        assert_eq!(parse_hook_input("").event, "");
+        assert_eq!(parse_hook_input("not json").event, "");
+        assert_eq!(parse_hook_input("{}").event, "");
+        // An empty session id is treated as absent rather than a valid id.
+        assert!(parse_hook_input(r#"{"session_id":""}"#).session_id.is_none());
+    }
+
+    #[test]
+    fn horde_commands_are_recognised_for_idempotent_reinstall() {
+        assert!(is_horde_command("/usr/local/bin/horde hook claude Stop"));
+        assert!(!is_horde_command("bash '/Users/josh/.claude/hooks/herdr-agent-state.sh' session"));
+        assert!(!is_horde_command("echo hello"));
+    }
+
+    #[test]
+    fn install_is_merge_safe_and_idempotent() {
+        // Simulate a settings file that already has another tool's hook, mirroring the
+        // real-world case of herdr being installed alongside.
+        let mut settings = json!({
+            "permissions": { "allow": ["Bash"] },
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "bash '/Users/josh/.claude/hooks/herdr-agent-state.sh' session"
+                    }]
+                }]
+            }
+        });
+
+        let apply = |settings: &mut Value| {
+            let hooks = settings.get_mut("hooks").unwrap().as_object_mut().unwrap();
+            for (event, _) in CLAUDE_EVENTS {
+                let entry = hooks.entry(event.to_string()).or_insert_with(|| json!([]));
+                let arr = entry.as_array_mut().unwrap();
+                arr.retain(|g| {
+                    !g.get("hooks")
+                        .and_then(|h| h.as_array())
+                        .map(|inner| {
+                            inner.iter().any(|h| {
+                                h.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .is_some_and(is_horde_command)
+                            })
+                        })
+                        .unwrap_or(false)
+                });
+                arr.push(json!({
+                    "matcher": "*",
+                    "hooks": [{ "type": "command", "command": format!("/bin/horde hook claude {event}") }]
+                }));
+            }
+        };
+
+        apply(&mut settings);
+        let after_first = settings.clone();
+        apply(&mut settings);
+
+        assert_eq!(settings, after_first, "reinstalling must not accumulate duplicates");
+
+        // Unrelated settings survive.
+        assert!(settings.get("permissions").is_some());
+        // And so does the other tool's hook.
+        let session = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session.len(), 2, "herdr's hook must survive alongside horde's");
+        assert!(session.iter().any(|g| g["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("herdr-agent-state.sh")));
+    }
+}
