@@ -1,14 +1,16 @@
 # OpenAI Codex CLI screen manifest.
 #
-# Untested locally — codex is not installed on this machine. Refine with
-# `horde agent explain <pane>`, which prints the snapshot and the rule that fired.
+# Untested locally — codex is not installed on this machine. `esc to interrupt` was
+# removed from `detect`: Claude Code shows the same phrase, so it made both manifests claim
+# the same pane and the winner was whichever the map happened to yield first.
 
 name = "codex"
 processes = ["codex"]
 
 detect = [
-  'Codex',
-  'esc to interrupt',
+  'Codex CLI',
+  'OpenAI Codex',
+  'codex --',
 ]
 
 [[rules]]
@@ -25,9 +27,9 @@ any = [
 [[rules]]
 name = "working"
 state = "working"
+within = 4
 any = [
   'esc to interrupt',
-  '\bthinking\b',
   '\bWorking\b',
 ]
 

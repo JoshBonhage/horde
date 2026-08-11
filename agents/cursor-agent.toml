@@ -21,10 +21,10 @@ any = [
 [[rules]]
 name = "working"
 state = "working"
+within = 4
 any = [
   'esc to interrupt',
   '\bGenerating\b',
-  '\bThinking\b',
 ]
 
 [[rules]]

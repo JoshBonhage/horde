@@ -180,12 +180,13 @@ impl Detector {
                 .is_some_and(|t| t.elapsed() < HOOK_TTL)
                 .then(|| self.hook_kinds.get(&id).cloned())
                 .flatten();
-            let found = hooked.or_else(|| {
-                self.manifests
-                    .values()
-                    .find(|m| m.present(process.as_deref(), &screen))
-                    .map(|m| m.name.clone())
-            });
+            let cmd_kind = session
+                .panes
+                .get(&id)
+                .and_then(|p| p.cmd.split_whitespace().next())
+                .and_then(|w| w.rsplit('/').next())
+                .map(|s| s.to_string());
+            let found = hooked.or_else(|| self.identify(process.as_deref(), cmd_kind.as_deref(), &screen));
 
             // Hooks hold authority while their last report is fresh.
             let hook_fresh = self.hook_reports.get(&id).is_some_and(|t| t.elapsed() < HOOK_TTL);
@@ -264,6 +265,48 @@ impl Detector {
         events
     }
 
+    /// Work out which agent is in a pane, in order of how much the signal can be trusted.
+    ///
+    /// 1. the foreground process name — a definite answer from `ps`
+    /// 2. the command the pane was started with — what we were asked to run
+    /// 3. screen patterns — a guess, and the only ambiguous one
+    ///
+    /// The order matters and the iteration is sorted, because several agents share phrases
+    /// in their UIs. Letting a screen guess outrank `ps`, or letting HashMap order pick
+    /// between two matching manifests, is how a Claude pane ends up labelled `codex` on one
+    /// scan and `gemini` on the next.
+    fn identify(
+        &self,
+        process: Option<&str>,
+        cmd: Option<&str>,
+        screen: &str,
+    ) -> Option<String> {
+        let mut names: Vec<&String> = self.manifests.keys().collect();
+        names.sort();
+
+        for n in &names {
+            if self.manifests[*n].matches_process(process) {
+                return Some((*n).clone());
+            }
+        }
+        if let Some(cmd) = cmd {
+            if let Some(n) = names.iter().find(|n| n.as_str() == cmd) {
+                return Some((*n).clone());
+            }
+            for n in &names {
+                if self.manifests[*n].processes.iter().any(|p| p == cmd) {
+                    return Some((*n).clone());
+                }
+            }
+        }
+        for n in &names {
+            if self.manifests[*n].matches_screen(screen) {
+                return Some((*n).clone());
+            }
+        }
+        None
+    }
+
     /// Names already in use, excluding `except` so a pane does not collide with itself.
     fn taken_names(&self, session: &Session, except: PaneId) -> Vec<String> {
         session
@@ -283,17 +326,25 @@ impl Detector {
         };
         let lines = p.detection_snapshot(cfg.detection_lines);
         let screen = lines.join("\n");
-        let present: Vec<String> = self
+        let mut present: Vec<String> = self
             .manifests
             .values()
             .filter(|m| m.present(process.as_deref(), &screen))
             .map(|m| m.name.clone())
             .collect();
+        present.sort();
+        let cmd_kind = p
+            .cmd
+            .split_whitespace()
+            .next()
+            .and_then(|w| w.rsplit('/').next())
+            .map(|s| s.to_string());
+        let chosen = self.identify(process.as_deref(), cmd_kind.as_deref(), &screen);
 
         let hook_fresh =
             self.hook_reports.get(&pane).is_some_and(|t| t.elapsed() < HOOK_TTL);
 
-        let evaluated = present.first().and_then(|k| self.manifests.get(k)).map(|m| {
+        let evaluated = chosen.as_ref().and_then(|k| self.manifests.get(k)).map(|m| {
             let v = m.evaluate(&screen);
             serde_json::json!({
                 "manifest": m.name,
@@ -310,6 +361,7 @@ impl Detector {
             "authority": if hook_fresh { "hook" } else { "screen" },
             "hook_authoritative": hook_fresh,
             "manifests_matching": present,
+            "chosen": chosen,
             "screen_evaluation": evaluated,
             "current": p.agent.as_ref().map(|a| serde_json::json!({
                 "kind": a.kind,

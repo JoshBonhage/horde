@@ -1,0 +1,11 @@
+❯ count from 1 to 25, one number per line, slowly
+⏺ Counting now.
+✻ Thinking… about the request
+  1
+  2
+  3
+──────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · rest…
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt

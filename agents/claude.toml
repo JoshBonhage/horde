@@ -6,32 +6,36 @@
 # Patterns are single-quoted TOML literals so regex backslashes need no escaping.
 # Matching is case-insensitive and `^`/`$` bind to line boundaries.
 #
-# Patterns marked VERIFIED were read off a live Claude Code 2.1.227 session. The rest are
-# inferred; use `horde agent explain <pane>` to see the snapshot and the rule that fired.
+# Two things every pattern here has to survive:
 #
-# Rule order is load-bearing. The `❯` input caret stays on screen *while Claude is
-# working*, so an idle rule matching the caret would win over the working rule if it came
-# first. Blocked is checked before both, because a permission menu also renders a caret.
+# 1. **Truncation.** Claude elides its own status line to fit the pane, so at ~50 columns
+#    `· esc to interrupt` renders as `· esc to inte…`. Match a short prefix, never the
+#    whole phrase.
+# 2. **Transcript history.** The snapshot covers the last ~40 lines, which includes what
+#    Claude *said*, not just what it is doing. `within` restricts a rule to the bottom few
+#    lines — the live status area — so a "Thinking…" from ten minutes ago cannot pin the
+#    pane to `working` forever.
 
 name = "claude"
 
-# `claude` on disk is often a symlink to a versioned binary, so the process name alone is
-# not dependable — the `detect` patterns carry most of the weight.
+# `claude` on disk is often a symlink to a versioned binary, so the process name alone is not
+# dependable — though when `ps` does say `claude`, that beats any screen guess.
 processes = ["claude"]
 
+# Presence patterns must be unique to Claude. Anything generic ("esc to interrupt") is shared
+# with other agents' UIs and would make two manifests claim the same pane.
 detect = [
-  'esc to interrupt',          # VERIFIED
-  'shift\+tab to cycle',       # VERIFIED
-  '⏵⏵',                        # VERIFIED (mode indicator)
   'Claude Code',
   '\? for shortcuts',
+  'shift\+tab to cycle',
+  '⏵⏵',
 ]
 
-# Blocked is deliberately strict: only a visible approval, question, or permission UI
-# counts. Silence is never treated as blocked.
+# Blocked is checked first and kept deliberately strict: only a visible approval, question, or
+# permission UI counts. Silence is never treated as blocked.
 #
 # `❯\s*\d+\.` matches a numbered selection menu, which is distinct from the bare `❯` input
-# caret — matching the bare caret here would mark every idle pane as blocked.
+# caret — matching the caret here would mark every idle pane as blocked.
 [[rules]]
 name = "blocked-permission"
 state = "blocked"
@@ -43,18 +47,21 @@ any = [
   'No, and tell Claude',
 ]
 
-# VERIFIED: `esc to interrupt` is appended to the mode line while a turn is running and
-# removed the moment it finishes.
+# VERIFIED: while a turn runs, `· esc to interrupt` is appended to the mode line at the very
+# bottom and removed the moment it finishes. `within` pins this to that line so the words
+# cannot be picked up from scrollback, and the pattern is short enough to survive elision.
 [[rules]]
 name = "working-esc-to-interrupt"
 state = "working"
-any = ['esc to interrupt']
+within = 4
+any = ['esc to int']
 
-# VERIFIED: at rest the composer is a bare `❯` line framed by horizontal rules, with the
-# mode line beneath it.
+# VERIFIED: at rest the composer is a bare `❯` line framed by rules, with the mode line
+# beneath it and no interrupt hint.
 [[rules]]
 name = "idle-prompt"
 state = "idle"
+within = 6
 any = [
   '^❯',
   'shift\+tab to cycle',

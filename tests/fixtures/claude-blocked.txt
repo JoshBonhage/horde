@@ -1,0 +1,9 @@
+⏺ I need to edit a file.
+╭──────────────────────────────────────────────────────────────╮
+│ Do you want to make this edit to src/mux.rs?                  │
+│                                                              │
+│ ❯ 1. Yes                                                     │
+│   2. Yes, and don't ask again                                │
+│   3. No, and tell Claude what to do differently               │
+╰──────────────────────────────────────────────────────────────╯
+  ⏵⏵ auto mode on (shift+tab to cycle)

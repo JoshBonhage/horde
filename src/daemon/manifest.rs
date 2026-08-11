@@ -49,6 +49,9 @@ struct RawRule {
     all: Vec<String>,
     #[serde(default)]
     none: Vec<String>,
+    /// Match only the last N lines of the snapshot.
+    #[serde(default)]
+    within: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,19 +61,36 @@ pub struct Rule {
     any: Vec<regex::Regex>,
     all: Vec<regex::Regex>,
     none: Vec<regex::Regex>,
+    /// Restrict matching to the last N lines.
+    ///
+    /// This is what stops a live-status rule firing on transcript history. An agent that
+    /// printed "Thinking…" ten minutes ago still has those words on screen; only the bottom
+    /// couple of lines describe what it is doing *now*.
+    within: Option<usize>,
 }
 
 impl Rule {
     /// A rule fires when at least one `any` matches (or `any` is empty), every `all`
-    /// matches, and no `none` matches.
+    /// matches, and no `none` matches — against the last `within` lines, or the whole
+    /// snapshot when unset.
     fn matches(&self, screen: &str) -> bool {
-        if !self.any.is_empty() && !self.any.iter().any(|r| r.is_match(screen)) {
+        let owned;
+        let hay: &str = match self.within {
+            Some(n) => {
+                let lines: Vec<&str> = screen.lines().collect();
+                let start = lines.len().saturating_sub(n);
+                owned = lines[start..].join("\n");
+                &owned
+            }
+            None => screen,
+        };
+        if !self.any.is_empty() && !self.any.iter().any(|r| r.is_match(hay)) {
             return false;
         }
-        if !self.all.iter().all(|r| r.is_match(screen)) {
+        if !self.all.iter().all(|r| r.is_match(hay)) {
             return false;
         }
-        if self.none.iter().any(|r| r.is_match(screen)) {
+        if self.none.iter().any(|r| r.is_match(hay)) {
             return false;
         }
         true
@@ -96,15 +116,22 @@ pub struct Verdict {
 }
 
 impl Manifest {
-    /// Does this agent's UI appear to be on screen, or is its process in the foreground?
-    pub fn present(&self, process: Option<&str>, screen: &str) -> bool {
-        if let Some(p) = process {
-            let base = p.rsplit('/').next().unwrap_or(p);
-            if self.processes.iter().any(|want| want == base) {
-                return true;
-            }
-        }
+    /// Is this agent's process in the foreground? A definite answer, when available.
+    pub fn matches_process(&self, process: Option<&str>) -> bool {
+        let Some(p) = process else { return false };
+        let base = p.rsplit('/').next().unwrap_or(p);
+        self.processes.iter().any(|want| want == base)
+    }
+
+    /// Does this agent's UI appear to be on screen? A guess, used only when the process name
+    /// tells us nothing.
+    pub fn matches_screen(&self, screen: &str) -> bool {
         self.detect.iter().any(|r| r.is_match(screen))
+    }
+
+    /// Either signal. Kept for diagnostics; detection itself prefers the process.
+    pub fn present(&self, process: Option<&str>, screen: &str) -> bool {
+        self.matches_process(process) || self.matches_screen(screen)
     }
 
     /// First matching rule wins.
@@ -160,6 +187,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
             any: compile(&r.any, &format!("{}.{}.any", raw.name, r.name))?,
             all: compile(&r.all, &format!("{}.{}.all", raw.name, r.name))?,
             none: compile(&r.none, &format!("{}.{}.none", raw.name, r.name))?,
+            within: r.within,
         });
     }
     Ok(Manifest {
@@ -204,6 +232,128 @@ pub fn load_all(dir: &Path) -> (HashMap<String, Manifest>, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real screens captured from a live Claude Code session. These are the regression
+    /// guard for the whole class of bug where one agent's manifest claims another's pane.
+    const CLAUDE_SCREENS: &[(&str, &str, AgentState)] = &[
+        ("idle", include_str!("../../tests/fixtures/claude-idle.txt"), AgentState::Idle),
+        ("working", include_str!("../../tests/fixtures/claude-working.txt"), AgentState::Working),
+        (
+            "working-narrow",
+            include_str!("../../tests/fixtures/claude-working-narrow.txt"),
+            AgentState::Working,
+        ),
+        ("blocked", include_str!("../../tests/fixtures/claude-blocked.txt"), AgentState::Blocked),
+        (
+            "finished-after-thinking",
+            include_str!("../../tests/fixtures/claude-finished-after-thinking.txt"),
+            AgentState::Idle,
+        ),
+    ];
+
+    /// No other agent may claim a Claude pane. Generic phrases like `esc to interrupt` in
+    /// another manifest's `detect` list made two manifests match at once, and with HashMap
+    /// ordering deciding the winner a pane flickered between `codex` and `gemini`.
+    #[test]
+    fn no_other_manifest_claims_a_claude_screen() {
+        let (all, _) = load_all(Path::new("/nonexistent"));
+        for (label, screen, _) in CLAUDE_SCREENS {
+            let claimants: Vec<&str> = all
+                .values()
+                .filter(|m| m.matches_screen(screen))
+                .map(|m| m.name.as_str())
+                .collect();
+            assert_eq!(
+                claimants,
+                vec!["claude"],
+                "claude {label} screen is claimed by {claimants:?}"
+            );
+        }
+    }
+
+    /// Claude's own manifest must read each screen correctly, including the narrow pane where
+    /// Claude elides its status line to `esc to inte…`.
+    #[test]
+    fn claude_manifest_reads_real_screens_correctly() {
+        let (all, _) = load_all(Path::new("/nonexistent"));
+        let claude = &all["claude"];
+        for (label, screen, want) in CLAUDE_SCREENS {
+            let v = claude.evaluate(screen);
+            assert_eq!(v.state, *want, "claude {label}: got {:?} via {}", v.state, v.reason);
+        }
+    }
+
+    /// The bug behind "it stays generating forever": a rule matching transcript history keeps
+    /// firing long after the agent stopped. `within` is what prevents it.
+    #[test]
+    fn a_finished_turn_is_not_read_as_working_because_of_scrollback() {
+        let (all, _) = load_all(Path::new("/nonexistent"));
+        let claude = &all["claude"];
+        let screen = include_str!("../../tests/fixtures/claude-finished-after-thinking.txt");
+        assert!(screen.contains("Thinking"), "fixture must contain stale status words");
+        let v = claude.evaluate(screen);
+        assert_eq!(
+            v.state,
+            AgentState::Idle,
+            "stale 'Thinking' in scrollback must not pin the pane to working (rule: {})",
+            v.reason
+        );
+    }
+
+    /// Screen patterns are a guess and can fail — a dialog could cover the chrome horde looks
+    /// for. The process name is the definite answer, which is why detection prefers it and an
+    /// unrecognisable screen does not make an agent vanish from the sidebar.
+    #[test]
+    fn an_unrecognisable_screen_still_resolves_by_process_name() {
+        let (all, _) = load_all(Path::new("/nonexistent"));
+        let claude = &all["claude"];
+        let opaque = "some full-screen dialog with none of the usual chrome";
+        assert!(!claude.matches_screen(opaque), "fixture should not match by screen");
+        assert!(claude.matches_process(Some("claude")), "ps is the fallback that saves us");
+        assert!(claude.matches_process(Some("/usr/local/bin/claude")), "basename is used");
+        assert!(!claude.matches_process(Some("zsh")));
+    }
+
+    #[test]
+    fn within_restricts_matching_to_the_bottom_lines() {
+        let m = parse(
+            r#"
+name = "t"
+[[rules]]
+name = "bottom-only"
+state = "working"
+within = 2
+any = ['BUSY']
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.evaluate("BUSY
+x
+y").state, AgentState::Idle, "too far up to count");
+        assert_eq!(m.evaluate("x
+y
+BUSY").state, AgentState::Working);
+        // A snapshot shorter than `within` still works.
+        assert_eq!(m.evaluate("BUSY").state, AgentState::Working);
+    }
+
+    /// Detect lists must not overlap between agents at all, on any fixture we have.
+    #[test]
+    fn manifests_do_not_share_detect_patterns() {
+        let (all, _) = load_all(Path::new("/nonexistent"));
+        // A phrase several agents genuinely use must not appear in any detect list, or
+        // whichever manifest is checked first wins the pane.
+        let generic = ["esc to interrupt", "esc to cancel", "Thinking", "Working"];
+        for m in all.values() {
+            for g in generic {
+                assert!(
+                    !m.matches_screen(g),
+                    "{}'s detect list matches the generic phrase {g:?}",
+                    m.name
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_bundled_manifest_parses() {
@@ -272,6 +422,7 @@ any = ["ZZZ"]
             any: compile(&v(any), "t").unwrap(),
             all: compile(&v(all), "t").unwrap(),
             none: compile(&v(none), "t").unwrap(),
+            within: None,
         }
     }
 

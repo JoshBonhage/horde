@@ -1,0 +1,7 @@
+❯ do a thing
+⏺ Working on it.
+──────────────────────────────
+❯
+──────────────────────────────
+  ⚠ Transcript saving is off…
+  ⏵⏵ auto mode on (shift+tab…) · esc to inte…

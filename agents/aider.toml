@@ -9,6 +9,7 @@ processes = ["aider"]
 detect = [
   'aider v',
   'Added .* to the chat',
+  'aider --',
 ]
 
 [[rules]]
@@ -25,6 +26,7 @@ any = [
 [[rules]]
 name = "working"
 state = "working"
+within = 4
 any = [
   '^\s*Thinking',
   'Applying edit',

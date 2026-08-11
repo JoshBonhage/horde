@@ -1,0 +1,8 @@
+│ Opus 5 (1M context) with high… · Claude Team · The │ /release-notes for more   │
+│               ~/Documents/dev/horde                │                           │
+╰──────────────────────────────────────────────────────────────────────────────╯
+──────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · rest…
+  ⏵⏵ auto mode on (shift+tab to cycle)

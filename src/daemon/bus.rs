@@ -420,7 +420,7 @@ mod tests {
         let pane = *session.panes.keys().next().unwrap();
         give_agent(&mut session, pane, AgentState::Idle);
 
-        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-deliver.jsonl"));
+        let bus = Bus::new(std::env::temp_dir().join("horde-test-deliver.jsonl"));
         let mut m = msg(1, "ping");
         bus.deliver(&mut session, pane, &mut m, true);
         assert_eq!(m.delivery, Delivery::Delivered);

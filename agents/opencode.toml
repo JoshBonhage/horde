@@ -4,7 +4,9 @@ name = "opencode"
 processes = ["opencode"]
 
 detect = [
-  'opencode',
+  'opencode v',
+  'opencode --',
+  'OpenCode',
 ]
 
 [[rules]]
@@ -20,10 +22,10 @@ any = [
 [[rules]]
 name = "working"
 state = "working"
+within = 4
 any = [
   'esc to interrupt',
   '\bWorking\b',
-  '\bThinking\b',
 ]
 
 [[rules]]

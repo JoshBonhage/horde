@@ -5,7 +5,8 @@ processes = ["gemini"]
 
 detect = [
   'Gemini CLI',
-  'esc to cancel',
+  'gemini-2',
+  'GEMINI\.md',
 ]
 
 [[rules]]
@@ -21,6 +22,7 @@ any = [
 [[rules]]
 name = "working"
 state = "working"
+within = 4
 any = [
   'esc to cancel',
   '\bThinking\b',

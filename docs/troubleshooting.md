@@ -13,6 +13,16 @@ This prints what detection is actually looking at and which rule fired. The usua
 truncated off and a working agent reads as idle. Fix: `horde integration install claude`, or
 widen the pane.
 
+**It says it is generating and never stops.** A rule is matching the agent's own transcript
+rather than its live status line — "Thinking…" from ten minutes ago is still on screen. The
+rule needs `within = N` to scope it to the bottom few lines. See
+[agents](agents.md).
+
+**It has the wrong agent's name.** Two manifests are claiming the pane because one has a
+generic `detect` pattern that the other agent also shows. `horde agent explain` prints
+`chosen` and `manifests_matching`; if more than one is listed, tighten the `detect` list of
+whichever does not belong.
+
 **No rule matched.** `reason` will say so, and the state falls back to `idle`. If the agent
 updated its UI, the bundled pattern may be stale — copy `agents/<name>.toml` to
 `~/.config/horde/agents/<name>.toml` and fix the pattern. `agent explain` shows you the
