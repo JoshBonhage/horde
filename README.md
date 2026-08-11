@@ -69,6 +69,7 @@ cp target/release/horde ~/.local/bin/      # or anywhere on PATH
 
 ```sh
 horde                 # start the daemon if needed, then attach
+horde upgrade         # swap in a rebuilt binary, keeping every agent alive
 horde stop            # stop the daemon and everything it owns
 horde status          # what the daemon thinks is going on
 ```
@@ -318,8 +319,8 @@ Shell panes are not listed — they are not agents, and you can already see them
 ## Notes
 
 * **The daemon outlives your client and survives rebuilds.** After `cargo build`, run
-  `horde stop` before reattaching, or you will connect a new client to the old daemon.
-  horde warns when it notices this, but stopping is the cure.
+  `horde upgrade` — it swaps the binary while your agents keep running. `horde stop` also
+  works but ends them. horde warns if a client attaches to a daemon of a different version.
 
 * macOS and Linux. No Windows.
 * The socket path must stay under ~100 bytes; that is an OS limit on `AF_UNIX`. Set

@@ -51,10 +51,51 @@ goes out when a terminal window closes cannot reach it. That is the whole reason
 window is safe; a daemon left in the client's process group would die with it and take every
 agent along.
 
-Not implemented: swapping the daemon binary while it runs. herdr does this by passing the
-open PTY file descriptors to a replacement process over a Unix socket (`SCM_RIGHTS`), so an
-upgrade never touches the child processes. horde has the state/runtime split that would make
-it possible, but for now upgrading means `horde stop && horde`, which does end your agents.
+### Upgrading without killing anything
+
+```sh
+cargo build --release
+horde upgrade                    # or --exe /path/to/new/binary
+```
+
+The running daemon hands the whole session to a new process and exits. Your panes keep
+running throughout — same processes, same pids, same conversations. Use this after rebuilding
+instead of `horde stop`.
+
+It works because panes are attached to the *slave* side of their PTYs while the daemon holds
+the master. Transfer the master descriptors to a successor over a Unix socket
+(`SCM_RIGHTS`) and the children never learn anything changed: no signals, no restarts.
+Layout, names, agent state, and each pane's visible screen travel alongside as ordinary
+serialised data.
+
+The ordering is where the safety lives:
+
+```
+1. pause every reader, and wait for each to acknowledge
+2. snapshot state, duplicate the PTY masters
+3. spawn the successor in import mode, joined by a socketpair
+4. send manifest + descriptors
+5. successor rebuilds the panes and binds <socket>.handoff   -> "R"
+6. we unlink <socket>                                        -> "G"
+7. successor renames <socket>.handoff to <socket>            -> "B"
+8. we exit without signalling any pane process group
+```
+
+The invariant is that **exactly one process may read a given PTY at a time** — two readers on
+one master would tear the output stream in half. That is why step 1 waits for acknowledgement
+rather than assuming.
+
+Anything failing before step 6 rolls back: readers resume, the successor is killed, and the
+session carries on untouched. Steps 6 and 7 are an unlink followed by a rename of a file the
+successor already created, so the committed window has no failure mode worth planning around.
+
+Two honest caveats:
+
+- **Alternate-screen programs come back approximate.** `nvim`, `htop` and friends survive
+  perfectly — their processes are untouched — but horde replays the visible grid, not their
+  internal state, so they look off until they next redraw.
+- **This is not checkpoint/restore.** It does not survive a reboot, move processes between
+  machines, or preserve anything beyond the descriptors and the screen.
 
 ### What it costs to leave running
 

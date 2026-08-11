@@ -30,9 +30,22 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Run the daemon in the foreground (normally started automatically).
-    Daemon,
+    Daemon {
+        /// Internal: take over an existing session from a predecessor daemon.
+        #[arg(long, hide = true)]
+        import: bool,
+    },
     /// Stop the daemon and every pane it owns.
     Stop,
+    /// Replace the running daemon with this binary, keeping every pane and agent alive.
+    ///
+    /// The PTYs are handed to the new daemon over a socket, so the processes attached to
+    /// them never notice. Use this after rebuilding instead of `horde stop`.
+    Upgrade {
+        /// Binary to hand over to. Defaults to the one running this command.
+        #[arg(long)]
+        exe: Option<String>,
+    },
     /// Show daemon status.
     Status,
     /// List agents and their states.
@@ -281,8 +294,55 @@ fn dir_name(s: &str) -> Result<&str> {
 
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
-        Command::Daemon | Command::Stop if false => unreachable!(),
-        Command::Daemon => unreachable!("handled in main"),
+        Command::Daemon { .. } => unreachable!("handled in main"),
+
+        Command::Upgrade { exe } => {
+            if !daemon_running() {
+                println!("no daemon running — just start one with `horde`");
+                return Ok(());
+            }
+            let exe = match exe {
+                Some(e) => std::fs::canonicalize(&e)
+                    .with_context(|| format!("no such binary: {e}"))?
+                    .to_string_lossy()
+                    .to_string(),
+                None => std::env::current_exe()?.to_string_lossy().to_string(),
+            };
+            let before = call("server.status", json!({}))?;
+            let was = before.get("version").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let panes = before.get("panes").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            println!("handing {panes} panes to {exe}…");
+            // The daemon exits the moment it commits, so losing the connection here is the
+            // expected outcome rather than a failure.
+            match call("server.handoff", json!({ "exe": exe })) {
+                Ok(_) => {}
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("closed the connection") {
+                        return Err(e).context("handoff refused; nothing changed");
+                    }
+                }
+            }
+
+            // Wait for the successor to take over the socket.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(v) = call("server.status", json!({})) {
+                    let now = v.get("version").and_then(|x| x.as_str()).unwrap_or("?");
+                    let n = v.get("panes").and_then(|x| x.as_u64()).unwrap_or(0);
+                    println!("upgraded {was} -> {now}, {n} panes still running");
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "the new daemon did not come up within 15s — see {}",
+                        crate::config::log_path().display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        }
 
         Command::Stop => {
             if !daemon_running() {

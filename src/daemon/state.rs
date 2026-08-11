@@ -741,6 +741,105 @@ impl Session {
             .collect()
     }
 
+    // -- live handoff -----------------------------------------------------
+
+    /// Rebuild this session from a predecessor's manifest and its transferred PTY masters.
+    ///
+    /// Panes are adopted rather than spawned: their processes never learn the daemon changed.
+    pub fn import(
+        &mut self,
+        cfg: &Config,
+        theme: &crate::theme::Theme,
+        manifest: super::handoff::Manifest,
+        fds: Vec<std::os::fd::OwnedFd>,
+    ) -> Result<usize> {
+        // Descriptors arrive in the manifest's pane order, so pair them up first.
+        let mut fds: Vec<Option<std::os::fd::OwnedFd>> = fds.into_iter().map(Some).collect();
+        // Manifest index to the pane id we give it here.
+        let mut ids: Vec<Option<PaneId>> = vec![None; manifest.panes.len()];
+
+        self.view = manifest.view;
+        self.client_cols = manifest.client_cols;
+        self.client_rows = manifest.client_rows;
+
+        let mut space_ids = Vec::new();
+        for hspace in &manifest.spaces {
+            let space_id = self.next_space;
+            self.next_space += 1;
+            let name = self.unique_space_name(&hspace.name);
+            self.spaces.push(Space {
+                id: space_id,
+                name,
+                cwd: PathBuf::from(&hspace.cwd),
+                tabs: Vec::new(),
+                focused_tab: None,
+            });
+            space_ids.push(space_id);
+
+            let mut tab_ids = Vec::new();
+            for htab in &hspace.tabs {
+                let tab_id = self.next_tab;
+                self.next_tab += 1;
+                self.tabs.push(Tab {
+                    id: tab_id,
+                    space: space_id,
+                    name: htab.name.clone(),
+                    layout: Layout::new(),
+                    focused_pane: None,
+                });
+                if let Some(s) = self.space_mut(space_id) {
+                    s.tabs.push(tab_id);
+                }
+                tab_ids.push(tab_id);
+
+                // Adopt every pane this tab's tree refers to, then rebuild the tree.
+                let mut leaves = Vec::new();
+                collect_hleaves(&htab.tree, &mut leaves);
+                for mi in leaves {
+                    let Some(hpane) = manifest.panes.get(mi) else {
+                        return Err(anyhow!("tree references pane {mi} which is not in the manifest"));
+                    };
+                    let Some(fd) = fds.get_mut(mi).and_then(|f| f.take()) else {
+                        return Err(anyhow!("no descriptor for pane {mi}"));
+                    };
+                    let id = self.next_pane;
+                    self.next_pane += 1;
+                    let pane = Pane::adopt(
+                        id,
+                        tab_id,
+                        space_id,
+                        hpane,
+                        fd,
+                        cfg.scrollback,
+                        theme,
+                    )?;
+                    self.panes.insert(id, pane);
+                    ids[mi] = Some(id);
+                }
+
+                let tree = rebuild_hnode(&htab.tree, &ids)?;
+                if let Some(t) = self.tab_mut(tab_id) {
+                    t.layout = Layout::from_root(tree);
+                    t.focused_pane = htab.focused_pane.and_then(|i| ids.get(i).copied().flatten());
+                }
+            }
+
+            if let (Some(fi), Some(s)) = (hspace.focused_tab, self.space_mut(space_id)) {
+                s.focused_tab = tab_ids.get(fi).copied().or(tab_ids.first().copied());
+            } else if let Some(s) = self.space_mut(space_id) {
+                s.focused_tab = tab_ids.first().copied();
+            }
+        }
+
+        self.focused_space = manifest
+            .focused_space
+            .and_then(|i| space_ids.get(i).copied())
+            .or_else(|| space_ids.first().copied());
+
+        self.relayout(cfg);
+        Ok(self.panes.len())
+    }
+
     // -- snapshot ---------------------------------------------------------
 
     pub fn snapshot(&self, cfg: &Config) -> Snapshot {
@@ -832,6 +931,41 @@ impl Session {
             tabbar: self.chrome.tabbar,
         }
     }
+}
+
+fn collect_hleaves(n: &super::handoff::HNode, out: &mut Vec<usize>) {
+    use super::handoff::HNode;
+    match n {
+        HNode::Leaf(i) => out.push(*i),
+        HNode::Split { a, b, .. } => {
+            collect_hleaves(a, out);
+            collect_hleaves(b, out);
+        }
+    }
+}
+
+fn rebuild_hnode(
+    n: &super::handoff::HNode,
+    ids: &[Option<PaneId>],
+) -> Result<super::layout::Node> {
+    use super::handoff::HNode;
+    use super::layout::{Axis, Node};
+    Ok(match n {
+        HNode::Leaf(i) => Node::Leaf(
+            ids.get(*i)
+                .copied()
+                .flatten()
+                .ok_or_else(|| anyhow!("pane {i} was not adopted"))?,
+        ),
+        HNode::Split { horizontal, ratio, a, b } => Node::Split {
+            // Reassigned by Layout::from_root.
+            id: 0,
+            axis: if *horizontal { Axis::Horizontal } else { Axis::Vertical },
+            ratio: *ratio,
+            a: Box::new(rebuild_hnode(a, ids)?),
+            b: Box::new(rebuild_hnode(b, ids)?),
+        },
+    })
 }
 
 /// Agent state attached to a pane. Populated in phase 2; declared here because `Pane` and

@@ -32,12 +32,17 @@ fn real_main() -> Result<()> {
     let cli = cli::Cli::parse();
 
     match cli.command {
-        Some(cli::Command::Daemon) => {
+        Some(cli::Command::Daemon { import }) => {
             let (cfg, warnings) = config::Config::load();
             for w in &warnings {
                 eprintln!("horde: config: {w}");
             }
-            runtime()?.block_on(daemon::run(cfg, warnings))
+            let rt = runtime()?;
+            if import {
+                rt.block_on(daemon::run_imported(cfg, warnings))
+            } else {
+                rt.block_on(daemon::run(cfg, warnings))
+            }
         }
         // Everything else is a one-shot control call and needs no async runtime.
         Some(cmd) => cli::run(cmd),

@@ -9,7 +9,7 @@
 //! directly from two places would double-consume damage.
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
@@ -19,9 +19,11 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::time::Instant;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+use super::pty::{self, ChildHandle, Master, Reader};
 
 use crate::proto::{attrs, CursorPos, PaneId, Row, Run, SpaceId, TabId};
 use crate::theme::Theme;
@@ -126,10 +128,10 @@ pub struct Pane {
 
     term: Term<EventProxy>,
     parser: Processor,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    bytes_rx: UnboundedReceiver<Vec<u8>>,
+    master: Master,
+    writer: std::fs::File,
+    child: ChildHandle,
+    reader: Reader,
     signal_rx: UnboundedReceiver<PaneSignal>,
 
     /// Visible grid as of the last `pump`. Authoritative for both rendering and detection.
@@ -188,29 +190,10 @@ impl Pane {
         // The slave fd must be dropped or the PTY never reports EOF when the child exits.
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().context("clone reader")?;
-        let writer = pair.master.take_writer().context("take writer")?;
-
-        // PTY reads are blocking, so they live on their own thread and hand bytes to the
-        // async side through a channel.
-        let (bytes_tx, bytes_rx) = unbounded_channel::<Vec<u8>>();
-        std::thread::Builder::new()
-            .name(format!("horde-pty-{id}"))
-            .spawn(move || {
-                let mut buf = [0u8; 65536];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if bytes_tx.send(buf[..n].to_vec()).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            })
-            .context("spawn pty reader thread")?;
+        let master = Master::Owned(pair.master);
+        let writer = master.writer()?;
+        let reader = pty::spawn_reader(&master, format!("horde-pty-{id}"))?;
+        let child = ChildHandle::Owned(child);
 
         let (signal_tx, signal_rx) = unbounded_channel::<PaneSignal>();
         let config = TermConfig { scrolling_history: scrollback, ..Default::default() };
@@ -231,10 +214,10 @@ impl Pane {
             agent: None,
             term,
             parser: Processor::new(),
-            master: pair.master,
+            master,
             writer,
             child,
-            bytes_rx,
+            reader,
             signal_rx,
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
@@ -249,7 +232,7 @@ impl Pane {
         let mut got_bytes = false;
         // Bounded per tick so one firehosing pane cannot starve the others.
         for _ in 0..256 {
-            match self.bytes_rx.try_recv() {
+            match self.reader.rx.try_recv() {
                 Ok(chunk) => {
                     self.parser.advance(&mut self.term, &chunk);
                     got_bytes = true;
@@ -285,8 +268,8 @@ impl Pane {
         }
 
         if self.exited.is_none() {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.exited = Some(status.exit_code() as i32);
+            if let Some(code) = self.child.try_wait() {
+                self.exited = Some(code);
             }
         }
 
@@ -498,6 +481,135 @@ impl Pane {
         self.write(bytes)
     }
 
+    // -- live handoff -----------------------------------------------------
+
+    /// Stop reading this pane's PTY and wait for the reader to confirm it has stopped.
+    ///
+    /// Returns false on timeout. A caller that cannot get confirmation must abandon the
+    /// handoff: two processes reading one master would tear the output stream apart.
+    pub fn pause_reader(&self, timeout: std::time::Duration) -> bool {
+        self.reader.pause(timeout)
+    }
+
+    pub fn resume_reader(&self) {
+        self.reader.resume();
+    }
+
+    /// Everything a successor daemon needs to take this pane over, plus a duplicate of the
+    /// PTY master to go with it.
+    ///
+    /// Call only while the reader is paused, so `pending` really is everything outstanding.
+    pub fn export(&mut self) -> Result<(super::handoff::HPane, std::os::fd::OwnedFd)> {
+        // Anything already read but not yet fed to the emulator travels with the manifest;
+        // dropping it would lose whatever the pane printed in the last instant.
+        let mut pending = Vec::new();
+        while let Ok(chunk) = self.reader.rx.try_recv() {
+            pending.extend(chunk);
+        }
+        let cursor = self.cursor();
+        let fd = self.master.dup_for_handoff()?;
+        Ok((
+            super::handoff::HPane {
+                pid: self.child.pid().unwrap_or(0),
+                cmd: self.cmd.clone(),
+                cwd: self.cwd.to_string_lossy().to_string(),
+                name: self.name.clone(),
+                osc_title: self.osc_title.clone(),
+                cols: self.cols,
+                rows: self.rows,
+                agent: self.agent.as_ref().map(|a| super::handoff::HAgent {
+                    kind: a.kind.clone(),
+                    name: a.name.clone(),
+                    state: a.state,
+                    authority: a.authority.clone(),
+                    reason: a.reason.clone(),
+                    seen: a.seen,
+                    session_id: a.session_id.clone(),
+                    queued: a.queued.clone(),
+                }),
+                screen: self.mirror.clone(),
+                pending,
+                cursor_x: cursor.x,
+                cursor_y: cursor.y,
+            },
+            fd,
+        ))
+    }
+
+    /// Rebuild a pane around a PTY master received from a predecessor.
+    ///
+    /// The child process is untouched and unaware: it is still attached to the slave side.
+    /// We are not its parent, so liveness moves to a null-signal check.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adopt(
+        id: PaneId,
+        tab: TabId,
+        space: SpaceId,
+        saved: &super::handoff::HPane,
+        fd: std::os::fd::OwnedFd,
+        scrollback: usize,
+        theme: &Theme,
+    ) -> Result<Pane> {
+        let master = pty::adopt(fd);
+        let writer = master.writer()?;
+        let reader = pty::spawn_reader(&master, format!("horde-pty-{id}"))?;
+
+        let (signal_tx, signal_rx) = unbounded_channel::<PaneSignal>();
+        let config = TermConfig { scrolling_history: scrollback, ..Default::default() };
+        let size = TermSize { cols: saved.cols as usize, rows: saved.rows as usize };
+        let term = Term::new(config, &size, EventProxy { tx: signal_tx });
+
+        let mut pane = Pane {
+            id,
+            tab,
+            space,
+            name: saved.name.clone(),
+            osc_title: saved.osc_title.clone(),
+            cwd: PathBuf::from(&saved.cwd),
+            cmd: saved.cmd.clone(),
+            cols: saved.cols,
+            rows: saved.rows,
+            exited: None,
+            agent: saved.agent.as_ref().map(|a| super::state::AgentRuntime {
+                kind: a.kind.clone(),
+                name: a.name.clone(),
+                state: a.state,
+                // The clock restarts; the alternative is serialising a monotonic instant,
+                // which is meaningless in another process.
+                since: Instant::now(),
+                authority: a.authority.clone(),
+                reason: a.reason.clone(),
+                seen: a.seen,
+                session_id: a.session_id.clone(),
+                queued: a.queued.clone(),
+            }),
+            term,
+            parser: Processor::new(),
+            master,
+            writer,
+            child: ChildHandle::Adopted(saved.pid),
+            reader,
+            signal_rx,
+            mirror: vec![Row::default(); saved.rows as usize],
+            dirty: HashSet::new(),
+            full_repaint: true,
+            deferred: Vec::new(),
+        };
+
+        // Repaint the emulator to what was on screen, then apply anything the predecessor
+        // had read but not yet processed. Without this the pane would come back blank until
+        // whatever is running happened to redraw.
+        let replay =
+            super::handoff::screen_to_ansi(&saved.screen, saved.cursor_x, saved.cursor_y);
+        pane.parser.advance(&mut pane.term, &replay);
+        if !saved.pending.is_empty() {
+            pane.parser.advance(&mut pane.term, &saved.pending);
+        }
+        pane.refresh_mirror(theme);
+        pane.request_full_repaint();
+        Ok(pane)
+    }
+
     /// Queue bytes to be written after `delay`.
     pub fn write_later(&mut self, bytes: Vec<u8>, delay: std::time::Duration) {
         self.deferred.push((Instant::now() + delay, bytes));
@@ -517,7 +629,7 @@ impl Pane {
         }
         self.cols = cols;
         self.rows = rows;
-        self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+        self.master.resize(cols, rows)?;
         self.term.resize(TermSize { cols: cols as usize, rows: rows as usize });
         self.mirror.clear();
         self.mirror.resize(rows as usize, Row::default());
@@ -551,7 +663,7 @@ impl Pane {
     /// Foreground process group of the PTY. Detection uses this to work out which program
     /// is actually in charge, which is not necessarily what we spawned.
     pub fn foreground_pgid(&self) -> Option<i32> {
-        self.master.process_group_leader()
+        self.master.foreground_pgid()
     }
 
     pub fn kill(&mut self) {

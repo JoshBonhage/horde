@@ -6,12 +6,15 @@
 
 pub mod agents;
 pub mod bus;
+pub mod handoff;
 pub mod layout;
 pub mod manifest;
 pub mod pane;
 pub mod persist;
+pub mod pty;
 pub mod rpc;
 pub mod state;
+pub mod upgrade;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -114,10 +117,26 @@ impl Engine {
 }
 
 pub async fn run(cfg: Config, warnings: Vec<String>) -> Result<()> {
-    let socket = socket_path();
+    run_inner(cfg, warnings, false).await
+}
+
+/// Start as the successor in a live handoff: adopt the predecessor's panes, then take over
+/// its socket. See [`upgrade`].
+pub async fn run_imported(cfg: Config, warnings: Vec<String>) -> Result<()> {
+    run_inner(cfg, warnings, true).await
+}
+
+async fn run_inner(cfg: Config, warnings: Vec<String>, importing: bool) -> Result<()> {
+    // While importing, the predecessor still owns the real socket path, so bind a staging
+    // path and move it into place once it says go.
+    let socket = if importing { upgrade::staging_socket() } else { socket_path() };
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    // An importing daemon may find a staging socket left by an aborted attempt.
+    if importing {
+        let _ = std::fs::remove_file(&socket);
     }
     ensure_socket_free(&socket).await?;
 
@@ -135,8 +154,15 @@ pub async fn run(cfg: Config, warnings: Vec<String>) -> Result<()> {
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("could not bind {}", socket.display()))?;
 
+    // Take the handoff socket before anything else can consume descriptor 3.
+    let import = if importing {
+        Some(upgrade::inherited_socket().context("picking up the handoff socket")?)
+    } else {
+        None
+    };
+
     let (tx, rx) = mpsc::unbounded_channel();
-    let engine = tokio::spawn(engine_loop(cfg, warnings, rx));
+    let engine = tokio::spawn(engine_loop(cfg, warnings, rx, import));
 
     let accept_tx = tx.clone();
     let accept = tokio::spawn(async move {
@@ -187,8 +213,12 @@ pub async fn run(cfg: Config, warnings: Vec<String>) -> Result<()> {
         }
     };
     hup.abort();
-    // Leave no stale socket behind for the next start to trip over.
-    let _ = std::fs::remove_file(&socket);
+    // Leave no stale socket behind for the next start to trip over. A daemon that handed
+    // over must not remove the path — its successor is listening on it now.
+    if !HANDED_OVER.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = std::fs::remove_file(socket_path());
+    }
+    let _ = std::fs::remove_file(upgrade::staging_socket());
     result
 }
 
@@ -211,10 +241,16 @@ async fn ensure_socket_free(socket: &PathBuf) -> Result<()> {
     }
 }
 
+/// Set once this process has committed a handoff, so shutdown does not delete the socket its
+/// successor now owns.
+pub static HANDED_OVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 async fn engine_loop(
     cfg: Config,
     warnings: Vec<String>,
     mut rx: mpsc::UnboundedReceiver<DaemonMsg>,
+    import: Option<std::os::unix::net::UnixStream>,
 ) -> Result<()> {
     let session = Session::new(&cfg);
     let agents = agents::Detector::new(&cfg);
@@ -229,14 +265,29 @@ async fn engine_loop(
         pending_events: Vec::new(),
     };
 
-    match persist::load(&crate::config::state_path()) {
-        Ok(Some(saved)) => {
-            if let Err(e) = persist::restore(&mut eng, saved) {
-                log_line(&format!("restore failed, starting fresh: {e}"));
+    let mut import = import;
+    match &mut import {
+        Some(sock) => {
+            // Adopt the predecessor's panes. A failure here means rolling back is still
+            // possible on their side, so report it and exit rather than starting empty and
+            // pretending everything is fine.
+            match import_session(&mut eng, sock) {
+                Ok(n) => log_line(&format!("handoff: adopted {n} panes")),
+                Err(e) => {
+                    log_line(&format!("handoff: import failed: {e:#}"));
+                    return Err(e);
+                }
             }
         }
-        Ok(None) => {}
-        Err(e) => log_line(&format!("could not read saved state: {e}")),
+        None => match persist::load(&crate::config::state_path()) {
+            Ok(Some(saved)) => {
+                if let Err(e) = persist::restore(&mut eng, saved) {
+                    log_line(&format!("restore failed, starting fresh: {e}"));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log_line(&format!("could not read saved state: {e}")),
+        },
     }
     if eng.session.spaces.is_empty() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -246,6 +297,11 @@ async fn engine_loop(
 
     for w in warnings {
         eng.notice(NoticeLevel::Warn, w);
+    }
+
+    // Everything is rebuilt: tell the predecessor to stand down and take over its socket.
+    if let Some(sock) = &mut import {
+        upgrade::complete_import(sock).context("completing the handoff")?;
     }
 
     let mut attached = false;
@@ -287,8 +343,28 @@ async fn engine_loop(
         }
     }
 
-    let _ = persist::save(&eng, &crate::config::state_path());
+    if !HANDED_OVER.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = persist::save(&eng, &crate::config::state_path());
+    }
     Ok(())
+}
+
+/// Rebuild the session from a predecessor's manifest and descriptors.
+fn import_session(eng: &mut Engine, sock: &mut std::os::unix::net::UnixStream) -> Result<usize> {
+    let (manifest, fds) = handoff::recv(sock)?;
+    if fds.len() != manifest.panes.len() {
+        return Err(anyhow!(
+            "manifest lists {} panes but {} descriptors arrived",
+            manifest.panes.len(),
+            fds.len()
+        ));
+    }
+    let cfg = eng.cfg.clone();
+    let theme = cfg.theme.clone();
+    let count = eng.session.import(&cfg, &theme, manifest, fds)?;
+    eng.touch();
+    eng.detect_now();
+    Ok(count)
 }
 
 /// Returns true when the daemon should shut down.
@@ -296,6 +372,30 @@ fn handle_msg(eng: &mut Engine, msg: DaemonMsg) -> bool {
     match msg {
         DaemonMsg::Rpc { req, reply } => {
             let stop = req.method == "server.stop";
+            // Handoff is handled here rather than in the dispatcher: on success this process
+            // must stop touching the session and exit, which is not something a normal
+            // method return can express.
+            if req.method == "server.handoff" {
+                let exe = req
+                    .params
+                    .get("exe")
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from);
+                match upgrade::run(eng, exe) {
+                    Ok(()) => {
+                        HANDED_OVER.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = reply.send(Response::ok(
+                            req.id,
+                            serde_json::json!({ "handed_over": true }),
+                        ));
+                        return true;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Response::err(req.id, "failed", format!("{e:#}")));
+                        return false;
+                    }
+                }
+            }
             let resp = rpc::dispatch(eng, req);
             let _ = reply.send(resp);
             if stop {
