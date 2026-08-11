@@ -4,20 +4,25 @@ An agent-aware terminal multiplexer. A background daemon owns your PTYs, so codi
 keep working when you close the terminal — and it knows which ones need you.
 
 ```
-┌─ horde ───────────┬──────────────────────────┬─ bus ───────┐
-│ ● api-refactor  3 │┌ ⠹ builder ─── 2m18s ───┐│ 14:02   ✓   │
-│   ⠹ builder  2m18s││ > applying migration…  ││ builder →   │
-│   ◍ reviewer  blkd││   3 files changed      ││  reviewer   │
-│   · shell         │└────────────────────────┘│ schema is   │
-│                   │┌ ◍ reviewer needs you ──┐│ ready       │
-│ ○ docs          1 ││ Do you want to make    ││             │
-│   ○ writer   idle ││ this edit to src/mux.rs││ 14:03   ⧗   │
-│                   ││   ❯ 1. Yes             ││ reviewer →  │
-│ ───────────────── ││     2. No              ││  builder    │
-│ ◍ 1 needs you     │└────────────────────────┘│ LGTM ✓      │
-└───────────────────┴──────────────────────────┴─────────────┘
- ctrl+b   3 panes · 2 agents · 1 needs you        ~/dev/horde
+ api-refactor ›  1 agents  2 logs                        ◍1 ⠹1
+ horde              ╭ ⠹ builder ──── 2m18s ──╮╭ ◍ reviewer needs you ─╮ bus
+─────────────────── │ > applying migration…  ││ Do you want to make    │────────────
+ SPACES             │   003_users.sql        ││ this edit to src/mux.rs│ 14:02   ✓
+▎● api-refactor   2 │                        ││                        │ builder →
+ ○ docs           1 │   3 files changed      ││   ❯ 1. Yes             │  reviewer
+───────────────────  ╰────────────────────────╯╰────────────────────────╯ schema is
+ AGENTS             ╭ tests ──────────────────────────────────────────────╮ ready
+▎⠹ builder    2m18s │ PASS  42   FAIL  0                                  │
+ ◍ reviewer blocked │ $                                                   │ 14:03   ⧗
+ ○ writer      idle │                                                     │ reviewer →
+───────────────────  ╰────────────────────────────────────────────────────╯  builder
+ ◍ 1 needs you                                                            LGTM ✓
+ ⠹ 1 working
+ ctrl+b   3 panes · 3 agents · 1 needs you                    ~/dev/horde
 ```
+
+Spaces and agents are separate lists. Every agent in the session shows in one flat place
+with its own state, whichever space it happens to live in.
 
 ## Why
 
