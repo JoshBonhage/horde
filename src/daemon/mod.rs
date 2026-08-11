@@ -61,6 +61,9 @@ pub struct Engine {
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
     dirty_shape: bool,
+    /// Set when a pane appeared, so detection runs on the next tick instead of waiting for
+    /// the slow cadence.
+    detect_soon: bool,
     pending_events: Vec<Event>,
 }
 
@@ -77,6 +80,11 @@ impl Engine {
     /// Mark the session shape as changed so clients get a new snapshot.
     pub fn touch(&mut self) {
         self.dirty_shape = true;
+    }
+
+    /// Ask for a detection pass on the next tick, after spawning a pane.
+    pub fn detect_now(&mut self) {
+        self.detect_soon = true;
     }
 
     // Field-splitting wrappers. `self.agents.scan(&mut self.session, ...)` cannot borrow
@@ -188,6 +196,7 @@ async fn engine_loop(
         cfg,
         clients: HashMap::new(),
         dirty_shape: true,
+        detect_soon: true,
         pending_events: Vec::new(),
     };
 
@@ -451,6 +460,8 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
     if let Some(p) = seen {
         eng.mark_seen(p);
     }
+    // Any of the arms above can have created a pane; a spare detection pass is cheap.
+    eng.detect_soon = true;
     for (level, text) in problems {
         eng.notice(level, text);
     }
@@ -467,12 +478,30 @@ fn tick(eng: &mut Engine, ticks: u32) {
         }
     }
 
-    if ticks % DETECT_EVERY == 0 {
+    // A freshly spawned pane gets looked at on the very next tick rather than waiting up to
+    // DETECT_EVERY, so a new agent appears in the sidebar immediately.
+    if ticks % DETECT_EVERY == 0 || eng.detect_soon {
+        eng.detect_soon = false;
+        let before = agent_fingerprint(&eng.session);
         let mut events = eng.detect();
         // A message held back for a busy agent may now be deliverable.
         events.extend(eng.flush_bus());
+        let changed = !events.is_empty();
         for ev in events {
             eng.pending_events.push(ev);
+        }
+
+        // Agent state, names, and elapsed timers all travel in the snapshot, so a detection
+        // pass has to refresh it. Without this the sidebar keeps whatever it last saw and
+        // only catches up when something unrelated happens to dirty the shape.
+        //
+        // The fingerprint comparison matters on top of `has_agents`: an agent that
+        // *disappears* produces no event and leaves no agent behind to force a refresh, so
+        // the sidebar would go on showing one that has exited.
+        let after = agent_fingerprint(&eng.session);
+        let has_agents = !after.is_empty();
+        if changed || has_agents || before != after {
+            eng.dirty_shape = true;
         }
     }
 
@@ -490,6 +519,18 @@ fn tick(eng: &mut Engine, ticks: u32) {
     }
 
     broadcast(eng);
+}
+
+/// Cheap summary of every agent, so a detection pass can tell whether anything the client
+/// can see has changed — including an agent disappearing, which emits no event.
+fn agent_fingerprint(session: &Session) -> Vec<(PaneId, String, crate::proto::AgentState)> {
+    let mut v: Vec<_> = session
+        .panes
+        .values()
+        .filter_map(|p| p.agent.as_ref().map(|a| (p.id, a.name.clone(), a.state)))
+        .collect();
+    v.sort_by_key(|(id, _, _)| *id);
+    v
 }
 
 fn broadcast(eng: &mut Engine) {
@@ -733,4 +774,129 @@ pub fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an engine with one real pane, as the daemon would have.
+    fn engine() -> Engine {
+        let cfg = Config::default();
+        let session = Session::new(&cfg);
+        let agents = agents::Detector::new(&cfg);
+        let mut eng = Engine {
+            session,
+            bus: bus::Bus::new(std::env::temp_dir().join("horde-test-bus.jsonl")),
+            agents,
+            cfg,
+            clients: HashMap::new(),
+            dirty_shape: true,
+            detect_soon: true,
+            pending_events: Vec::new(),
+        };
+        let cfg = eng.cfg.clone();
+        eng.session.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        eng
+    }
+
+    fn kill_all(eng: &mut Engine) {
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    /// The bug this guards: agent state, names, and elapsed timers all reach the client
+    /// inside the snapshot. A detection pass that updates them without marking the shape
+    /// dirty leaves the sidebar showing whatever it last saw — indefinitely, until
+    /// something unrelated happens to dirty it.
+    #[test]
+    fn a_live_agent_refreshes_the_snapshot_every_detection_pass() {
+        let mut eng = engine();
+        let pane = *eng.session.panes.keys().next().unwrap();
+
+        // Establish the agent the way an installed hook does. That also keeps it alive
+        // through the scan, since a fresh hook report outranks screen detection.
+        let Engine { agents, session, .. } = &mut eng;
+        agents.report(session, pane, crate::proto::AgentState::Working, None);
+        assert!(eng.session.panes[&pane].agent.is_some());
+
+        eng.dirty_shape = false;
+        eng.detect_soon = false;
+        tick(&mut eng, DETECT_EVERY);
+        assert!(
+            eng.dirty_shape,
+            "a working agent's elapsed timer only advances if the snapshot is resent"
+        );
+        // The agent survived the scan, and reaches the client through the snapshot.
+        let cfg = eng.cfg.clone();
+        let info = eng
+            .session
+            .snapshot(&cfg)
+            .panes
+            .into_iter()
+            .find(|p| p.id == pane)
+            .and_then(|p| p.agent)
+            .expect("a hook-reported agent must survive screen detection");
+        assert_eq!(info.state, crate::proto::AgentState::Working);
+        assert_eq!(info.authority, "hook");
+        kill_all(&mut eng);
+    }
+
+    /// An agent that goes away emits no state-change event and leaves nothing behind to
+    /// force a refresh, so without the fingerprint check the sidebar would keep listing it.
+    #[test]
+    fn an_agent_disappearing_also_refreshes_the_snapshot() {
+        let mut eng = engine();
+        let pane = *eng.session.panes.keys().next().unwrap();
+
+        // An agent with no hook backing, in a pane running a plain shell: detection is
+        // right to remove it, and the client has to be told.
+        eng.session.panes.get_mut(&pane).unwrap().agent = Some(state::AgentRuntime {
+            kind: "claude".into(),
+            name: "builder".into(),
+            state: crate::proto::AgentState::Idle,
+            since: std::time::Instant::now(),
+            authority: "screen".into(),
+            reason: "t".into(),
+            seen: false,
+            session_id: None,
+            queued: Vec::new(),
+        });
+
+        eng.dirty_shape = false;
+        eng.detect_soon = false;
+        tick(&mut eng, DETECT_EVERY);
+        assert!(eng.session.panes[&pane].agent.is_none(), "the scan should have removed it");
+        assert!(eng.dirty_shape, "the sidebar must be told the agent is gone");
+        kill_all(&mut eng);
+    }
+
+    /// With no agents there is nothing time-varying to push, so an idle session stays quiet
+    /// rather than sending a snapshot every detection pass forever.
+    #[test]
+    fn an_idle_session_with_no_agents_does_not_refresh_needlessly() {
+        let mut eng = engine();
+        eng.dirty_shape = false;
+        eng.detect_soon = false;
+        tick(&mut eng, DETECT_EVERY);
+        assert!(!eng.dirty_shape, "nothing changed, so nothing should be resent");
+        kill_all(&mut eng);
+    }
+
+    /// A newly spawned pane is looked at on the next tick rather than waiting out the slow
+    /// cadence, so a new agent appears immediately instead of up to DETECT_EVERY later.
+    #[test]
+    fn a_spawn_requests_a_prompt_detection_pass() {
+        let mut eng = engine();
+        eng.detect_soon = false;
+        apply_cmd(&mut eng, Cmd::SplitRight);
+        assert!(eng.detect_soon, "spawning a pane must ask for a detection pass");
+
+        // And that pass happens on the very next tick, not only on the cadence.
+        eng.dirty_shape = false;
+        tick(&mut eng, 1); // 1 % DETECT_EVERY != 0
+        assert!(!eng.detect_soon, "the requested pass should have run");
+        kill_all(&mut eng);
+    }
 }

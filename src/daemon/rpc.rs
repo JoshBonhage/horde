@@ -123,6 +123,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 .create_space(&cfg, str_arg(req, "name"), &cwd)
                 .map_err(|e| failed(e.to_string()))?;
             eng.touch();
+            eng.detect_now();
             Ok(json!({ "space": id }))
         }
         "space.focus" => {
@@ -163,6 +164,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 .create_tab(&cfg, space, str_arg(req, "name"))
                 .map_err(|e| failed(e.to_string()))?;
             eng.touch();
+            eng.detect_now();
             Ok(json!({ "tab": id }))
         }
         "tab.close" => {
@@ -191,6 +193,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 p.name = Some(n.to_string());
             }
             eng.touch();
+            eng.detect_now();
             Ok(json!({ "pane": id }))
         }
         "pane.close" => {
@@ -342,6 +345,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 p.name = Some(n.to_string());
             }
             eng.touch();
+            eng.detect_now();
             Ok(json!({ "pane": id, "cmd": cmd }))
         }
         "agent.wait" => {

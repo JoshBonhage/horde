@@ -33,13 +33,22 @@ pub struct Detector {
     processes: HashMap<PaneId, String>,
     /// Last hook report per pane, used to decide whether hooks still hold authority.
     hook_reports: HashMap<PaneId, Instant>,
+    /// Agent kind last reported by a hook, so a scan can keep the agent even when neither
+    /// the process name nor the screen identifies it.
+    hook_kinds: HashMap<PaneId, String>,
 }
 
 impl Detector {
     pub fn new(cfg: &Config) -> Detector {
         let _ = cfg;
         let (manifests, warnings) = manifest::load_all(&crate::config::config_dir().join("agents"));
-        Detector { manifests, warnings, processes: HashMap::new(), hook_reports: HashMap::new() }
+        Detector {
+            manifests,
+            warnings,
+            processes: HashMap::new(),
+            hook_reports: HashMap::new(),
+            hook_kinds: HashMap::new(),
+        }
     }
 
     pub fn reload(&mut self) {
@@ -73,6 +82,9 @@ impl Detector {
 
         let names = self.taken_names(session, pane);
         let pane_ref = session.panes.get_mut(&pane)?;
+        // Remember which agent reported, so a scan that cannot identify the pane by process
+        // or screen still knows what is in it.
+        self.hook_kinds.insert(pane, kind.clone());
         let cmd_kind =
             pane_ref.cmd.split_whitespace().next().unwrap_or("agent").rsplit('/').next()?.to_string();
         let kind = if self.manifests.contains_key(&cmd_kind) { cmd_kind } else { kind };
@@ -131,6 +143,7 @@ impl Detector {
         }
         self.processes.retain(|id, _| pane_ids.contains(id));
         self.hook_reports.retain(|id, _| pane_ids.contains(id));
+        self.hook_kinds.retain(|id, _| pane_ids.contains(id));
 
         for &id in &pane_ids {
             let process = self.processes.get(&id).cloned();
@@ -139,29 +152,39 @@ impl Detector {
                 None => continue,
             };
 
-            // Which agent, if any, is in this pane?
-            let found = self
-                .manifests
-                .values()
-                .find(|m| m.present(process.as_deref(), &screen))
-                .map(|m| m.name.clone());
+            // Which agent, if any, is in this pane? A fresh hook report is itself proof,
+            // and outranks guessing from the process name or the screen.
+            let hooked = self
+                .hook_reports
+                .get(&id)
+                .is_some_and(|t| t.elapsed() < HOOK_TTL)
+                .then(|| self.hook_kinds.get(&id).cloned())
+                .flatten();
+            let found = hooked.or_else(|| {
+                self.manifests
+                    .values()
+                    .find(|m| m.present(process.as_deref(), &screen))
+                    .map(|m| m.name.clone())
+            });
+
+            // Hooks hold authority while their last report is fresh.
+            let hook_fresh = self.hook_reports.get(&id).is_some_and(|t| t.elapsed() < HOOK_TTL);
 
             let Some(kind) = found else {
-                // Agent gone (exited back to a shell): drop the runtime so the sidebar
-                // stops listing it.
-                if let Some(p) = session.panes.get_mut(&id) {
-                    if p.agent.is_some() {
-                        p.agent = None;
+                // Nothing recognisable on screen. Drop the runtime so the sidebar stops
+                // listing an agent that has exited back to a shell — unless hooks are still
+                // reporting, in which case they are the authority and screen detection has
+                // no business overruling them. Without this guard a hook-reported agent
+                // whose process name horde does not recognise would flicker in and out.
+                if !hook_fresh {
+                    if let Some(p) = session.panes.get_mut(&id) {
+                        if p.agent.is_some() {
+                            p.agent = None;
+                        }
                     }
                 }
                 continue;
             };
-
-            // Hooks hold authority while their last report is fresh.
-            let hook_fresh = self
-                .hook_reports
-                .get(&id)
-                .is_some_and(|t| t.elapsed() < HOOK_TTL);
 
             let verdict: Option<Verdict> = if hook_fresh {
                 None
