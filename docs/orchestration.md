@@ -109,22 +109,24 @@ horde writes this into the target's terminal, then presses Enter for it:
 [horde] message from builder: schema migration is applied, please review src/db/*.rs
 ```
 
-Enter is sent as a **separate write, a moment after the text**. Agents detect a paste by
-noticing several bytes arriving in one read, and a carriage return inside a paste inserts a
-newline instead of submitting — so a message sent as one chunk would sit unsent in the
-recipient's input box. Two consequences for you:
-
-- **Newlines in your body are flattened to spaces.** A multi-line body would submit early,
-  one line at a time, splitting one message into several half-messages. Send one line.
-- **Sending twice in quick succession is held**, not merged. The second message waits for the
-  first one's Enter rather than landing in front of it.
-
-That means **your message arrives as if the human had typed it**. Two consequences:
+Your message arrives **as if the human had typed it**. Two consequences:
 
 1. **Phrase messages as instructions, not as chat.** "please review src/db/*.rs" works.
    "hey what do you think" wastes a turn.
 2. **The `[horde] message from <name>:` prefix is your signal.** If you see a line starting
    that way, another agent is talking to you — not the human.
+
+### Why Enter arrives separately
+
+horde writes the text, waits a beat, then sends Enter as its own write. Agents detect a
+paste by noticing several bytes arriving in one read, and a carriage return *inside* a paste
+inserts a newline rather than submitting — so a message sent as one chunk would sit unsent in
+the recipient's input box. Two things follow for you:
+
+- **Newlines in your body are flattened to spaces.** A multi-line body would submit early,
+  one line at a time, splitting one message into several half-messages. Send one line.
+- **Sending twice in quick succession is held**, not merged. The second message waits for the
+  first one's Enter rather than landing in front of it.
 
 ---
 
