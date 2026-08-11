@@ -57,13 +57,20 @@ Prefix is `ctrl+b`. `ctrl+b ?` lists everything.
 | **`a`** | **jump to the next agent that needs you** |
 | `g` | command palette |
 | `e` `b` | toggle sidebar / bus drawer |
-| `,` | rename the focused pane (also renames the agent) |
+| `,` `.` | rename the focused pane (also renames the agent) / **settings** |
 | `d` `?` | detach / help |
 
 Mouse works too: click a pane or a sidebar row to focus it, click a tab to switch, scroll
 to page back through scrollback.
 
-### Layouts
+#### Settings
+
+`ctrl+b .` opens a live settings panel: arrow keys change a value, it applies immediately
+and persists to `config.toml`. Writing goes through `toml_edit`, so comments and formatting
+in a hand-edited file survive. The panel also offers **edit config.toml in $EDITOR** (opens
+in a new pane) and **reload from disk**.
+
+## Layouts
 
 ```sh
 horde layout duo      # solo · duo · trio · dev · quad
@@ -232,7 +239,25 @@ src/
 agents/            bundled detection manifests
 ```
 
+## The sidebar
+
+Two independent sections:
+
+* **SPACES** — projects only. A dot turns to the attention colour when anything inside needs
+  you, so a collapsed row tells you whether it is worth opening.
+* **AGENTS** — every agent in the session, wherever it lives, each with its own state and
+  either its elapsed time or its status. Ordered stably by space rather than by urgency,
+  because rows that jump around under you are worse than rows you have to scan; colour
+  already carries the urgency. Agents in other spaces stay listed but render dimmer. Click
+  any row to jump to it.
+
+Shell panes are not listed — they are not agents, and you can already see them on screen.
+
 ## Notes
+
+* **The daemon outlives your client and survives rebuilds.** After `cargo build`, run
+  `horde stop` before reattaching, or you will connect a new client to the old daemon.
+  horde warns when it notices this, but stopping is the cure.
 
 * macOS and Linux. No Windows.
 * The socket path must stay under ~100 bytes; that is an OS limit on `AF_UNIX`. Set
@@ -240,4 +265,5 @@ agents/            bundled detection manifests
 * Not implemented: dragging pane borders to resize (use `H J K L`), text selection in copy
   mode, and OSC 52 clipboard forwarding.
 * `cargo test` covers the layout algebra, detection state machine, key encoding, config
-  parsing, and cell rendering — the parts where a subtle bug would be hard to see.
+  parsing and writing, and cell rendering — the parts where a subtle bug would be hard to
+  see.
