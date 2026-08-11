@@ -39,6 +39,23 @@ matches against it, `horde pane read` returns it.
 **Geometry lives in the daemon and nowhere else.** The client draws where it is told. That is
 why a pane's PTY size and its drawn rectangle can never drift apart.
 
+### What survives what
+
+| Event | What happens |
+|---|---|
+| `ctrl+b d`, or closing the terminal window | only the client ends. Every pane, process, and agent keeps running. `horde` reattaches to the same daemon. |
+| `horde stop`, a crash, a reboot | the daemon goes. On next start it restores the *shape* — spaces, tabs, the split tree and its ratios, names, working directories — and panes come back as fresh shells. Agents that reported a session id are resumed. |
+
+The daemon is started in its own session, with no controlling terminal, so the SIGHUP that
+goes out when a terminal window closes cannot reach it. That is the whole reason closing the
+window is safe; a daemon left in the client's process group would die with it and take every
+agent along.
+
+Not implemented: swapping the daemon binary while it runs. herdr does this by passing the
+open PTY file descriptors to a replacement process over a Unix socket (`SCM_RIGHTS`), so an
+upgrade never touches the child processes. horde has the state/runtime split that would make
+it possible, but for now upgrading means `horde stop && horde`, which does end your agents.
+
 ### One consequence worth knowing
 
 The daemon outlives every client and **survives rebuilds**. After `cargo build`, run

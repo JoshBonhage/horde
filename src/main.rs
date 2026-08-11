@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use std::os::unix::process::CommandExt;
 
 fn main() {
     if let Err(e) = real_main() {
@@ -71,13 +72,29 @@ fn ensure_daemon() -> Result<()> {
     let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     let err = out.try_clone()?;
 
-    std::process::Command::new(&exe)
-        .arg("daemon")
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(out)
-        .stderr(err)
-        .spawn()
-        .with_context(|| format!("could not start {} daemon", exe.display()))?;
+        .stderr(err);
+
+    // Put the daemon in its own session, with no controlling terminal.
+    //
+    // This is what makes horde behave like tmux. `Command::spawn` leaves a child in the
+    // parent's session and process group, so when the terminal window closes the kernel
+    // sends SIGHUP to that whole group — taking the daemon, and every agent it owns, down
+    // with the client. `setsid` detaches it so closing the window only ends the client.
+    unsafe {
+        cmd.pre_exec(|| {
+            // SAFETY: async-signal-safe, and the only call made between fork and exec.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    cmd.spawn().with_context(|| format!("could not start {} daemon", exe.display()))?;
 
     // Wait for it to bind. Two seconds is generous for a local socket, and failing with a
     // pointer to the log beats hanging.

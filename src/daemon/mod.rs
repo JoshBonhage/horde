@@ -20,6 +20,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{socket_path, Config};
@@ -153,11 +154,32 @@ pub async fn run(cfg: Config, warnings: Vec<String>) -> Result<()> {
         }
     });
 
+    // SIGHUP means "the terminal went away", which is precisely the case the daemon exists
+    // to survive. Ignore it rather than dying with the terminal that started us.
+    //
+    // `setsid` in the spawner already means we should never receive one, but a daemon
+    // started by hand from a shell (`horde daemon &`) has no such protection, and losing
+    // every agent because a window closed is not a failure worth risking twice.
+    let mut sighup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    let hup = tokio::spawn(async move {
+        loop {
+            sighup.recv().await;
+            log_line("ignoring SIGHUP — the daemon outlives its terminal");
+        }
+    });
+
     let result = tokio::select! {
         r = engine => r.map_err(|e| anyhow!("engine panicked: {e}")).and_then(|r| r),
         _ = accept => Ok(()),
+        // Both of these are orderly shutdowns, so the engine saves state on its way out.
         _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = sigterm.recv() => {
+            log_line("SIGTERM — shutting down");
+            Ok(())
+        }
     };
+    hup.abort();
     // Leave no stale socket behind for the next start to trip over.
     let _ = std::fs::remove_file(&socket);
     result

@@ -145,9 +145,10 @@ impl Session {
             tabs: Vec::new(),
             focused_tab: None,
         });
-        if self.focused_space.is_none() {
-            self.focused_space = Some(id);
-        }
+        // Focus the new space. Creating one and being left in the old one means the next
+        // `pane split` or spawned agent lands somewhere you did not ask for — which is how
+        // three freshly created spaces end up empty while the original fills up.
+        self.focused_space = Some(id);
         self.create_tab(cfg, id, None)?;
         Ok(id)
     }
@@ -861,5 +862,67 @@ impl AgentRuntime {
             authority: self.authority.clone(),
             reason: self.reason.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> (Config, Session) {
+        let mut cfg = Config::default();
+        // `cat` starts instantly and produces nothing, keeping these tests quick.
+        cfg.shell = "cat".into();
+        let session = Session::new(&cfg);
+        (cfg, session)
+    }
+
+    fn kill_all(s: &mut Session) {
+        for p in s.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    /// Creating a space must take you there. Otherwise the next split or spawned agent goes
+    /// into whichever space you were already in, and the new one sits empty.
+    #[test]
+    fn creating_a_space_focuses_it() {
+        let (cfg, mut s) = session();
+        let first = s.create_space(&cfg, Some("first"), &std::env::temp_dir()).unwrap();
+        assert_eq!(s.focused_space, Some(first));
+
+        let second = s.create_space(&cfg, Some("second"), &std::env::temp_dir()).unwrap();
+        assert_eq!(s.focused_space, Some(second), "the new space should be focused");
+
+        // And a split now lands in the new space rather than the old one.
+        let pane = s.split(&cfg, None, Dir::Right, None).unwrap();
+        assert_eq!(s.panes[&pane].space, second);
+        kill_all(&mut s);
+    }
+
+    /// Creating a tab focuses it too, for the same reason.
+    #[test]
+    fn creating_a_tab_focuses_it() {
+        let (cfg, mut s) = session();
+        let space = s.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        let tab = s.create_tab(&cfg, space, Some("logs")).unwrap();
+        assert_eq!(s.focused_tab(), Some(tab));
+        kill_all(&mut s);
+    }
+
+    #[test]
+    fn space_names_stay_unique_so_they_remain_addressable() {
+        let (cfg, mut s) = session();
+        s.create_space(&cfg, Some("api"), &std::env::temp_dir()).unwrap();
+        let b = s.create_space(&cfg, Some("api"), &std::env::temp_dir()).unwrap();
+        assert_eq!(s.space(b).unwrap().name, "api-2");
+
+        // Renaming onto a taken name is uniquified rather than creating a collision.
+        let c = s.create_space(&cfg, Some("other"), &std::env::temp_dir()).unwrap();
+        s.rename_space(c, "api");
+        assert_eq!(s.space(c).unwrap().name, "api-3");
+        // An empty rename is refused rather than leaving an unaddressable space.
+        assert!(!s.rename_space(c, "   "));
+        kill_all(&mut s);
     }
 }
