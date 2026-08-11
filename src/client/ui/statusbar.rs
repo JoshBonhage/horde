@@ -154,6 +154,7 @@ impl Widget for StatusBar<'_> {
             Mode::Palette { .. } => left.push(chip(" COMMAND ", t.ui.accent_alt, t)),
             Mode::SpaceSwitcher { .. } => left.push(chip(" SPACE ", t.ui.accent_alt, t)),
             Mode::Rename { .. } => left.push(chip(" RENAME ", t.ui.accent_alt, t)),
+            Mode::Settings { .. } => left.push(chip(" SETTINGS ", t.ui.accent_alt, t)),
             Mode::Terminal => left.push(Span::styled(
                 format!(" {} ", self.prefix),
                 panel.fg(color(t.ui.text_faint)),
@@ -280,6 +281,7 @@ mod tests {
             .collect();
         Snapshot {
             protocol: 1,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             spaces: vec![SpaceInfo {
                 id: 1,
                 name: "api".into(),

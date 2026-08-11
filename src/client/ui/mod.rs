@@ -282,6 +282,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             dim_area(f.buffer_mut(), area, &theme, 0.5);
             overlays::rename(f, area, app);
         }
+        Mode::Settings { .. } => {
+            dim_area(f.buffer_mut(), area, &theme, 0.6);
+            overlays::settings(f, area, app);
+        }
     }
 
     overlays::toasts(f, area, app);
@@ -422,6 +426,7 @@ mod frame_tests {
 
         let snap = Snapshot {
             protocol: 1,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             spaces: vec![
                 SpaceInfo { id: 1, name: "api-refactor".into(), cwd: "/x".into(),
                     tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1 },
@@ -499,6 +504,22 @@ mod frame_tests {
         let out = render(&mut app, 146, 39);
         println!("\n{out}\n");
         assert!(out.contains("keys"));
+    }
+
+    #[test]
+    fn settings_panel_renders() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        let rows = crate::client::settings::rows(&app.cfg);
+        let sel = rows.iter().position(|r| r.selectable()).unwrap();
+        app.mode = crate::client::Mode::Settings { sel };
+        let out = render(&mut app, 146, 39);
+        println!("\n{out}\n");
+        assert!(out.contains("settings"));
+        assert!(out.contains("Theme"));
+        assert!(out.contains("Sidebar width"));
+        assert!(out.contains("Edit config.toml"));
+        assert!(out.contains("change"));
     }
 
     #[test]

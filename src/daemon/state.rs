@@ -775,6 +775,7 @@ impl Session {
 
         Snapshot {
             protocol: PROTOCOL_VERSION,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             spaces,
             tabs,
             panes,

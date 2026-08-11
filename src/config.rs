@@ -418,6 +418,8 @@ pub enum Action {
     CopyMode,
     /// Open the rename prompt for the focused pane.
     RenamePane,
+    /// Open the settings panel.
+    Settings,
     /// Send the prefix key itself to the pane.
     SendPrefix,
 }
@@ -483,6 +485,7 @@ impl Default for Keymap {
             ("palette", Trigger::Prefix(d("g")), Action::Palette),
             ("copy_mode", Trigger::Prefix(d("[")), Action::CopyMode),
             ("rename_pane", Trigger::Prefix(d(",")), Action::RenamePane),
+            ("settings", Trigger::Prefix(d(".")), Action::Settings),
             ("help", Trigger::Prefix(d("?")), Action::Help),
             ("detach", Trigger::Prefix(d("d")), Action::Detach),
             ("send_prefix", Trigger::Prefix(d("ctrl+b")), Action::SendPrefix),

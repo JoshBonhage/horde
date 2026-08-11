@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use ratatui::Frame;
 
 use super::{centered, color, fill, put_line, truncate, wrap_text};
+use crate::client::settings::{self, Kind};
 use crate::client::{App, Mode, PickKind};
 use crate::config::{Action, Trigger};
 use crate::proto::NoticeLevel;
@@ -113,6 +114,7 @@ fn describe_action(name: &str, action: &Action) -> String {
         Action::SpaceSwitcher => "switch space".into(),
         Action::CopyMode => "scrollback / copy mode".into(),
         Action::RenamePane => "rename the focused pane".into(),
+        Action::Settings => "settings".into(),
         Action::SendPrefix => "send the prefix key to the pane".into(),
         Action::Cmd(_) => name.replace('_', " "),
     }
@@ -221,6 +223,104 @@ pub fn rename(f: &mut Frame, area: TRect, app: &App) {
         inner.width,
         Line::from(vec![Span::styled(
             "enter saves · esc cancels · empty clears".to_string(),
+            panel_bg.fg(color(theme.ui.text_faint)),
+        )]),
+    );
+}
+
+/// The settings panel: current values, changed in place.
+pub fn settings(f: &mut Frame, area: TRect, app: &App) {
+    let theme = app.cfg.theme.clone();
+    let Mode::Settings { sel } = &app.mode else { return };
+    let sel = *sel;
+    let rows = settings::rows(&app.cfg);
+
+    let w = (area.width.saturating_sub(8)).min(58).max(30);
+    let h = (rows.len() as u16 + 5).min(area.height.saturating_sub(2));
+    let outer = centered(area, w, h);
+    let inner = panel(f, outer, "settings", &theme);
+    let panel_bg = Style::default().bg(color(theme.ui.panel_bg));
+
+    let mut y = inner.y;
+    let bottom = inner.y + inner.height;
+    // Value column is right-aligned into a fixed gutter so values line up as a column.
+    let value_w = 18u16.min(inner.width / 2);
+    let label_w = inner.width.saturating_sub(value_w + 3);
+
+    for (i, r) in rows.iter().enumerate() {
+        if y >= bottom.saturating_sub(1) {
+            break;
+        }
+        match r.kind {
+            Kind::Separator => {
+                for x in 0..inner.width {
+                    if let Some(c) = f.buffer_mut().cell_mut((inner.x + x, y)) {
+                        c.set_symbol("─");
+                        c.set_style(panel_bg.fg(color(theme.ui.border)));
+                    }
+                }
+                y += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let selected = i == sel;
+        let bg = if selected { theme.ui.title_bg } else { theme.ui.panel_bg };
+        let row_bg = Style::default().bg(color(bg));
+
+        let label_color = match r.kind {
+            Kind::ReadOnly => theme.ui.text_faint,
+            _ if selected => theme.ui.text,
+            _ => theme.ui.text_dim,
+        };
+        let value_color = match r.kind {
+            Kind::Action(_) => theme.ui.text_faint,
+            Kind::ReadOnly => theme.ui.text_faint,
+            _ => theme.ui.accent,
+        };
+
+        let label = truncate(&r.label, label_w as usize);
+        let value = truncate(&r.value, value_w as usize);
+        let pad = inner
+            .width
+            .saturating_sub(2 + label.chars().count() as u16 + value.chars().count() as u16);
+
+        let mut label_style = row_bg.fg(color(label_color));
+        if selected {
+            label_style = label_style.add_modifier(Modifier::BOLD);
+        }
+
+        put_line(
+            f.buffer_mut(),
+            inner.x,
+            y,
+            inner.width,
+            Line::from(vec![
+                Span::styled(
+                    if selected { "▎" } else { " " },
+                    row_bg.fg(color(theme.ui.accent)),
+                ),
+                Span::styled(format!("{label} "), label_style),
+                Span::styled(" ".repeat(pad as usize), row_bg),
+                Span::styled(value, row_bg.fg(color(value_color))),
+            ]),
+        );
+        y += 1;
+    }
+
+    // Footer hint, pinned to the last line.
+    let hint = match rows.get(sel).map(|r| &r.kind) {
+        Some(Kind::Action(_)) => "enter runs · esc closes",
+        _ => "←/→ change · ↑/↓ move · esc closes",
+    };
+    put_line(
+        f.buffer_mut(),
+        inner.x + 1,
+        bottom.saturating_sub(1),
+        inner.width,
+        Line::from(vec![Span::styled(
+            hint.to_string(),
             panel_bg.fg(color(theme.ui.text_faint)),
         )]),
     );

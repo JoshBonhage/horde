@@ -264,6 +264,10 @@ pub struct SpaceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub protocol: u32,
+    /// Build version of the daemon. The client compares this against its own: a mismatch
+    /// means a daemon from an older binary is still running, which is easy to cause (the
+    /// daemon outlives every client and survives rebuilds) and confusing to diagnose.
+    pub daemon_version: String,
     pub spaces: Vec<SpaceInfo>,
     pub tabs: Vec<TabInfo>,
     pub panes: Vec<PaneInfo>,

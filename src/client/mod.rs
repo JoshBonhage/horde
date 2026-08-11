@@ -4,6 +4,7 @@
 //! come back without disturbing a single running process.
 
 pub mod input;
+pub mod settings;
 pub mod ui;
 
 use std::collections::{HashMap, VecDeque};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -24,7 +25,6 @@ use ratatui::Terminal;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
 
 use crate::config::{Action, Chord, Config, Notify, Trigger};
 use crate::framing;
@@ -51,6 +51,8 @@ pub enum Mode {
     Palette { query: String, sel: usize },
     SpaceSwitcher { query: String, sel: usize },
     Rename { pane: PaneId, value: String },
+    /// The settings panel. `sel` indexes into `settings::rows`.
+    Settings { sel: usize },
 }
 
 /// What selecting a picker row does.
@@ -78,6 +80,8 @@ pub struct App {
     pub tick: usize,
     /// Row-to-target map produced by the sidebar during render, used to resolve clicks.
     pub sidebar_hits: Vec<(u16, Hit)>,
+    /// Set once the version mismatch warning has been shown, so it appears only once.
+    pub warned_version: bool,
     pub quit: bool,
 }
 
@@ -98,6 +102,7 @@ impl App {
             toasts: VecDeque::new(),
             tick: 0,
             sidebar_hits: Vec::new(),
+            warned_version: false,
             quit: false,
         }
     }
@@ -295,13 +300,36 @@ fn restore_terminal(term: &mut Term) -> Result<()> {
     Ok(())
 }
 
+/// Read terminal events on a dedicated blocking thread.
+///
+/// **Do not replace this with `EventStream` in a `select!`.** crossterm's `EventStream`
+/// dispatches a wake-task guarded by an `AtomicBool` that is only cleared once that task
+/// fires. `select!` drops every branch future that does not win, so the first dropped
+/// `next()` leaves the flag set with a waker belonging to a dead future: no new task is
+/// dispatched, `poll_next` returns `Pending` forever, and all input stops. A blocking read
+/// on its own thread cannot be cancelled, so it cannot wedge.
+fn spawn_event_reader() -> mpsc::UnboundedReceiver<Event> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("horde-input".into())
+        .spawn(move || {
+            while let Ok(ev) = crossterm::event::read() {
+                if tx.send(ev).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn input thread");
+    rx
+}
+
 async fn run_loop(
     term: &mut Term,
     app: &mut App,
     out: mpsc::UnboundedSender<ClientFrame>,
     mut inbound: mpsc::UnboundedReceiver<ServerFrame>,
 ) -> Result<()> {
-    let mut events = EventStream::new();
+    let mut events = spawn_event_reader();
     let mut anim = tokio::time::interval(ANIM);
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut needs_draw = true;
@@ -334,13 +362,17 @@ async fn run_loop(
                     None => return Err(anyhow!("daemon closed the connection")),
                 }
             }
-            ev = events.next() => {
+            ev = events.recv() => {
                 match ev {
-                    Some(Ok(ev)) => {
+                    Some(ev) => {
                         handle_event(app, ev, &out)?;
+                        // Drain the rest of the burst so a fast typist gets one redraw,
+                        // not one per keystroke.
+                        while let Ok(ev) = events.try_recv() {
+                            handle_event(app, ev, &out)?;
+                        }
                         needs_draw = true;
                     }
-                    Some(Err(e)) => return Err(e.into()),
                     None => return Ok(()),
                 }
             }
@@ -365,6 +397,19 @@ async fn run_loop(
 fn apply_frame(app: &mut App, frame: ServerFrame) -> Option<String> {
     match frame {
         ServerFrame::Snapshot(snap) => {
+            // A daemon left over from an older build serves stale behaviour while looking
+            // perfectly healthy, so say so loudly the first time we see it.
+            let mine = env!("CARGO_PKG_VERSION");
+            if snap.daemon_version != mine && !app.warned_version {
+                app.warned_version = true;
+                app.toast(
+                    NoticeLevel::Warn,
+                    format!(
+                        "daemon is v{} but this client is v{mine} — run `horde stop`, then `horde`",
+                        snap.daemon_version
+                    ),
+                );
+            }
             // Forget caches for panes that no longer exist.
             let live: Vec<PaneId> = snap.panes.iter().map(|p| p.id).collect();
             app.rows.retain(|id, _| live.contains(id));
@@ -484,6 +529,9 @@ fn handle_key(
             }
             return Ok(());
         }
+        Mode::Settings { sel } => {
+            return settings_key(app, k, out, sel);
+        }
         Mode::Prefix => {
             app.mode = Mode::Terminal;
             match app.cfg.keys.lookup(&Trigger::Prefix(chord)).cloned() {
@@ -577,6 +625,88 @@ fn picker_key(
     Ok(())
 }
 
+/// Keys in the settings panel. Changes apply and persist immediately.
+fn settings_key(
+    app: &mut App,
+    k: KeyEvent,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    mut sel: usize,
+) -> Result<()> {
+    let rows = settings::rows(&app.cfg);
+    let selectable: Vec<usize> =
+        rows.iter().enumerate().filter(|(_, r)| r.selectable()).map(|(i, _)| i).collect();
+    if selectable.is_empty() {
+        app.mode = Mode::Terminal;
+        return Ok(());
+    }
+    // Position within the selectable rows, so separators are skipped rather than landed on.
+    let pos = selectable.iter().position(|i| *i == sel).unwrap_or(0);
+
+    let mut delta = 0i32;
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::Terminal;
+            return Ok(());
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            sel = selectable[pos.saturating_sub(1)];
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            sel = selectable[(pos + 1).min(selectable.len() - 1)];
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => delta = 1,
+        KeyCode::Left | KeyCode::Char('h') => delta = -1,
+        _ => {}
+    }
+
+    if delta != 0 {
+        match rows.get(sel).map(|r| r.kind.clone()) {
+            Some(settings::Kind::Setting(field)) => {
+                let (key, value) = settings::bump(&mut app.cfg, field, delta);
+                match settings::write(&key, value) {
+                    // The daemon owns geometry and PTY sizes, so it has to re-read too.
+                    Ok(()) => {
+                        let _ = crate::cli::call("server.reload_config", serde_json::json!({}));
+                    }
+                    Err(e) => app.toast(NoticeLevel::Error, format!("could not save: {e:#}")),
+                }
+            }
+            Some(settings::Kind::Action(settings::Action::Reload)) => {
+                let (cfg, warnings) = Config::load();
+                app.cfg = cfg;
+                let _ = crate::cli::call("server.reload_config", serde_json::json!({}));
+                for w in warnings {
+                    app.toast(NoticeLevel::Warn, w);
+                }
+                app.toast(NoticeLevel::Info, "config reloaded");
+            }
+            Some(settings::Kind::Action(settings::Action::EditFile)) => {
+                let path = settings::config_file();
+                // Give the editor something to open rather than an empty buffer.
+                if !path.exists() {
+                    if let Some(p) = path.parent() {
+                        let _ = std::fs::create_dir_all(p);
+                    }
+                    let _ = std::fs::write(&path, settings::template());
+                }
+                let cmd = format!("{} {}", settings::editor(), path.display());
+                let _ = out.send(ClientFrame::Command(Cmd::SpawnAgent {
+                    cmd,
+                    name: Some("config".into()),
+                    split: None,
+                }));
+                app.mode = Mode::Terminal;
+                app.toast(NoticeLevel::Info, "opened config.toml — settings reload on save");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    app.mode = Mode::Settings { sel };
+    Ok(())
+}
+
 /// Palette names map to the same commands the RPC layer uses, so there is one definition.
 fn command_for(name: &str) -> Option<Cmd> {
     use crate::proto::Dir;
@@ -620,6 +750,12 @@ fn run_action(
         Action::Palette => app.mode = Mode::Palette { query: String::new(), sel: 0 },
         Action::SpaceSwitcher => {
             app.mode = Mode::SpaceSwitcher { query: String::new(), sel: 0 }
+        }
+        Action::Settings => {
+            // Land on the first selectable row rather than a separator.
+            let rows = settings::rows(&app.cfg);
+            let sel = rows.iter().position(|r| r.selectable()).unwrap_or(0);
+            app.mode = Mode::Settings { sel };
         }
         Action::RenamePane => {
             if let Some(pane) = app.focused_pane() {

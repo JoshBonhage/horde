@@ -77,6 +77,12 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             eng.cfg = cfg;
             eng.agents.reload();
             let cfg = eng.cfg.clone();
+            // Panel visibility lives in ViewState, so a reload has to push the new config
+            // into it or a settings change would not take effect until restart.
+            eng.session.view.sidebar_open = cfg.sidebar;
+            eng.session.view.bus_open = cfg.bus;
+            eng.session.view.sidebar_width = cfg.sidebar_width;
+            eng.session.view.bus_width = cfg.bus_width;
             eng.session.relayout(&cfg);
             eng.touch();
             let mut all = warnings;
@@ -84,6 +90,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             Ok(json!({ "reloaded": true, "warnings": all }))
         }
         "server.status" => Ok(json!({
+            "version": env!("CARGO_PKG_VERSION"),
             "protocol": crate::proto::PROTOCOL_VERSION,
             "spaces": eng.session.spaces.len(),
             "tabs": eng.session.tabs.len(),
