@@ -109,6 +109,16 @@ horde writes this into the target's terminal, then presses Enter for it:
 [horde] message from builder: schema migration is applied, please review src/db/*.rs
 ```
 
+Enter is sent as a **separate write, a moment after the text**. Agents detect a paste by
+noticing several bytes arriving in one read, and a carriage return inside a paste inserts a
+newline instead of submitting — so a message sent as one chunk would sit unsent in the
+recipient's input box. Two consequences for you:
+
+- **Newlines in your body are flattened to spaces.** A multi-line body would submit early,
+  one line at a time, splitting one message into several half-messages. Send one line.
+- **Sending twice in quick succession is held**, not merged. The second message waits for the
+  first one's Enter rather than landing in front of it.
+
 That means **your message arrives as if the human had typed it**. Two consequences:
 
 1. **Phrase messages as instructions, not as chat.** "please review src/db/*.rs" works.
@@ -135,8 +145,10 @@ prompt, for two reasons:
   newline would *answer that prompt* — potentially approving a file write or a shell command
   nobody agreed to. horde will not do that.
 
-Queued messages flush automatically the moment the target reaches its prompt. You do not
-have to retry, and nothing is lost. You can see the queue depth:
+Queued messages flush automatically the moment the target reaches its prompt, **one per
+pass** — each delivered message submits a prompt, so releasing the whole queue at once would
+stack several turns of work on the recipient. You do not have to retry, and nothing is lost.
+You can see the queue depth:
 
 ```sh
 horde roster --json | grep queued

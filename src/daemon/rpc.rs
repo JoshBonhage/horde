@@ -248,11 +248,12 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             let text = str_arg(req, "text").ok_or_else(|| bad("text required"))?;
             let submit = bool_arg(req, "submit");
             let pane = eng.session.panes.get_mut(&p).ok_or_else(|| not_found("no such pane"))?;
-            let mut bytes = text.as_bytes().to_vec();
+            pane.write(text.as_bytes()).map_err(|e| failed(e.to_string()))?;
             if submit {
-                bytes.push(b'\r');
+                // Enter goes as its own write, or the agent reads text+CR as a paste and
+                // inserts a newline instead of submitting. See bus::SUBMIT_DELAY.
+                pane.write_later(vec![b'\r'], super::bus::SUBMIT_DELAY);
             }
-            pane.write(&bytes).map_err(|e| failed(e.to_string()))?;
             Ok(json!({ "sent": p }))
         }
         "pane.report_agent" | "pane.report-agent" => {

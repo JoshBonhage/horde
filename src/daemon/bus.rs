@@ -23,6 +23,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
@@ -33,6 +34,14 @@ use super::state::Session;
 
 /// Messages kept in memory for the bus drawer.
 const RING: usize = 500;
+
+/// How long after the text to send Enter.
+///
+/// Agents detect a paste by noticing several bytes arriving in one read, and a trailing
+/// carriage return inside a paste becomes a literal newline rather than a submit. Sending
+/// Enter as its own write, a beat later, makes it read as a keypress. Verified against
+/// Claude Code, which otherwise leaves the message sitting unsent in its input box.
+pub const SUBMIT_DELAY: Duration = Duration::from_millis(120);
 
 pub struct Bus {
     log_path: PathBuf,
@@ -125,6 +134,11 @@ impl Bus {
 
     fn gate(session: &Session, pane: PaneId, force: bool) -> Gate {
         let Some(p) = session.panes.get(&pane) else { return Gate::Hold("pane is gone") };
+        // A submit is still pending for this pane. Typing now would land in front of an
+        // Enter that has not fired yet, merging two messages into one prompt.
+        if p.has_deferred() {
+            return Gate::Hold("previous message is still being submitted");
+        }
         let Some(agent) = p.agent.as_ref() else { return Gate::TextOnly };
         if force {
             return Gate::Submit;
@@ -190,18 +204,22 @@ impl Bus {
         Ok(msg)
     }
 
-    /// Write a message into a pane. `submit` appends a carriage return.
+    /// Write a message into a pane.
+    ///
+    /// `submit` schedules Enter as a *separate* write rather than appending it, because an
+    /// agent reading text and CR in one chunk treats the whole thing as a paste and turns
+    /// the CR into a newline. See [`SUBMIT_DELAY`].
     fn deliver(&self, session: &mut Session, pane: PaneId, msg: &mut Message, submit: bool) {
-        let text = format!("[horde] message from {}: {}", msg.from, msg.body.trim());
-        let mut bytes = text.into_bytes();
-        if submit {
-            // Carriage return, not newline: that is what a terminal sends for Enter.
-            bytes.push(b'\r');
-        }
+        let text = format_message(&msg.from, &msg.body);
         match session.panes.get_mut(&pane) {
             Some(p) => {
-                msg.delivery = match p.write(&bytes) {
-                    Ok(()) => Delivery::Delivered,
+                msg.delivery = match p.write(text.as_bytes()) {
+                    Ok(()) => {
+                        if submit {
+                            p.write_later(vec![b'\r'], SUBMIT_DELAY);
+                        }
+                        Delivery::Delivered
+                    }
                     Err(_) => Delivery::Dropped,
                 };
             }
@@ -255,16 +273,17 @@ impl Bus {
             if !matches!(Self::gate(session, pane, cfg.force_inject), Gate::Submit) {
                 continue;
             }
-            // Take the whole queue: delivering one at a time would race the state change
-            // back to `working` and strand the rest.
-            let queued: Vec<Message> = session
+            // One message per pass. Each delivered message submits a prompt, so sending the
+            // whole queue at once would stack several turns of work on the recipient — and
+            // the second message's text would land before the first one's Enter. The rest
+            // stay queued and flush on later passes as it returns to idle.
+            let next: Option<Message> = session
                 .panes
                 .get_mut(&pane)
                 .and_then(|p| p.agent.as_mut())
-                .map(|a| std::mem::take(&mut a.queued))
-                .unwrap_or_default();
+                .and_then(|a| if a.queued.is_empty() { None } else { Some(a.queued.remove(0)) });
 
-            for mut msg in queued {
+            if let Some(mut msg) = next {
                 self.deliver(session, pane, &mut msg, true);
                 self.update_delivery(msg.id, msg.delivery);
                 events.push(Event::BusMessage(msg));
@@ -305,6 +324,16 @@ impl Bus {
     }
 }
 
+/// The exact bytes written into a recipient's terminal, minus the Enter that follows.
+///
+/// Newlines are flattened: a body containing one would submit early, one line at a time,
+/// turning a single message into several half-messages. The `[horde] message from <name>:`
+/// prefix is the recipient's signal that this is another agent rather than the human.
+pub fn format_message(from: &str, body: &str) -> String {
+    let body = body.trim().replace(['\r', '\n'], " ");
+    format!("[horde] message from {from}: {body}")
+}
+
 /// Replay the tail of the log. Later entries for the same id supersede earlier ones, which
 /// is how a queued-then-delivered message reads back correctly.
 fn read_tail(path: &PathBuf, n: usize) -> VecDeque<Message> {
@@ -325,6 +354,153 @@ fn read_tail(path: &PathBuf, n: usize) -> VecDeque<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::Config;
+    use crate::daemon::state::{AgentRuntime, Session};
+    use crate::proto::AgentState;
+
+    /// A session with one pane running `cat`, so anything written to the pty comes straight
+    /// back and lands in the mirror where a test can see it.
+    fn session_with_cat() -> (Config, Session) {
+        let mut cfg = Config::default();
+        cfg.shell = "cat".into();
+        let mut session = Session::new(&cfg);
+        session.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        (cfg, session)
+    }
+
+    fn give_agent(session: &mut Session, pane: PaneId, state: AgentState) {
+        session.panes.get_mut(&pane).unwrap().agent = Some(AgentRuntime {
+            kind: "claude".into(),
+            name: "target".into(),
+            state,
+            since: std::time::Instant::now(),
+            authority: "hook".into(),
+            reason: "t".into(),
+            seen: false,
+            session_id: None,
+            queued: Vec::new(),
+        });
+    }
+
+    fn msg(id: u64, body: &str) -> Message {
+        Message {
+            id,
+            ts: 0,
+            from: "builder".into(),
+            to: "target".into(),
+            body: body.into(),
+            delivery: Delivery::Queued,
+            broadcast: false,
+        }
+    }
+
+    #[test]
+    fn the_message_body_carries_no_carriage_return() {
+        // The bug this guards: an agent reading text and CR in one chunk treats the whole
+        // thing as a paste and inserts a newline instead of submitting, leaving the message
+        // sitting unsent in its input box. Enter has to be a separate write.
+        let text = format_message("builder", "please review src/bus.rs");
+        assert!(!text.contains('\r'), "{text:?}");
+        assert!(!text.contains('\n'), "{text:?}");
+        assert_eq!(text, "[horde] message from builder: please review src/bus.rs");
+    }
+
+    #[test]
+    fn newlines_in_a_body_are_flattened_not_submitted() {
+        // Otherwise each line submits separately, splitting one message into several.
+        let text = format_message("a", "line one\nline two\r\nline three");
+        assert_eq!(text, "[horde] message from a: line one line two  line three");
+        assert!(!text.contains('\n') && !text.contains('\r'));
+    }
+
+    #[test]
+    fn delivering_writes_the_text_now_and_enter_later() {
+        let (cfg, mut session) = session_with_cat();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Idle);
+
+        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-deliver.jsonl"));
+        let mut m = msg(1, "ping");
+        bus.deliver(&mut session, pane, &mut m, true);
+        assert_eq!(m.delivery, Delivery::Delivered);
+        assert!(session.panes[&pane].has_deferred(), "Enter must be pending, not already sent");
+
+        // The text itself reaches the pty immediately; `cat` echoes it back to us.
+        let theme = cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut saw = false;
+        while std::time::Instant::now() < deadline && !saw {
+            session.panes.get_mut(&pane).unwrap().pump(&theme);
+            saw = session.panes[&pane]
+                .visible_text()
+                .iter()
+                .any(|l| l.contains("message from builder"));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(saw, "the message text should have reached the pane");
+
+        // And the deferred Enter fires once its delay has passed.
+        std::thread::sleep(SUBMIT_DELAY + std::time::Duration::from_millis(60));
+        session.panes.get_mut(&pane).unwrap().pump(&theme);
+        assert!(!session.panes[&pane].has_deferred(), "Enter should have been written by now");
+
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    #[test]
+    fn a_pending_submit_holds_the_next_message() {
+        // Typing while an Enter is still queued would merge two messages into one prompt.
+        let (_cfg, mut session) = session_with_cat();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Idle);
+
+        assert!(matches!(Bus::gate(&session, pane, false), Gate::Submit));
+        session
+            .panes
+            .get_mut(&pane)
+            .unwrap()
+            .write_later(vec![b'\r'], std::time::Duration::from_secs(5));
+        assert!(matches!(Bus::gate(&session, pane, false), Gate::Hold(_)));
+
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    #[test]
+    fn flushing_delivers_one_message_per_pass() {
+        // Each delivered message submits a prompt, so draining the whole queue at once would
+        // stack turns on the recipient and land later text before earlier Enters.
+        let (cfg, mut session) = session_with_cat();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Idle);
+        {
+            let agent = session.panes.get_mut(&pane).unwrap().agent.as_mut().unwrap();
+            agent.queued = vec![msg(1, "one"), msg(2, "two"), msg(3, "three")];
+        }
+
+        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-flush.jsonl"));
+        let events = bus.flush_queued(&mut session, &cfg);
+        assert_eq!(events.len(), 1, "exactly one message per pass");
+        assert_eq!(
+            session.panes[&pane].agent.as_ref().unwrap().queued.len(),
+            2,
+            "the rest must stay queued"
+        );
+
+        // The pending Enter then holds the queue until it has fired.
+        assert!(
+            bus.flush_queued(&mut session, &cfg).is_empty(),
+            "a pending submit should hold the queue"
+        );
+
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+    }
 
     #[test]
     fn read_tail_of_a_missing_log_is_empty() {

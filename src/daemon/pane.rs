@@ -20,6 +20,7 @@ use alacritty_terminal::term::{Config as TermConfig, Term, TermDamage, TermMode}
 use alacritty_terminal::vte::ansi::Processor;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::time::Instant;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::proto::{attrs, CursorPos, PaneId, Row, Run, SpaceId, TabId};
@@ -137,6 +138,13 @@ pub struct Pane {
     dirty: HashSet<u16>,
     /// Set when a client attaches or the pane resizes, forcing a full repaint.
     full_repaint: bool,
+    /// Bytes to write once their deadline passes.
+    ///
+    /// This exists for one reason: Enter has to arrive as its own read. Agents treat a chunk
+    /// of text and a carriage return arriving together as a *paste*, and a trailing CR in a
+    /// paste inserts a literal newline instead of submitting. Writing the text, then the CR
+    /// a beat later, makes the CR read as a keypress.
+    deferred: Vec<(Instant, Vec<u8>)>,
 }
 
 impl Pane {
@@ -231,6 +239,7 @@ impl Pane {
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
             full_repaint: true,
+            deferred: Vec::new(),
         })
     }
 
@@ -261,6 +270,18 @@ impl Pane {
                 PaneSignal::Title(t) => self.osc_title = t,
                 PaneSignal::Bell | PaneSignal::ClipboardStore | PaneSignal::Wakeup => {}
             }
+        }
+
+        // Flush any deferred writes whose moment has come.
+        let now = Instant::now();
+        let due: Vec<Vec<u8>> = {
+            let (due, pending): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut self.deferred).into_iter().partition(|(at, _)| *at <= now);
+            self.deferred = pending;
+            due.into_iter().map(|(_, b)| b).collect()
+        };
+        for bytes in due {
+            let _ = self.write(&bytes);
         }
 
         if self.exited.is_none() {
@@ -475,6 +496,17 @@ impl Pane {
             self.scroll_bottom();
         }
         self.write(bytes)
+    }
+
+    /// Queue bytes to be written after `delay`.
+    pub fn write_later(&mut self, bytes: Vec<u8>, delay: std::time::Duration) {
+        self.deferred.push((Instant::now() + delay, bytes));
+    }
+
+    /// True while a deferred write is still pending. Anything about to type into this pane
+    /// must wait, or its text would land in front of a submit that has not happened yet.
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred.is_empty()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
