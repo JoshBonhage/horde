@@ -31,13 +31,20 @@ use crate::proto::{
 };
 use state::Session;
 
-/// Render cadence. 16ms coalesces output bursts into one frame without visible lag.
-const TICK: Duration = Duration::from_millis(16);
-/// Detection cadence, in ticks. Probing the foreground process is comparatively expensive,
-/// so it runs far less often than rendering.
-const DETECT_EVERY: u32 = 40;
-/// Ticks of quiet before the session shape is written to disk.
-const SAVE_DELAY: u32 = 60;
+/// Render cadence while a client is attached. 16ms coalesces output bursts into one frame
+/// without visible lag.
+const TICK_ATTACHED: Duration = Duration::from_millis(16);
+/// Cadence with nobody watching. There are no frames to draw, so the only work left is
+/// draining pty output into the emulators and running detection — and waking 60 times a
+/// second to do that costs real battery for no benefit. Pty reads happen on their own
+/// threads into unbounded channels, so nothing stalls in between.
+const TICK_DETACHED: Duration = Duration::from_millis(150);
+/// How often to look at what each agent is doing. Probing the foreground process shells out,
+/// so it runs far less often than rendering. Timed rather than counted in ticks, so it is
+/// unaffected by the cadence switching above.
+const DETECT_INTERVAL: Duration = Duration::from_millis(640);
+/// Quiet period before the session shape is written to disk.
+const SAVE_DELAY: Duration = Duration::from_millis(1000);
 
 type ClientId = u64;
 
@@ -241,10 +248,10 @@ async fn engine_loop(
         eng.notice(NoticeLevel::Warn, w);
     }
 
-    let mut ticker = tokio::time::interval(TICK);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut ticks: u32 = 0;
-    let mut save_countdown: u32 = 0;
+    let mut attached = false;
+    let mut ticker = new_ticker(attached);
+    let mut last_detect = std::time::Instant::now();
+    let mut save_at: Option<std::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -253,20 +260,30 @@ async fn engine_loop(
                 if handle_msg(&mut eng, msg) {
                     break;
                 }
-                save_countdown = SAVE_DELAY;
+                save_at = Some(std::time::Instant::now() + SAVE_DELAY);
             }
             _ = ticker.tick() => {
-                ticks = ticks.wrapping_add(1);
-                tick(&mut eng, ticks);
-                if save_countdown > 0 {
-                    save_countdown -= 1;
-                    if save_countdown == 0 {
-                        if let Err(e) = persist::save(&eng, &crate::config::state_path()) {
-                            log_line(&format!("could not save state: {e}"));
-                        }
+                let detect = last_detect.elapsed() >= DETECT_INTERVAL;
+                if detect {
+                    last_detect = std::time::Instant::now();
+                }
+                tick(&mut eng, detect);
+
+                if save_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                    save_at = None;
+                    if let Err(e) = persist::save(&eng, &crate::config::state_path()) {
+                        log_line(&format!("could not save state: {e}"));
                     }
                 }
             }
+        }
+
+        // Drop to the slow cadence the moment the last client leaves, and back up the
+        // instant one arrives.
+        let now_attached = !eng.clients.is_empty();
+        if now_attached != attached {
+            attached = now_attached;
+            ticker = new_ticker(attached);
         }
     }
 
@@ -490,8 +507,14 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
     eng.dirty_shape = true;
 }
 
-/// One frame: pump panes, run detection on a slower cadence, broadcast.
-fn tick(eng: &mut Engine, ticks: u32) {
+fn new_ticker(attached: bool) -> tokio::time::Interval {
+    let mut t = tokio::time::interval(if attached { TICK_ATTACHED } else { TICK_DETACHED });
+    t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    t
+}
+
+/// One frame: pump panes, optionally run detection, broadcast.
+fn tick(eng: &mut Engine, detect_due: bool) {
     let theme = eng.cfg.theme.clone();
     let pane_ids: Vec<PaneId> = eng.session.panes.keys().copied().collect();
     for id in &pane_ids {
@@ -500,9 +523,9 @@ fn tick(eng: &mut Engine, ticks: u32) {
         }
     }
 
-    // A freshly spawned pane gets looked at on the very next tick rather than waiting up to
-    // DETECT_EVERY, so a new agent appears in the sidebar immediately.
-    if ticks % DETECT_EVERY == 0 || eng.detect_soon {
+    // A freshly spawned pane gets looked at on the very next tick rather than waiting out
+    // the interval, so a new agent appears in the sidebar immediately.
+    if detect_due || eng.detect_soon {
         eng.detect_soon = false;
         let before = agent_fingerprint(&eng.session);
         let mut events = eng.detect();
@@ -845,7 +868,7 @@ mod tests {
 
         eng.dirty_shape = false;
         eng.detect_soon = false;
-        tick(&mut eng, DETECT_EVERY);
+        tick(&mut eng, true);
         assert!(
             eng.dirty_shape,
             "a working agent's elapsed timer only advances if the snapshot is resent"
@@ -888,7 +911,7 @@ mod tests {
 
         eng.dirty_shape = false;
         eng.detect_soon = false;
-        tick(&mut eng, DETECT_EVERY);
+        tick(&mut eng, true);
         assert!(eng.session.panes[&pane].agent.is_none(), "the scan should have removed it");
         assert!(eng.dirty_shape, "the sidebar must be told the agent is gone");
         kill_all(&mut eng);
@@ -901,7 +924,7 @@ mod tests {
         let mut eng = engine();
         eng.dirty_shape = false;
         eng.detect_soon = false;
-        tick(&mut eng, DETECT_EVERY);
+        tick(&mut eng, true);
         assert!(!eng.dirty_shape, "nothing changed, so nothing should be resent");
         kill_all(&mut eng);
     }
@@ -917,7 +940,7 @@ mod tests {
 
         // And that pass happens on the very next tick, not only on the cadence.
         eng.dirty_shape = false;
-        tick(&mut eng, 1); // 1 % DETECT_EVERY != 0
+        tick(&mut eng, false); // detection not due
         assert!(!eng.detect_soon, "the requested pass should have run");
         kill_all(&mut eng);
     }

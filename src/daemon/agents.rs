@@ -26,6 +26,14 @@ use super::state::{AgentRuntime, Session};
 /// rather than showing a stale state forever.
 const HOOK_TTL: Duration = Duration::from_secs(90);
 
+/// How often to re-probe which process is in the foreground of each pane.
+///
+/// Deliberately slower than screen detection. Identifying the process means forking `ps`
+/// once per pane, and what is running in a pane changes on the timescale of a person typing
+/// a command — whereas what it is *doing* changes second to second. Coupling the two made a
+/// detached daemon fork several times a second forever.
+const PROCESS_INTERVAL: Duration = Duration::from_secs(2);
+
 pub struct Detector {
     manifests: HashMap<String, Manifest>,
     pub warnings: Vec<String>,
@@ -36,6 +44,8 @@ pub struct Detector {
     /// Agent kind last reported by a hook, so a scan can keep the agent even when neither
     /// the process name nor the screen identifies it.
     hook_kinds: HashMap<PaneId, String>,
+    /// When the foreground process cache was last refreshed.
+    last_process_probe: Option<Instant>,
 }
 
 impl Detector {
@@ -48,6 +58,7 @@ impl Detector {
             processes: HashMap::new(),
             hook_reports: HashMap::new(),
             hook_kinds: HashMap::new(),
+            last_process_probe: None,
         }
     }
 
@@ -127,9 +138,15 @@ impl Detector {
         let pane_ids: Vec<PaneId> = session.panes.keys().copied().collect();
         let focused = session.focused_pane();
 
-        // Refresh the foreground process cache first so `taken_names` and the per-pane loop
-        // both see the same picture.
+        // Refresh the foreground process cache, on its own slower cadence. A pane horde has
+        // never probed is always looked at, so a newly spawned agent is identified at once.
+        let probe_due = self
+            .last_process_probe
+            .is_none_or(|t| t.elapsed() >= PROCESS_INTERVAL);
         for &id in &pane_ids {
+            if !probe_due && self.processes.contains_key(&id) {
+                continue;
+            }
             match session.panes.get(&id).and_then(|p| p.foreground_pgid()) {
                 Some(pgid) => {
                     if let Some(name) = process_name(pgid) {
@@ -140,6 +157,9 @@ impl Detector {
                     self.processes.remove(&id);
                 }
             }
+        }
+        if probe_due {
+            self.last_process_probe = Some(Instant::now());
         }
         self.processes.retain(|id, _| pane_ids.contains(id));
         self.hook_reports.retain(|id, _| pane_ids.contains(id));

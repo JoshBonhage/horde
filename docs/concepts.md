@@ -56,6 +56,34 @@ open PTY file descriptors to a replacement process over a Unix socket (`SCM_RIGH
 upgrade never touches the child processes. horde has the state/runtime split that would make
 it possible, but for now upgrading means `horde stop && horde`, which does end your agents.
 
+### What it costs to leave running
+
+Closing the terminal does **not** free anything. That is the point — but it means you should
+know the bill. Measured on this machine, detached, completely idle:
+
+| | CPU | Resident memory |
+|---|---|---|
+| the daemon, 3 panes | ~0.15% of one core | 8–11 MB |
+| each idle shell | ~0% | ~3.4 MB |
+| each idle Claude Code | ~2% of one core | its own, and much larger |
+
+The daemon drops to a slower cadence when no client is attached: there are no frames to
+draw, so it only drains pty output and runs detection. Probing which process is in the
+foreground of each pane is slower still, because that means forking `ps` and what is
+*running* in a pane changes far less often than what it is *doing*.
+
+**Your agents dominate that table, not horde.** A handful of idle Claude Code processes cost
+more than the multiplexer holding them. If you left five spaces of agents running, they are
+all still running.
+
+To actually stop everything:
+
+```sh
+horde stop          # the daemon and every pane it owns
+```
+
+`horde status` tells you what is currently alive.
+
 ### One consequence worth knowing
 
 The daemon outlives every client and **survives rebuilds**. After `cargo build`, run
