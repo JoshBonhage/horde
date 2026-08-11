@@ -12,10 +12,22 @@ use serde::Deserialize;
 use crate::proto::{Cmd, Dir};
 use crate::theme::{Theme, ThemeOverrides};
 
+/// Where config, state, and the socket live.
+///
+/// Deliberately **not** `dirs::config_dir()`: on macOS that returns
+/// `~/Library/Application Support`, which is wrong for a terminal tool — it puts a space in
+/// the socket path and eats into the ~100 byte `AF_UNIX` limit. Terminal tools belong in
+/// `~/.config`, which is also where tmux, zellij and herdr keep theirs.
 pub fn config_dir() -> PathBuf {
-    std::env::var_os("HORDE_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| {
-        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("horde")
-    })
+    if let Some(dir) = std::env::var_os("HORDE_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("horde")
 }
 
 pub fn socket_path() -> PathBuf {
@@ -722,5 +734,27 @@ bogus_action = "prefix+q"
         assert_eq!(cfg.sidebar_width, 14);
         assert_eq!(cfg.bus_width, 70);
         let _ = std::fs::remove_file(p);
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn config_lives_under_dot_config_not_apple_application_support() {
+        // `dirs::config_dir()` returns ~/Library/Application Support on macOS, which would
+        // put a space in the socket path and waste the AF_UNIX length budget.
+        let dir = config_dir();
+        let s = dir.to_string_lossy();
+        assert!(s.ends_with("/horde"), "{s}");
+        assert!(!s.contains("Application Support"), "{s}");
+        assert!(!s.contains(' '), "socket paths with spaces are asking for trouble: {s}");
+    }
+
+    #[test]
+    fn socket_path_fits_the_os_limit_with_room_to_spare() {
+        // Bind fails outright past ~104 bytes, so the default must be nowhere near it.
+        assert!(socket_path().as_os_str().len() < 100, "{:?}", socket_path());
     }
 }
