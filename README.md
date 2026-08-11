@@ -30,6 +30,34 @@ tmux does not know the difference between an agent that is thinking and one that
 waiting twenty minutes for you to approve a file write. horde does, and it puts that in a
 sidebar. It also gives agents an addressable way to talk to each other.
 
+## Documentation
+
+Full docs in [`docs/`](docs/), readable from the terminal with `horde docs <topic>`:
+
+| | |
+|---|---|
+| **[orchestration](docs/orchestration.md)** | **agents talking to each other — written to be read by an agent** |
+| [quick-start](docs/quick-start.md) | install, first session, first agent |
+| [concepts](docs/concepts.md) | spaces, tabs, panes, the daemon |
+| [agents](docs/agents.md) | detection, states, lifecycle hooks |
+| [socket-api](docs/socket-api.md) | the control protocol, every method |
+| [configuration](docs/configuration.md) | `config.toml` and the settings page |
+| [keys](docs/keys.md) | keybindings, mouse, right-click menus |
+| [troubleshooting](docs/troubleshooting.md) | when something looks wrong |
+
+### Point your agents at this
+
+An agent cannot discover any of this on its own. Tell it once — in `CLAUDE.md`, a system
+prompt, or the first thing you say to it:
+
+```
+You are running inside horde, a terminal multiplexer where agents can talk to each other.
+Run `horde docs orchestration` to learn how, then `horde roster` to see who else is here.
+```
+
+Every horde pane also carries `HORDE_DOCS` in its environment holding that exact command, so
+an agent that inspects its environment will find it.
+
 ## Install
 
 ```sh

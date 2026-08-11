@@ -172,6 +172,9 @@ impl Pane {
         builder.env("HORDE_SPACE", space.to_string());
         // Anything that shells out to a pager would block on input nobody can give it.
         builder.env("PAGER", "cat");
+        // Discovery: an agent has no way to know horde exists, let alone that other agents
+        // are reachable. This is the breadcrumb.
+        builder.env("HORDE_DOCS", "horde docs orchestration");
 
         let child = pair.slave.spawn_command(builder).context("failed to spawn command")?;
         // The slave fd must be dropped or the PTY never reports EOF when the child exits.

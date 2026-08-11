@@ -1,10 +1,12 @@
 //! Command line surface. Every subcommand is one control-channel call, which is what lets
 //! an agent orchestrate horde with nothing but a shell.
 
+pub mod docs;
 mod integration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -111,6 +113,10 @@ pub enum Command {
     /// Internal: called by an agent's lifecycle hook. Reads the hook payload on stdin.
     #[command(hide = true)]
     Hook { agent: String, event: String },
+    /// Read the documentation. `horde docs` lists topics.
+    ///
+    /// Agents: `horde docs orchestration` explains how to talk to other agents.
+    Docs { topic: Option<String> },
     /// Show the active keybindings.
     Keys,
     /// Call a control method directly.
@@ -525,6 +531,8 @@ pub fn run(cmd: Command) -> Result<()> {
         },
 
         Command::Hook { agent, event } => integration::run_hook(&agent, &event)?,
+
+        Command::Docs { topic } => docs::show(topic.as_deref())?,
 
         Command::Keys => {
             let (cfg, _) = crate::config::Config::load();
