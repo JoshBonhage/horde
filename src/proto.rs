@@ -376,6 +376,12 @@ pub enum Cmd {
     RenamePane { pane: PaneId, name: String },
     SpawnAgent { cmd: String, name: Option<String>, split: Option<Dir> },
     ApplyLayout { preset: String },
+    RenameSpace { space: SpaceId, name: String },
+    RenameTab { tab: TabId, name: String },
+    CloseSpace(SpaceId),
+    FocusTab(TabId),
+    /// New tab in a specific space, rather than the focused one.
+    NewTabIn(SpaceId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

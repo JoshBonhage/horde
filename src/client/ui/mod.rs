@@ -278,13 +278,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             dim_area(f.buffer_mut(), area, &theme, 0.6);
             overlays::picker(f, area, app);
         }
-        Mode::Rename { .. } => {
+        Mode::Prompt { .. } => {
             dim_area(f.buffer_mut(), area, &theme, 0.5);
-            overlays::rename(f, area, app);
+            overlays::prompt(f, area, app);
         }
         Mode::Settings { .. } => {
             dim_area(f.buffer_mut(), area, &theme, 0.6);
             overlays::settings(f, area, app);
+        }
+        Mode::Menu { .. } => {
+            // A menu is a light touch on top of the session, not a modal takeover.
+            dim_area(f.buffer_mut(), area, &theme, 0.25);
+            overlays::menu(f, area, app);
         }
     }
 
@@ -510,9 +515,7 @@ mod frame_tests {
     fn settings_panel_renders() {
         let (mut app, snap) = demo();
         app.snapshot = Some(snap);
-        let rows = crate::client::settings::rows(&app.cfg);
-        let sel = rows.iter().position(|r| r.selectable()).unwrap();
-        app.mode = crate::client::Mode::Settings { sel };
+        crate::client::open_settings(&mut app, 0);
         let out = render(&mut app, 146, 39);
         println!("\n{out}\n");
         assert!(out.contains("settings"));
@@ -520,6 +523,62 @@ mod frame_tests {
         assert!(out.contains("Sidebar width"));
         assert!(out.contains("Edit config.toml"));
         assert!(out.contains("change"));
+    }
+
+    #[test]
+    fn keybindings_settings_page_renders() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        let cat = crate::client::settings::Category::all()
+            .iter()
+            .position(|c| *c == crate::client::settings::Category::Keys)
+            .unwrap();
+        crate::client::open_settings(&mut app, cat);
+        let out = render(&mut app, 146, 39);
+        println!("\n{out}\n");
+        assert!(out.contains("Keybindings"));
+        assert!(out.contains("ctrl+b"));
+        assert!(out.contains("rebinds"));
+    }
+
+    #[test]
+    fn long_settings_list_scrolls_to_keep_the_selection_visible() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        let cat = crate::client::settings::Category::all()
+            .iter()
+            .position(|c| *c == crate::client::settings::Category::Keys)
+            .unwrap();
+        crate::client::open_settings(&mut app, cat);
+
+        // Jump the selection to the very last rebindable action.
+        let rows = crate::client::settings::rows(&app.cfg, crate::client::settings::Category::Keys);
+        let last = rows.iter().enumerate().filter(|(_, r)| r.selectable()).last().unwrap().0;
+        app.mode = crate::client::Mode::Settings { cat, sel: last, capture: None };
+
+        let out = render(&mut app, 146, 30);
+        println!("\n{out}\n");
+        let label = rows[last].label.clone();
+        assert!(out.contains(&label), "selection {label:?} must be scrolled into view:\n{out}");
+        // And the scroll position is reported rather than left implicit.
+        assert!(out.contains('%'), "{out}");
+    }
+
+    #[test]
+    fn context_menu_renders_over_a_pane() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap.clone());
+        let level = crate::client::menu::build(
+            crate::client::menu::Target::Pane(1),
+            &snap,
+            "ctrl+b",
+        );
+        app.mode = crate::client::Mode::Menu { stack: vec![level], at: (40, 6) };
+        let out = render(&mut app, 146, 39);
+        println!("\n{out}\n");
+        assert!(out.contains("Split right"));
+        assert!(out.contains("Send message"));
+        assert!(out.contains("Settings"));
     }
 
     #[test]

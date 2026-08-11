@@ -4,6 +4,7 @@
 //! come back without disturbing a single running process.
 
 pub mod input;
+pub mod menu;
 pub mod settings;
 pub mod ui;
 
@@ -27,10 +28,11 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::config::{Action, Chord, Config, Notify, Trigger};
+use crate::client::menu::{Act, Level, Prompt, Target};
 use crate::framing;
 use crate::proto::{
     ClientFrame, Cmd, CursorPos, Message, NoticeLevel, PaneId, Row, ServerFrame, Snapshot, SpaceId,
-    PROTOCOL_VERSION,
+    TabId, PROTOCOL_VERSION,
 };
 use ui::overlays::Item;
 use ui::sidebar::Hit;
@@ -50,9 +52,13 @@ pub enum Mode {
     Help,
     Palette { query: String, sel: usize },
     SpaceSwitcher { query: String, sel: usize },
-    Rename { pane: PaneId, value: String },
-    /// The settings panel. `sel` indexes into `settings::rows`.
-    Settings { sel: usize },
+    /// A single-line text prompt, opened by a key or a context menu.
+    Prompt { prompt: Prompt, value: String },
+    /// The settings page. `cat` indexes `Category::all`, `sel` indexes that category's rows.
+    /// `capture` holds the action awaiting a key press while rebinding.
+    Settings { cat: usize, sel: usize, capture: Option<String> },
+    /// A context menu. The stack grows when a submenu opens so `esc` steps back out.
+    Menu { stack: Vec<Level>, at: (u16, u16) },
 }
 
 /// What selecting a picker row does.
@@ -82,6 +88,14 @@ pub struct App {
     pub sidebar_hits: Vec<(u16, Hit)>,
     /// Set once the version mismatch warning has been shown, so it appears only once.
     pub warned_version: bool,
+    /// Screen row to menu-item index, recorded during render for mouse hit-testing.
+    pub menu_hits: Vec<(u16, usize)>,
+    /// Rect the menu occupies, so clicks outside it can dismiss it.
+    pub menu_rect: crate::proto::Rect,
+    /// Screen row to settings-category index.
+    pub settings_cat_hits: Vec<(u16, usize)>,
+    /// Screen row to settings-row index.
+    pub settings_row_hits: Vec<(u16, usize)>,
     pub quit: bool,
 }
 
@@ -103,6 +117,10 @@ impl App {
             tick: 0,
             sidebar_hits: Vec::new(),
             warned_version: false,
+            menu_hits: Vec::new(),
+            menu_rect: crate::proto::Rect::default(),
+            settings_cat_hits: Vec::new(),
+            settings_row_hits: Vec::new(),
             quit: false,
         }
     }
@@ -510,27 +528,14 @@ fn handle_key(
         Mode::SpaceSwitcher { query, sel } => {
             return picker_key(app, k, out, query, sel, false);
         }
-        Mode::Rename { pane, mut value } => {
-            match k.code {
-                KeyCode::Esc => app.mode = Mode::Terminal,
-                KeyCode::Enter => {
-                    let _ = out.send(ClientFrame::Command(Cmd::RenamePane { pane, name: value }));
-                    app.mode = Mode::Terminal;
-                }
-                KeyCode::Backspace => {
-                    value.pop();
-                    app.mode = Mode::Rename { pane, value };
-                }
-                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    value.push(c);
-                    app.mode = Mode::Rename { pane, value };
-                }
-                _ => {}
-            }
-            return Ok(());
+        Mode::Prompt { prompt, value } => {
+            return prompt_key(app, k, out, prompt, value);
         }
-        Mode::Settings { sel } => {
-            return settings_key(app, k, out, sel);
+        Mode::Menu { stack, at } => {
+            return menu_key(app, k, out, stack, at);
+        }
+        Mode::Settings { cat, sel, capture } => {
+            return settings_key(app, k, out, cat, sel, capture);
         }
         Mode::Prefix => {
             app.mode = Mode::Terminal;
@@ -625,21 +630,260 @@ fn picker_key(
     Ok(())
 }
 
-/// Keys in the settings panel. Changes apply and persist immediately.
+/// Open the settings page on `cat`, landing on its first changeable row.
+pub fn open_settings(app: &mut App, cat: usize) {
+    let category = settings::Category::all()[cat.min(settings::Category::all().len() - 1)];
+    let rows = settings::rows(&app.cfg, category);
+    let sel = rows.iter().position(|r| r.selectable()).unwrap_or(0);
+    app.mode = Mode::Settings { cat, sel, capture: None };
+}
+
+/// Open a text prompt, prefilled where there is an obvious current value so a small tweak
+/// does not mean retyping.
+pub fn open_prompt(app: &mut App, prompt: Prompt) {
+    let value = match &prompt {
+        Prompt::RenamePane(p) => app
+            .pane_info(*p)
+            .map(|i| i.agent.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| i.title.clone()))
+            .unwrap_or_default(),
+        Prompt::RenameSpace(id) => app
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.spaces.iter().find(|x| x.id == *id))
+            .map(|x| x.name.clone())
+            .unwrap_or_default(),
+        Prompt::RenameTab(id) => app
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.tabs.iter().find(|x| x.id == *id))
+            .map(|x| x.name.clone())
+            .unwrap_or_default(),
+        // Nothing sensible to prefill for these.
+        Prompt::NewSpace | Prompt::SendTo(_) | Prompt::RunCommand => String::new(),
+    };
+    app.mode = Mode::Prompt { prompt, value };
+}
+
+/// Open a context menu for `target` at the cursor.
+fn open_menu(app: &mut App, target: Target, at: (u16, u16)) {
+    let Some(snap) = app.snapshot.as_ref() else { return };
+    let level = menu::build(target, snap, &app.cfg.prefix.describe());
+    app.mode = Mode::Menu { stack: vec![level], at };
+}
+
+/// Run whatever a menu entry does.
+fn activate(app: &mut App, act: Act, out: &mpsc::UnboundedSender<ClientFrame>) -> Result<()> {
+    match act {
+        Act::Cmd(cmd) => {
+            let _ = out.send(ClientFrame::Command(cmd));
+            app.mode = Mode::Terminal;
+        }
+        Act::Prompt(p) => open_prompt(app, p),
+        Act::Submenu(sub) => {
+            if let Mode::Menu { stack, at } = &app.mode {
+                let mut stack = stack.clone();
+                stack.push(menu::submenu(sub));
+                app.mode = Mode::Menu { stack, at: *at };
+            }
+        }
+        Act::Settings => open_settings(app, 0),
+        Act::Help => app.mode = Mode::Help,
+        Act::CopyPane(pane) => {
+            // Read through the daemon rather than the local row cache: it holds the
+            // authoritative text, already trimmed.
+            match crate::cli::call(
+                "pane.read",
+                serde_json::json!({ "pane": pane, "source": "visible" }),
+            ) {
+                Ok(v) => {
+                    let text: Vec<String> = v
+                        .get("lines")
+                        .and_then(|l| l.as_array())
+                        .map(|a| {
+                            a.iter().map(|x| x.as_str().unwrap_or("").to_string()).collect()
+                        })
+                        .unwrap_or_default();
+                    let joined = text.join("\n");
+                    match copy_to_clipboard(&joined) {
+                        Ok(()) => app.toast(
+                            NoticeLevel::Info,
+                            format!("copied {} lines", text.len()),
+                        ),
+                        Err(e) => app.toast(NoticeLevel::Warn, format!("copy failed: {e}")),
+                    }
+                }
+                Err(e) => app.toast(NoticeLevel::Warn, format!("could not read pane: {e}")),
+            }
+            app.mode = Mode::Terminal;
+        }
+        Act::Close => app.mode = Mode::Terminal,
+    }
+    Ok(())
+}
+
+/// Hand text to the system clipboard via `pbcopy`.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    child.wait()?;
+    Ok(())
+}
+
+/// Keys in a context menu.
+fn menu_key(
+    app: &mut App,
+    k: KeyEvent,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    mut stack: Vec<Level>,
+    at: (u16, u16),
+) -> Result<()> {
+    if stack.is_empty() {
+        app.mode = Mode::Terminal;
+        return Ok(());
+    }
+    let depth = stack.len();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Step out of a submenu before closing the whole thing.
+            stack.pop();
+            app.mode = if stack.is_empty() { Mode::Terminal } else { Mode::Menu { stack, at } };
+            return Ok(());
+        }
+        KeyCode::Left | KeyCode::Char('h') if depth > 1 => {
+            stack.pop();
+            app.mode = Mode::Menu { stack, at };
+            return Ok(());
+        }
+        KeyCode::Up | KeyCode::Char('k') => stack[depth - 1].step(-1),
+        KeyCode::Down | KeyCode::Char('j') => stack[depth - 1].step(1),
+        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
+            let act = stack[depth - 1].selected().map(|i| i.act.clone());
+            app.mode = Mode::Menu { stack, at };
+            if let Some(act) = act {
+                return activate(app, act, out);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    app.mode = Mode::Menu { stack, at };
+    Ok(())
+}
+
+/// Keys in a text prompt.
+fn prompt_key(
+    app: &mut App,
+    k: KeyEvent,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    prompt: Prompt,
+    mut value: String,
+) -> Result<()> {
+    match k.code {
+        KeyCode::Esc => {
+            app.mode = Mode::Terminal;
+            return Ok(());
+        }
+        KeyCode::Enter => {
+            app.mode = Mode::Terminal;
+            let v = value.trim().to_string();
+            match prompt {
+                Prompt::RenamePane(pane) => {
+                    let _ = out.send(ClientFrame::Command(Cmd::RenamePane { pane, name: v }));
+                }
+                Prompt::RenameSpace(space) => {
+                    let _ = out.send(ClientFrame::Command(Cmd::RenameSpace { space, name: v }));
+                }
+                Prompt::RenameTab(tab) => {
+                    let _ = out.send(ClientFrame::Command(Cmd::RenameTab { tab, name: v }));
+                }
+                Prompt::NewSpace => {
+                    let name = if v.is_empty() { None } else { Some(v) };
+                    let _ = out.send(ClientFrame::Command(Cmd::NewSpace { name }));
+                }
+                Prompt::RunCommand => {
+                    if !v.is_empty() {
+                        let _ = out.send(ClientFrame::Command(Cmd::SpawnAgent {
+                            cmd: v,
+                            name: None,
+                            split: None,
+                        }));
+                    }
+                }
+                Prompt::SendTo(pane) => {
+                    if v.is_empty() {
+                        return Ok(());
+                    }
+                    // Route through the bus so the message is recorded and state-gated,
+                    // exactly as `horde send` would be.
+                    let target = app
+                        .pane_info(pane)
+                        .and_then(|p| p.agent.as_ref().map(|a| a.name.clone()))
+                        .unwrap_or_else(|| pane.to_string());
+                    match crate::cli::call(
+                        "bus.send",
+                        serde_json::json!({ "to": target, "body": v }),
+                    ) {
+                        Ok(m) => {
+                            let how = m.get("delivery").and_then(|d| d.as_str()).unwrap_or("sent");
+                            app.toast(NoticeLevel::Info, format!("{how} to {target}"));
+                        }
+                        Err(e) => app.toast(NoticeLevel::Warn, format!("{e}")),
+                    }
+                }
+            }
+            return Ok(());
+        }
+        KeyCode::Backspace => {
+            value.pop();
+        }
+        KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => value.push(c),
+        _ => {}
+    }
+    app.mode = Mode::Prompt { prompt, value };
+    Ok(())
+}
+
+/// Keys on the settings page. Changes apply and persist immediately.
 fn settings_key(
     app: &mut App,
     k: KeyEvent,
     out: &mpsc::UnboundedSender<ClientFrame>,
+    cat: usize,
     mut sel: usize,
+    capture: Option<String>,
 ) -> Result<()> {
-    let rows = settings::rows(&app.cfg);
-    let selectable: Vec<usize> =
-        rows.iter().enumerate().filter(|(_, r)| r.selectable()).map(|(i, _)| i).collect();
-    if selectable.is_empty() {
-        app.mode = Mode::Terminal;
+    // Rebinding: the very next key press becomes the binding, so nothing else may consume it.
+    if let Some(action) = capture {
+        if k.code == KeyCode::Esc {
+            app.mode = Mode::Settings { cat, sel, capture: None };
+            return Ok(());
+        }
+        let chord = Chord::new(k.modifiers, k.code);
+        match settings::rebind(&mut app.cfg, &action, chord) {
+            Ok((key, value)) => match settings::write(&key, value) {
+                Ok(()) => {
+                    app.toast(
+                        NoticeLevel::Info,
+                        format!("{} → {}", action.replace('_', " "), chord.describe()),
+                    );
+                }
+                Err(e) => app.toast(NoticeLevel::Error, format!("could not save: {e:#}")),
+            },
+            Err(e) => app.toast(NoticeLevel::Warn, format!("{e}")),
+        }
+        app.mode = Mode::Settings { cat, sel, capture: None };
         return Ok(());
     }
-    // Position within the selectable rows, so separators are skipped rather than landed on.
+
+    let cats = settings::Category::all();
+    let category = cats[cat.min(cats.len() - 1)];
+    let rows = settings::rows(&app.cfg, category);
+    let selectable: Vec<usize> =
+        rows.iter().enumerate().filter(|(_, r)| r.selectable()).map(|(i, _)| i).collect();
     let pos = selectable.iter().position(|i| *i == sel).unwrap_or(0);
 
     let mut delta = 0i32;
@@ -648,11 +892,26 @@ fn settings_key(
             app.mode = Mode::Terminal;
             return Ok(());
         }
+        // Tab moves between categories, leaving left/right free to change values.
+        KeyCode::Tab => {
+            let next = (cat + 1) % cats.len();
+            open_settings(app, next);
+            return Ok(());
+        }
+        KeyCode::BackTab => {
+            let next = (cat + cats.len() - 1) % cats.len();
+            open_settings(app, next);
+            return Ok(());
+        }
         KeyCode::Up | KeyCode::Char('k') => {
-            sel = selectable[pos.saturating_sub(1)];
+            if !selectable.is_empty() {
+                sel = selectable[pos.saturating_sub(1)];
+            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            sel = selectable[(pos + 1).min(selectable.len() - 1)];
+            if !selectable.is_empty() {
+                sel = selectable[(pos + 1).min(selectable.len() - 1)];
+            }
         }
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => delta = 1,
         KeyCode::Left | KeyCode::Char('h') => delta = -1,
@@ -671,6 +930,10 @@ fn settings_key(
                     Err(e) => app.toast(NoticeLevel::Error, format!("could not save: {e:#}")),
                 }
             }
+            Some(settings::Kind::Keybind(action)) => {
+                app.mode = Mode::Settings { cat, sel, capture: Some(action) };
+                return Ok(());
+            }
             Some(settings::Kind::Action(settings::Action::Reload)) => {
                 let (cfg, warnings) = Config::load();
                 app.cfg = cfg;
@@ -679,6 +942,18 @@ fn settings_key(
                     app.toast(NoticeLevel::Warn, w);
                 }
                 app.toast(NoticeLevel::Info, "config reloaded");
+            }
+            Some(settings::Kind::Action(settings::Action::InstallClaudeHooks)) => {
+                // Runs the same code path as `horde integration install claude`.
+                match crate::cli::run(crate::cli::Command::Integration {
+                    cmd: crate::cli::IntegrationCmd::Install { agent: "claude".into() },
+                }) {
+                    Ok(()) => app.toast(
+                        NoticeLevel::Info,
+                        "hooks installed — restart running Claude sessions",
+                    ),
+                    Err(e) => app.toast(NoticeLevel::Error, format!("{e:#}")),
+                }
             }
             Some(settings::Kind::Action(settings::Action::EditFile)) => {
                 let path = settings::config_file();
@@ -696,14 +971,14 @@ fn settings_key(
                     split: None,
                 }));
                 app.mode = Mode::Terminal;
-                app.toast(NoticeLevel::Info, "opened config.toml — settings reload on save");
+                app.toast(NoticeLevel::Info, "opened config.toml — reload from Appearance");
                 return Ok(());
             }
             _ => {}
         }
     }
 
-    app.mode = Mode::Settings { sel };
+    app.mode = Mode::Settings { cat, sel, capture: None };
     Ok(())
 }
 
@@ -751,20 +1026,10 @@ fn run_action(
         Action::SpaceSwitcher => {
             app.mode = Mode::SpaceSwitcher { query: String::new(), sel: 0 }
         }
-        Action::Settings => {
-            // Land on the first selectable row rather than a separator.
-            let rows = settings::rows(&app.cfg);
-            let sel = rows.iter().position(|r| r.selectable()).unwrap_or(0);
-            app.mode = Mode::Settings { sel };
-        }
+        Action::Settings => open_settings(app, 0),
         Action::RenamePane => {
             if let Some(pane) = app.focused_pane() {
-                // Prefill with the current name so a small tweak does not mean retyping.
-                let current = app
-                    .pane_info(pane)
-                    .and_then(|p| p.agent.as_ref().map(|a| a.name.clone()))
-                    .unwrap_or_default();
-                app.mode = Mode::Rename { pane, value: current };
+                open_prompt(app, Prompt::RenamePane(pane));
             }
         }
         Action::CopyMode => {
@@ -787,6 +1052,38 @@ fn run_action(
     Ok(())
 }
 
+/// Which tab sits at column `x` in the tab bar.
+///
+/// Mirrors `TabBar`'s layout: the space name, a separator, then `" <n> <name> "` per tab
+/// plus an attention marker. Kept beside the renderer's format so the two stay in step.
+fn tab_at(snap: &Snapshot, x: u16) -> Option<TabId> {
+    let space = snap.spaces.iter().find(|s| Some(s.id) == snap.focused_space)?;
+    // Names are truncated when drawn, so measure the truncated widths or a long name would
+    // shift every hit box to the right of it.
+    let mut cx: u16 = 1 + (space.name.chars().count().min(24)) as u16 + 1 + 2;
+    for &tid in &space.tabs {
+        let tab = snap.tabs.iter().find(|t| t.id == tid)?;
+        let attention = tab.panes.iter().any(|p| {
+            snap.panes
+                .iter()
+                .find(|q| q.id == *p)
+                .and_then(|q| q.agent.as_ref())
+                .is_some_and(|a| a.state.needs_attention())
+        });
+        let digits = (tid_index(space, tid) + 1).to_string().chars().count() as u16;
+        let w = 3 + digits + (tab.name.chars().count().min(16)) as u16 + u16::from(attention);
+        if x >= cx && x < cx + w {
+            return Some(tid);
+        }
+        cx += w + 1;
+    }
+    None
+}
+
+fn tid_index(space: &crate::proto::SpaceInfo, tab: TabId) -> usize {
+    space.tabs.iter().position(|&t| t == tab).unwrap_or(0)
+}
+
 fn handle_mouse(
     app: &mut App,
     m: crossterm::event::MouseEvent,
@@ -794,6 +1091,81 @@ fn handle_mouse(
 ) -> Result<()> {
     let Some(snap) = app.snapshot.clone() else { return Ok(()) };
     let (x, y) = (m.column, m.row);
+
+    // An open menu owns the mouse until it closes.
+    if let Mode::Menu { stack, at } = app.mode.clone() {
+        let inside = app.menu_rect.contains(x, y);
+        match m.kind {
+            // Hovering previews the entry the way a desktop menu does.
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                if let Some((_, idx)) = app.menu_hits.iter().find(|(hy, _)| *hy == y) {
+                    let mut stack = stack;
+                    if let Some(level) = stack.last_mut() {
+                        if !level.items[*idx].is_separator() {
+                            level.sel = *idx;
+                        }
+                    }
+                    app.mode = Mode::Menu { stack, at };
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if inside => {
+                let idx = app.menu_hits.iter().find(|(hy, _)| *hy == y).map(|(_, i)| *i);
+                let act = idx.and_then(|i| {
+                    stack.last().and_then(|l| l.items.get(i)).filter(|it| !it.is_separator())
+                }).map(|it| it.act.clone());
+                if let Some(act) = act {
+                    return activate(app, act, out);
+                }
+            }
+            // Clicking away dismisses, which is what every other menu does.
+            MouseEventKind::Down(_) if !inside => app.mode = Mode::Terminal,
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Right-click opens a context menu for whatever is under the cursor.
+    if matches!(m.kind, MouseEventKind::Down(MouseButton::Right)) {
+        let target = if snap.sidebar.contains(x, y) {
+            match app.sidebar_hits.iter().find(|(hy, _)| *hy == y) {
+                Some((_, Hit::Space(id))) => Target::Space(*id),
+                Some((_, Hit::Pane(id))) => Target::Agent(*id),
+                None => Target::Root,
+            }
+        } else if snap.tabbar.contains(x, y) {
+            match tab_at(&snap, x) {
+                Some(tab) => Target::Tab(tab),
+                None => Target::Root,
+            }
+        } else if snap.bus.contains(x, y) {
+            Target::Bus
+        } else if snap.status.contains(x, y) {
+            Target::Root
+        } else {
+            match snap.panes.iter().find(|p| !p.cell.is_empty() && p.cell.contains(x, y)) {
+                Some(p) => Target::Pane(p.id),
+                None => Target::Root,
+            }
+        };
+        open_menu(app, target, (x, y));
+        return Ok(());
+    }
+
+    // Clicks on the settings page pick a category or a row.
+    if let Mode::Settings { cat, sel, .. } = app.mode.clone() {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some((_, i)) = app.settings_cat_hits.iter().find(|(hy, _)| *hy == y) {
+                open_settings(app, *i);
+                return Ok(());
+            }
+            if let Some((_, i)) = app.settings_row_hits.iter().find(|(hy, _)| *hy == y) {
+                app.mode = Mode::Settings { cat, sel: *i, capture: None };
+                return Ok(());
+            }
+            let _ = sel;
+        }
+        return Ok(());
+    }
 
     // Sidebar clicks jump straight to a space or pane.
     if snap.sidebar.contains(x, y) {
@@ -812,18 +1184,8 @@ fn handle_mouse(
     // Tab bar clicks select a tab.
     if snap.tabbar.contains(x, y) {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            // Tab labels are `" <n> <name> "`; the leading digit is enough to pick one.
-            if let Some(space) = snap.spaces.iter().find(|s| Some(s.id) == snap.focused_space) {
-                let mut cx: u16 = 1 + space.name.chars().count() as u16 + 3;
-                for (i, &tid) in space.tabs.iter().enumerate() {
-                    let Some(tab) = snap.tabs.iter().find(|t| t.id == tid) else { continue };
-                    let w = 4 + tab.name.chars().count() as u16;
-                    if x >= cx && x < cx + w {
-                        let _ = out.send(ClientFrame::Command(Cmd::GotoTab(i)));
-                        break;
-                    }
-                    cx += w + 1;
-                }
+            if let Some(tab) = tab_at(&snap, x) {
+                let _ = out.send(ClientFrame::Command(Cmd::FocusTab(tab)));
             }
         }
         return Ok(());
@@ -869,6 +1231,60 @@ fn handle_mouse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tab_at` duplicates `TabBar`'s layout arithmetic, so pin them together: the column
+    /// range a tab is drawn at must be the range that resolves back to it.
+    #[test]
+    fn tab_hit_test_agrees_with_where_tabs_are_drawn() {
+        use crate::proto::*;
+        let mk_tab = |id: u32, name: &str| TabInfo {
+            id,
+            space: 1,
+            name: name.into(),
+            panes: vec![],
+            focused_pane: None,
+        };
+        let tabs = vec![mk_tab(1, "agents"), mk_tab(2, "logs"), mk_tab(3, "a-very-long-tab-name")];
+        let snap = Snapshot {
+            protocol: 1,
+            daemon_version: "t".into(),
+            spaces: vec![SpaceInfo {
+                id: 1,
+                name: "api".into(),
+                cwd: "/tmp".into(),
+                tabs: vec![1, 2, 3],
+                focused_tab: Some(1),
+                agent_count: 0,
+                attention_count: 0,
+            }],
+            tabs,
+            panes: vec![],
+            focused_space: Some(1),
+            focused_tab: Some(1),
+            focused_pane: None,
+            view: ViewState::default(),
+            sidebar: Rect::default(),
+            bus: Rect::default(),
+            status: Rect::default(),
+            tabbar: Rect::new(0, 0, 120, 1),
+        };
+
+        // Walk the bar and collect which tab each column maps to.
+        let hits: Vec<Option<TabId>> = (0..90).map(|x| tab_at(&snap, x)).collect();
+        // Every tab must own a contiguous, non-empty run of columns.
+        for id in [1u32, 2, 3] {
+            let cols: Vec<usize> =
+                hits.iter().enumerate().filter(|(_, h)| **h == Some(id)).map(|(i, _)| i).collect();
+            assert!(!cols.is_empty(), "tab {id} is unclickable");
+            let contiguous = cols.windows(2).all(|w| w[1] == w[0] + 1);
+            assert!(contiguous, "tab {id} hit box is split: {cols:?}");
+        }
+        // Tabs must not overlap, and the space name at the far left belongs to none of them.
+        assert_eq!(tab_at(&snap, 0), None);
+        assert_eq!(tab_at(&snap, 1), None, "the space name is not a tab");
+        // Past the last tab there is nothing.
+        assert_eq!(tab_at(&snap, 89), None);
+    }
 
     #[test]
     fn fuzzy_matches_subsequences_case_insensitively() {

@@ -423,6 +423,24 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
                 Err(e) => problems.push((NoticeLevel::Warn, e.to_string())),
             }
         }
+        Cmd::RenameSpace { space, name } => {
+            eng.session.rename_space(space, &name);
+        }
+        Cmd::RenameTab { tab, name } => {
+            eng.session.rename_tab(tab, &name);
+        }
+        Cmd::CloseSpace(id) => {
+            let _ = eng.session.close_space(&cfg, id);
+        }
+        Cmd::FocusTab(id) => {
+            eng.session.focus_tab(id);
+            seen = eng.session.focused_pane();
+        }
+        Cmd::NewTabIn(space) => {
+            if let Err(e) = eng.session.create_tab(&cfg, space, None) {
+                problems.push((NoticeLevel::Error, e.to_string()));
+            }
+        }
         Cmd::ApplyLayout { preset } => {
             if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
                 problems.push((NoticeLevel::Warn, e.to_string()));

@@ -408,6 +408,48 @@ impl Session {
         true
     }
 
+    pub fn rename_space(&mut self, space: SpaceId, name: &str) -> bool {
+        if name.trim().is_empty() {
+            return false;
+        }
+        // Names address spaces in `horde send` and `space focus`, so they must stay unique.
+        let unique = if self.find_space_by_name(name).is_some_and(|id| id != space) {
+            self.unique_space_name(name)
+        } else {
+            name.to_string()
+        };
+        match self.space_mut(space) {
+            Some(s) => {
+                s.name = unique;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn rename_tab(&mut self, tab: TabId, name: &str) -> bool {
+        if name.trim().is_empty() {
+            return false;
+        }
+        match self.tab_mut(tab) {
+            Some(t) => {
+                t.name = name.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Focus a tab, switching space if it lives in another one.
+    pub fn focus_tab(&mut self, tab: TabId) -> bool {
+        let Some(space) = self.tab(tab).map(|t| t.space) else { return false };
+        self.focused_space = Some(space);
+        if let Some(s) = self.space_mut(space) {
+            s.focused_tab = Some(tab);
+        }
+        true
+    }
+
     pub fn focus_space(&mut self, space: SpaceId) -> bool {
         if self.space(space).is_none() {
             return false;

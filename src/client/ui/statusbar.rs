@@ -153,7 +153,8 @@ impl Widget for StatusBar<'_> {
             Mode::Help => left.push(chip(" HELP ", t.ui.accent_alt, t)),
             Mode::Palette { .. } => left.push(chip(" COMMAND ", t.ui.accent_alt, t)),
             Mode::SpaceSwitcher { .. } => left.push(chip(" SPACE ", t.ui.accent_alt, t)),
-            Mode::Rename { .. } => left.push(chip(" RENAME ", t.ui.accent_alt, t)),
+            Mode::Prompt { .. } => left.push(chip(" INPUT ", t.ui.accent_alt, t)),
+            Mode::Menu { .. } => left.push(chip(" MENU ", t.ui.accent_alt, t)),
             Mode::Settings { .. } => left.push(chip(" SETTINGS ", t.ui.accent_alt, t)),
             Mode::Terminal => left.push(Span::styled(
                 format!(" {} ", self.prefix),

@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use ratatui::Frame;
 
 use super::{centered, color, fill, put_line, truncate, wrap_text};
+use crate::client::menu::Act;
 use crate::client::settings::{self, Kind};
 use crate::client::{App, Mode, PickKind};
 use crate::config::{Action, Trigger};
@@ -196,14 +197,22 @@ pub fn picker(f: &mut Frame, area: TRect, app: &App) {
     }
 }
 
-pub fn rename(f: &mut Frame, area: TRect, app: &App) {
+pub fn prompt(f: &mut Frame, area: TRect, app: &App) {
     let theme = app.cfg.theme.clone();
-    let Mode::Rename { value, .. } = &app.mode else { return };
+    let Mode::Prompt { prompt, value } = &app.mode else { return };
 
-    let w = (area.width.saturating_sub(10)).min(50).max(20);
+    let w = (area.width.saturating_sub(10)).min(60).max(24);
     let outer = centered(area, w, 5);
-    let inner = panel(f, outer, "rename pane", &theme);
+    let inner = panel(f, outer, prompt.title(), &theme);
     let panel_bg = Style::default().bg(color(theme.ui.panel_bg));
+
+    // Show the tail of a long value so the caret stays visible.
+    let room = inner.width.saturating_sub(4) as usize;
+    let shown: String = if value.chars().count() > room {
+        value.chars().skip(value.chars().count() - room).collect()
+    } else {
+        value.clone()
+    };
 
     put_line(
         f.buffer_mut(),
@@ -212,7 +221,7 @@ pub fn rename(f: &mut Frame, area: TRect, app: &App) {
         inner.width,
         Line::from(vec![
             Span::styled("❯ ".to_string(), panel_bg.fg(color(theme.ui.accent))),
-            Span::styled(value.clone(), panel_bg.fg(color(theme.ui.text))),
+            Span::styled(shown, panel_bg.fg(color(theme.ui.text))),
             Span::styled("▏".to_string(), panel_bg.fg(color(theme.ui.accent))),
         ]),
     );
@@ -222,71 +231,78 @@ pub fn rename(f: &mut Frame, area: TRect, app: &App) {
         inner.y + 3,
         inner.width,
         Line::from(vec![Span::styled(
-            "enter saves · esc cancels · empty clears".to_string(),
+            prompt.hint().to_string(),
             panel_bg.fg(color(theme.ui.text_faint)),
         )]),
     );
 }
 
-/// The settings panel: current values, changed in place.
-pub fn settings(f: &mut Frame, area: TRect, app: &App) {
+/// A right-click context menu, anchored at the cursor and flipped to stay on screen.
+pub fn menu(f: &mut Frame, area: TRect, app: &mut App) {
     let theme = app.cfg.theme.clone();
-    let Mode::Settings { sel } = &app.mode else { return };
-    let sel = *sel;
-    let rows = settings::rows(&app.cfg);
+    let (stack, at) = match &app.mode {
+        Mode::Menu { stack, at } => (stack.clone(), *at),
+        _ => return,
+    };
+    let Some(level) = stack.last() else { return };
 
-    let w = (area.width.saturating_sub(8)).min(58).max(30);
-    let h = (rows.len() as u16 + 5).min(area.height.saturating_sub(2));
-    let outer = centered(area, w, h);
-    let inner = panel(f, outer, "settings", &theme);
+    let w = crate::client::menu::width_for(level);
+    let h = level.items.len() as u16 + 2;
+    // Flip rather than clip when the menu would run off an edge.
+    let x = if at.0 + w <= area.x + area.width { at.0 } else { at.0.saturating_sub(w) };
+    let y = if at.1 + h <= area.y + area.height { at.1 } else { at.1.saturating_sub(h) };
+    let rect = TRect::new(
+        x.min(area.x + area.width.saturating_sub(w)),
+        y.min(area.y + area.height.saturating_sub(h)),
+        w,
+        h,
+    );
+
+    // Breadcrumb the title when inside a submenu, so it is clear esc steps back.
+    let title = if stack.len() > 1 {
+        format!("{} › {}", stack[stack.len() - 2].title, level.title)
+    } else {
+        level.title.clone()
+    };
+    let inner = panel(f, rect, &truncate(&title, w.saturating_sub(6) as usize), &theme);
     let panel_bg = Style::default().bg(color(theme.ui.panel_bg));
 
-    let mut y = inner.y;
-    let bottom = inner.y + inner.height;
-    // Value column is right-aligned into a fixed gutter so values line up as a column.
-    let value_w = 18u16.min(inner.width / 2);
-    let label_w = inner.width.saturating_sub(value_w + 3);
+    app.menu_hits.clear();
+    app.menu_rect =
+        crate::proto::Rect::new(rect.x, rect.y, rect.width, rect.height);
 
-    for (i, r) in rows.iter().enumerate() {
-        if y >= bottom.saturating_sub(1) {
+    for (i, item) in level.items.iter().enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
             break;
         }
-        match r.kind {
-            Kind::Separator => {
-                for x in 0..inner.width {
-                    if let Some(c) = f.buffer_mut().cell_mut((inner.x + x, y)) {
-                        c.set_symbol("─");
-                        c.set_style(panel_bg.fg(color(theme.ui.border)));
-                    }
+        if item.is_separator() {
+            for dx in 0..inner.width {
+                if let Some(c) = f.buffer_mut().cell_mut((inner.x + dx, y)) {
+                    c.set_symbol("─");
+                    c.set_style(panel_bg.fg(color(theme.ui.border)));
                 }
-                y += 1;
-                continue;
             }
-            _ => {}
+            continue;
         }
-
-        let selected = i == sel;
+        let selected = i == level.sel;
         let bg = if selected { theme.ui.title_bg } else { theme.ui.panel_bg };
         let row_bg = Style::default().bg(color(bg));
 
-        let label_color = match r.kind {
-            Kind::ReadOnly => theme.ui.text_faint,
-            _ if selected => theme.ui.text,
-            _ => theme.ui.text_dim,
-        };
-        let value_color = match r.kind {
-            Kind::Action(_) => theme.ui.text_faint,
-            Kind::ReadOnly => theme.ui.text_faint,
-            _ => theme.ui.accent,
-        };
-
-        let label = truncate(&r.label, label_w as usize);
-        let value = truncate(&r.value, value_w as usize);
+        // A submenu entry advertises itself with a chevron rather than needing a legend.
+        let arrow = if matches!(item.act, Act::Submenu(_)) { "›" } else { " " };
+        let hint = item.hint.clone();
+        let label_room = inner.width.saturating_sub(hint.chars().count() as u16 + 4);
+        let label = truncate(&item.label, label_room as usize);
         let pad = inner
             .width
-            .saturating_sub(2 + label.chars().count() as u16 + value.chars().count() as u16);
+            .saturating_sub(2 + label.chars().count() as u16 + hint.chars().count() as u16 + 1);
 
-        let mut label_style = row_bg.fg(color(label_color));
+        let mut label_style = row_bg.fg(color(if selected {
+            theme.ui.text
+        } else {
+            theme.ui.text_dim
+        }));
         if selected {
             label_style = label_style.add_modifier(Modifier::BOLD);
         }
@@ -301,18 +317,225 @@ pub fn settings(f: &mut Frame, area: TRect, app: &App) {
                     if selected { "▎" } else { " " },
                     row_bg.fg(color(theme.ui.accent)),
                 ),
-                Span::styled(format!("{label} "), label_style),
+                Span::styled(label, label_style),
                 Span::styled(" ".repeat(pad as usize), row_bg),
-                Span::styled(value, row_bg.fg(color(value_color))),
+                Span::styled(hint, row_bg.fg(color(theme.ui.text_faint))),
+                Span::styled(arrow.to_string(), row_bg.fg(color(theme.ui.accent))),
             ]),
         );
+        app.menu_hits.push((y, i));
+    }
+}
+
+/// The settings page: categories on the left, that category's settings on the right.
+pub fn settings(f: &mut Frame, area: TRect, app: &mut App) {
+    let theme = app.cfg.theme.clone();
+    let (cat, sel, capturing) = match &app.mode {
+        Mode::Settings { cat, sel, capture } => (*cat, *sel, capture.clone()),
+        _ => return,
+    };
+    let cats = settings::Category::all();
+    let cat = cat.min(cats.len() - 1);
+    let category = cats[cat];
+    let rows = settings::rows(&app.cfg, category);
+
+    let w = (area.width.saturating_sub(6)).min(86).max(44);
+    let h = (rows.len() as u16 + 4).max(cats.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let outer = centered(area, w, h);
+    let inner = panel(f, outer, "settings", &theme);
+    let panel_bg = Style::default().bg(color(theme.ui.panel_bg));
+
+    let nav_w = 16u16.min(inner.width / 3);
+    let body_x = inner.x + nav_w + 1;
+    let body_w = inner.width.saturating_sub(nav_w + 1);
+    let bottom = inner.y + inner.height;
+
+    app.settings_cat_hits.clear();
+    app.settings_row_hits.clear();
+
+    // Vertical divider between nav and body.
+    for dy in 0..inner.height.saturating_sub(1) {
+        if let Some(c) = f.buffer_mut().cell_mut((inner.x + nav_w, inner.y + dy)) {
+            c.set_symbol("│");
+            c.set_style(panel_bg.fg(color(theme.ui.border)));
+        }
+    }
+
+    for (i, c) in cats.iter().enumerate() {
+        let y = inner.y + i as u16;
+        if y >= bottom.saturating_sub(1) {
+            break;
+        }
+        let active = i == cat;
+        let bg = if active { theme.ui.title_bg } else { theme.ui.panel_bg };
+        let mut st = Style::default()
+            .bg(color(bg))
+            .fg(color(if active { theme.ui.accent } else { theme.ui.text_dim }));
+        if active {
+            st = st.add_modifier(Modifier::BOLD);
+        }
+        let label = truncate(c.label(), nav_w.saturating_sub(2) as usize);
+        let pad = nav_w.saturating_sub(1 + label.chars().count() as u16);
+        put_line(
+            f.buffer_mut(),
+            inner.x,
+            y,
+            nav_w,
+            Line::from(vec![
+                Span::styled(
+                    if active { "▎" } else { " " },
+                    Style::default().bg(color(bg)).fg(color(theme.ui.accent)),
+                ),
+                Span::styled(label, st),
+                Span::styled(" ".repeat(pad as usize), Style::default().bg(color(bg))),
+            ]),
+        );
+        app.settings_cat_hits.push((y, i));
+    }
+
+    let value_w = 22u16.min(body_w / 2);
+    let label_w = body_w.saturating_sub(value_w + 3);
+    // One line of the body, flattened first so wrapped notes count toward the scroll
+    // window. The Keybindings category alone is longer than any terminal is tall.
+    enum L {
+        Rule,
+        Note(String),
+        Row(usize),
+    }
+    let mut lines: Vec<L> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        match &r.kind {
+            Kind::Separator => lines.push(L::Rule),
+            Kind::Note => {
+                for line in wrap_text(&r.label, body_w.saturating_sub(3) as usize) {
+                    lines.push(L::Note(line));
+                }
+            }
+            _ => lines.push(L::Row(i)),
+        }
+    }
+
+    // Scroll so the selection stays on screen, keeping a row of context either side.
+    let cap = inner.height.saturating_sub(1) as usize;
+    let sel_line = lines
+        .iter()
+        .position(|l| matches!(l, L::Row(i) if *i == sel))
+        .unwrap_or(0);
+    let offset = if lines.len() <= cap {
+        0
+    } else if sel_line < cap.saturating_sub(2) {
+        0
+    } else {
+        (sel_line + 3).saturating_sub(cap).min(lines.len().saturating_sub(cap))
+    };
+
+    let mut y = inner.y;
+    for l in lines.iter().skip(offset).take(cap) {
+        match l {
+            L::Rule => {
+                for dx in 0..body_w {
+                    if let Some(c) = f.buffer_mut().cell_mut((body_x + dx, y)) {
+                        c.set_symbol("─");
+                        c.set_style(panel_bg.fg(color(theme.ui.border)));
+                    }
+                }
+            }
+            L::Note(text) => {
+                // Explanatory prose, indented and dim so it does not read as a setting.
+                put_line(
+                    f.buffer_mut(),
+                    body_x + 2,
+                    y,
+                    body_w,
+                    Line::from(vec![Span::styled(
+                        text.clone(),
+                        panel_bg.fg(color(theme.ui.text_faint)),
+                    )]),
+                );
+            }
+            L::Row(i) => {
+                let r = &rows[*i];
+                let selected = *i == sel;
+                let bg = if selected { theme.ui.title_bg } else { theme.ui.panel_bg };
+                let row_bg = Style::default().bg(color(bg));
+
+                let base_color = match r.kind {
+                    Kind::Action(_) | Kind::ReadOnly => theme.ui.text_faint,
+                    _ => theme.ui.accent,
+                };
+                // While capturing, the row being rebound says so instead of showing the
+                // key it is about to lose.
+                let capturing_here = matches!(
+                    &r.kind,
+                    Kind::Keybind(n) if capturing.as_deref() == Some(n.as_str())
+                );
+                let value =
+                    if capturing_here { "press a key…".to_string() } else { r.value.clone() };
+                let value_color = if capturing_here { theme.ui.warn } else { base_color };
+
+                let label = truncate(&r.label, label_w as usize);
+                let value = truncate(&value, value_w as usize);
+                let pad = body_w.saturating_sub(
+                    2 + label.chars().count() as u16 + value.chars().count() as u16,
+                );
+
+                let mut label_style = row_bg.fg(color(match r.kind {
+                    Kind::ReadOnly => theme.ui.text_faint,
+                    _ if selected => theme.ui.text,
+                    _ => theme.ui.text_dim,
+                }));
+                if selected {
+                    label_style = label_style.add_modifier(Modifier::BOLD);
+                }
+
+                put_line(
+                    f.buffer_mut(),
+                    body_x,
+                    y,
+                    body_w,
+                    Line::from(vec![
+                        Span::styled(
+                            if selected { "▎" } else { " " },
+                            row_bg.fg(color(theme.ui.accent)),
+                        ),
+                        Span::styled(format!("{label} "), label_style),
+                        Span::styled(" ".repeat(pad as usize), row_bg),
+                        Span::styled(value, row_bg.fg(color(value_color))),
+                    ]),
+                );
+                app.settings_row_hits.push((y, *i));
+            }
+        }
         y += 1;
     }
 
-    // Footer hint, pinned to the last line.
-    let hint = match rows.get(sel).map(|r| &r.kind) {
-        Some(Kind::Action(_)) => "enter runs · esc closes",
-        _ => "←/→ change · ↑/↓ move · esc closes",
+    // Say there is more, and roughly where you are in it.
+    if lines.len() > cap {
+        let pct = (offset * 100) / lines.len().saturating_sub(cap).max(1);
+        let marker = format!(" {pct:>3}% ");
+        let mw = marker.chars().count() as u16;
+        if mw + 2 < body_w {
+            put_line(
+                f.buffer_mut(),
+                body_x + body_w - mw - 1,
+                bottom.saturating_sub(1),
+                mw,
+                Line::from(vec![Span::styled(
+                    marker,
+                    panel_bg.fg(color(theme.ui.text_faint)),
+                )]),
+            );
+        }
+    }
+
+    let hint = if capturing.is_some() {
+        "press the key to bind · esc cancels"
+    } else {
+        match rows.get(sel).map(|r| &r.kind) {
+            Some(Kind::Keybind(_)) => "enter rebinds · tab switches section · esc closes",
+            Some(Kind::Action(_)) => "enter runs · tab switches section · esc closes",
+            _ => "←/→ change · ↑/↓ move · tab section · esc closes",
+        }
     };
     put_line(
         f.buffer_mut(),

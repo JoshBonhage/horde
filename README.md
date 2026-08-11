@@ -65,15 +65,44 @@ Prefix is `ctrl+b`. `ctrl+b ?` lists everything.
 | `,` `.` | rename the focused pane (also renames the agent) / **settings** |
 | `d` `?` | detach / help |
 
-Mouse works too: click a pane or a sidebar row to focus it, click a tab to switch, scroll
-to page back through scrollback.
+### Mouse
 
-#### Settings
+Left-click a pane or a sidebar row to focus it, click a tab to switch, scroll to page back
+through scrollback.
 
-`ctrl+b .` opens a live settings panel: arrow keys change a value, it applies immediately
-and persists to `config.toml`. Writing goes through `toml_edit`, so comments and formatting
-in a hand-edited file survive. The panel also offers **edit config.toml in $EDITOR** (opens
-in a new pane) and **reload from disk**.
+**Right-click anything** for a context menu built from what is under the cursor:
+
+| Right-click | You get |
+|---|---|
+| a pane | split, start an agent, run a command, zoom, rename, copy visible text, send a message (agents only), layout, close |
+| a space row | focus, new tab here, rename, new space, close space |
+| an agent row | the pane menu for that agent, including **send message** |
+| a tab | focus, rename, layout, new tab, close tab |
+| anywhere else | new space, new tab, start agent, layout, toggle panels, jump to attention |
+
+Every entry shows its keyboard equivalent, so the menu teaches the keys rather than
+replacing them. `›` marks a submenu. Arrow keys or `j`/`k` navigate, `enter` activates,
+`esc` steps back out of a submenu and then closes.
+
+### Settings
+
+`ctrl+b .` opens a settings page with categories down the left:
+
+* **Appearance** — theme, sidebar and bus drawer, widths, pane titles, animations
+* **Keybindings** — every rebindable action with its current key
+* **Agents** — restore, detection depth, force delivery, install Claude hooks
+* **Notifications** — in-app, in-app + macOS, or off
+* **Terminal** — scrollback, shell
+* **About** — versions and every path horde uses
+
+`tab` switches category, `↑`/`↓` moves, `←`/`→` changes a value. Changes apply immediately
+and persist. To rebind a key, select the action, press `enter`, then press the key you want:
+a bare key becomes a prefix binding, a modified chord becomes a direct one, and a chord
+another action already owns is refused rather than double-bound.
+
+Writing goes through `toml_edit`, so comments and formatting in a hand-edited `config.toml`
+survive. The page also offers **edit config.toml in $EDITOR** (opens in a new pane) and
+**reload from disk**.
 
 ## Layouts
 
@@ -268,7 +297,7 @@ Shell panes are not listed — they are not agents, and you can already see them
 * The socket path must stay under ~100 bytes; that is an OS limit on `AF_UNIX`. Set
   `HORDE_SOCKET` if your config directory is deep.
 * Not implemented: dragging pane borders to resize (use `H J K L`), text selection in copy
-  mode, and OSC 52 clipboard forwarding.
+  mode (right-click → copy visible text instead), and OSC 52 clipboard forwarding.
 * `cargo test` covers the layout algebra, detection state machine, key encoding, config
   parsing and writing, and cell rendering — the parts where a subtle bug would be hard to
   see.
