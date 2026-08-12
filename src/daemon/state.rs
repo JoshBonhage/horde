@@ -364,6 +364,14 @@ impl Session {
     ///
     /// A pane whose command exited is closed the way tmux does it — the pane goes away and
     /// its space is reclaimed by its neighbours.
+    /// True when any pane still holds bytes the tty has not taken.
+    ///
+    /// Used to keep the tick loop fast while a message is draining, since each tick pushes
+    /// only what the terminal will accept at that moment.
+    pub fn has_pending_output(&self) -> bool {
+        self.panes.values().any(|p| p.has_deferred())
+    }
+
     pub fn reap_exited(&mut self, cfg: &Config) -> Vec<PaneId> {
         let dead: Vec<PaneId> = self
             .panes
