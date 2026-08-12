@@ -1,6 +1,6 @@
 ---
 name: horde
-description: "Coordinate with other AI agents running alongside you in horde, a terminal multiplexer with a message bus. Use when you need to delegate work to another agent, answer a request from one, check what other agents are doing, or start a helper agent. Also use whenever you see a line beginning with [horde] in your input. Requires HORDE_PANE to be set."
+description: "Coordinate with other AI agents running alongside you in horde, a terminal multiplexer with a shared task board and a message bus. Use when you need to take work off the task board or queue (horde task claim), mark a task done, delegate work to another agent, answer a request from one, check what other agents are doing, or start a helper agent. Also use whenever you see a line beginning with [horde] in your input, whenever you are told work is waiting on the board, and whenever you finish something and want more work. Requires HORDE_PANE to be set."
 ---
 
 # horde
@@ -65,6 +65,10 @@ Phrase these as instructions, not chat — they land as a prompt in the recipien
 ## Shared work: the board
 
 Work can also sit on a board for whoever is free, instead of being addressed to you:
+
+If a `[horde]` line tells you work is waiting on the board, that is horde nudging you — claim
+it, do it, mark it done. It is not an assignment: another agent may get there first, and
+`claim` returning a different task, or nothing, is a normal outcome.
 
 ```bash
 horde task list                 # what is outstanding

@@ -548,6 +548,7 @@ mod tests {
             queued: Vec::new(),
                 activity: Default::default(),
                 touched: Default::default(),
+                nudged_since: None,
         });
     }
 

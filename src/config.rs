@@ -108,6 +108,8 @@ struct RawAgents {
     detection_lines: Option<usize>,
     /// Deliver a queued message even while the target is mid-stream.
     force_inject: Option<bool>,
+    /// Tell an idle agent when work is waiting on the task board.
+    task_nudge: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -146,6 +148,7 @@ pub struct Config {
     pub restore_agents: bool,
     pub detection_lines: usize,
     pub force_inject: bool,
+    pub task_nudge: bool,
     pub notify: Notify,
     pub keys: Keymap,
 }
@@ -168,6 +171,7 @@ impl Default for Config {
             restore_agents: true,
             detection_lines: 40,
             force_inject: false,
+            task_nudge: true,
             notify: Notify::Horde,
             keys: Keymap::default(),
         }
@@ -239,6 +243,7 @@ impl Config {
         cfg.restore_agents = raw.agents.restore.unwrap_or(cfg.restore_agents);
         cfg.detection_lines = raw.agents.detection_lines.unwrap_or(cfg.detection_lines).clamp(5, 200);
         cfg.force_inject = raw.agents.force_inject.unwrap_or(cfg.force_inject);
+        cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
 
         if let Some(d) = &raw.notifications.delivery {
             cfg.notify = match d.as_str() {
