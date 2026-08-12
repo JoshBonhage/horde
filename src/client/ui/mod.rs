@@ -240,6 +240,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let mut hits = std::mem::take(&mut app.sidebar_hits);
         sidebar::Sidebar {
             snap: &snap,
+            board: Some((snap.tasks_open, snap.tasks_claimed)),
             theme: &theme,
             tick: app.tick,
             animate: app.cfg.animate,
@@ -454,6 +455,8 @@ mod frame_tests {
             bus: Rect::new(116, 1, 30, 37),
             status: Rect::new(0, 38, 146, 1),
             tabbar: Rect::new(0, 0, 146, 1),
+            tasks_open: 2,
+            tasks_claimed: 1,
         };
 
         app.rows.insert(1, vec![

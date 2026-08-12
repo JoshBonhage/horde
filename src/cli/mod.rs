@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use crate::daemon::tasks::Task;
 use crate::proto::{Request, Response};
 
 #[derive(Parser)]
@@ -112,6 +113,11 @@ pub enum Command {
     },
     /// Apply a named layout: solo, duo, trio, dev, quad.
     Layout { preset: String },
+    /// The shared task board agents pull work from.
+    Task {
+        #[command(subcommand)]
+        cmd: TaskCmd,
+    },
     /// Show recent bus messages.
     Bus {
         #[command(subcommand)]
@@ -156,6 +162,40 @@ pub enum Command {
         method: String,
         #[arg(long, default_value = "{}")]
         params: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TaskCmd {
+    /// Put work on the board for whoever is free.
+    Add { text: Vec<String> },
+    /// Take the oldest open task, or a specific one. Prints nothing if the board is empty.
+    Claim {
+        /// Task number. Omit to take the oldest open one.
+        task: Option<u64>,
+    },
+    /// Finish the task you claimed.
+    Done {
+        /// Task number. Omit for your own claimed task.
+        task: Option<u64>,
+        /// A one-line note about the outcome.
+        #[arg(long)]
+        result: Option<String>,
+    },
+    /// Put a task back on the board, or abandon it.
+    Release {
+        task: u64,
+        /// Retire it instead of reopening it.
+        #[arg(long)]
+        drop: bool,
+    },
+    /// Show the board.
+    List {
+        /// Include finished and abandoned tasks.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -512,6 +552,64 @@ pub fn run(cmd: Command) -> Result<()> {
             call("layout.apply", json!({ "preset": preset }))?;
             println!("applied layout {preset}");
         }
+
+        Command::Task { cmd } => match cmd {
+            TaskCmd::Add { text } => {
+                let text = text.join(" ");
+                let t = call("task.add", json!({ "text": text, "from": self_pane() }))?;
+                println!("#{} added", t.get("id").and_then(|x| x.as_u64()).unwrap_or(0));
+            }
+            TaskCmd::Claim { task } => {
+                let v = call("task.claim", json!({ "task": task, "from": self_pane() }))?;
+                match v.as_object() {
+                    Some(t) => {
+                        // The text goes to stdout alone so it can be captured and worked on.
+                        println!("{}", t.get("text").and_then(|x| x.as_str()).unwrap_or(""));
+                        eprintln!(
+                            "claimed #{} — finish with: horde task done --result \"...\"",
+                            t.get("id").and_then(|x| x.as_u64()).unwrap_or(0)
+                        );
+                    }
+                    None => eprintln!("nothing on the board"),
+                }
+            }
+            TaskCmd::Done { task, result } => {
+                let v = call(
+                    "task.done",
+                    json!({ "task": task, "result": result, "from": self_pane() }),
+                )?;
+                println!("#{} done", v.get("id").and_then(|x| x.as_u64()).unwrap_or(0));
+            }
+            TaskCmd::Release { task, drop } => {
+                let v = call("task.release", json!({ "task": task, "drop": drop }))?;
+                let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("?");
+                println!("#{task} is now {state}");
+            }
+            TaskCmd::List { all, json: as_json } => {
+                let v = call("task.list", json!({}))?;
+                if as_json {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                    return Ok(());
+                }
+                // Decode the daemon's own type rather than re-deriving glyphs from
+                // strings, so the board reads the same here as it does in the sidebar.
+                let items: Vec<Task> = serde_json::from_value(v)?;
+                let shown: Vec<&Task> =
+                    items.iter().filter(|t| all || t.is_open() || t.is_claimed()).collect();
+                if shown.is_empty() {
+                    println!("board is empty — add work with `horde task add \"...\"`");
+                    return Ok(());
+                }
+                for t in shown {
+                    let owner =
+                        t.owner.as_ref().map(|o| format!("  [{o}]")).unwrap_or_default();
+                    println!("{} #{:<4} {}{}", t.state.glyph(), t.id, t.text, owner);
+                    if let Some(r) = &t.result {
+                        println!("       → {r}");
+                    }
+                }
+            }
+        },
 
         Command::Bus { cmd } => match cmd {
             BusCmd::Tail { limit, follow, json: as_json } => {

@@ -378,6 +378,8 @@ mod tests {
             bus: Rect::default(),
             status: Rect::default(),
             tabbar: Rect::default(),
+            tasks_open: 0,
+            tasks_claimed: 0,
         }
     }
 

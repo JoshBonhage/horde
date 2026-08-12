@@ -1267,6 +1267,8 @@ mod tests {
             bus: Rect::default(),
             status: Rect::default(),
             tabbar: Rect::new(0, 0, 120, 1),
+            tasks_open: 0,
+            tasks_claimed: 0,
         };
 
         // Walk the bar and collect which tab each column maps to.

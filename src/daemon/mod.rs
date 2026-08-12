@@ -14,6 +14,7 @@ pub mod persist;
 pub mod pty;
 pub mod rpc;
 pub mod state;
+pub mod tasks;
 pub mod upgrade;
 
 use std::collections::{HashMap, HashSet};
@@ -68,6 +69,7 @@ pub struct Engine {
     pub cfg: Config,
     pub session: Session,
     pub bus: bus::Bus,
+    pub board: tasks::Board,
     pub agents: agents::Detector,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
@@ -257,6 +259,7 @@ async fn engine_loop(
     let mut eng = Engine {
         session,
         bus: bus::Bus::new(crate::config::bus_log_path()),
+        board: tasks::Board::new(crate::config::tasks_path()),
         agents,
         cfg,
         clients: HashMap::new(),
@@ -656,6 +659,27 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         eng.pending_events.push(Event::PaneExited { pane: *p, status: 0 });
         eng.dirty_shape = true;
     }
+
+    // An agent that went away still holds whatever it claimed. Hand it back, or the board
+    // quietly stalls on work nobody is doing. This runs after reaping, and every tick
+    // rather than only on detection passes, because a pane can close without detection
+    // having a say.
+    if eng.board.claimed_count() > 0 {
+        let live: Vec<String> = eng
+            .session
+            .panes
+            .keys()
+            .map(|p| bus::Bus::sender_name(&eng.session, Some(*p)))
+            .collect();
+        for t in eng.board.reclaim_absent(&live) {
+            log_line(&format!("task #{} returned to the board", t.id));
+            eng.pending_events.push(Event::Notice {
+                level: NoticeLevel::Info,
+                text: format!("task #{} is open again — its agent left", t.id),
+            });
+            eng.dirty_shape = true;
+        }
+    }
     if !exited.is_empty() && eng.session.spaces.is_empty() {
         // The last pane closed; recreate a space so horde is never left unusable.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -694,7 +718,10 @@ fn broadcast(eng: &mut Engine) {
     let cfg = eng.cfg.clone();
     let snapshot = if eng.dirty_shape {
         eng.dirty_shape = false;
-        Some(Box::new(eng.session.snapshot(&cfg)))
+        let mut s = eng.session.snapshot(&cfg);
+        s.tasks_open = eng.board.open_count();
+        s.tasks_claimed = eng.board.claimed_count();
+        Some(Box::new(s))
     } else {
         None
     };
@@ -933,6 +960,7 @@ mod tests {
         let mut eng = Engine {
             session,
             bus: bus::Bus::new(std::env::temp_dir().join("horde-test-bus.jsonl")),
+            board: tasks::Board::new(std::env::temp_dir().join("horde-test-tasks.jsonl")),
             agents,
             cfg,
             clients: HashMap::new(),

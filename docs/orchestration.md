@@ -264,7 +264,65 @@ too, and is simpler.
 
 ---
 
-## 8. Worked patterns
+## 8. The shared task board
+
+The bus pushes work at a named agent. The board is the other direction: work sits there and
+whoever is free takes it. Use it when you have more jobs than you want to hand out one at a
+time, or when you do not care which agent does which.
+
+```sh
+horde task add "write tests for src/bus.rs"
+horde task add "check the docs for stale command names"
+horde task list
+```
+
+An agent takes work by claiming:
+
+```sh
+work=$(horde task claim)          # prints the task text, or "nothing on the board"
+```
+
+A claim is **exclusive** — two agents claiming at the same moment get different tasks, never
+the same one. If the board is empty, `claim` prints `nothing on the board` and exits 0, so a
+loop can tell "no work" from "broken".
+
+When you finish, say so, and say what happened:
+
+```sh
+horde task done --result "18 tests added, all passing"
+```
+
+`done` with no id finishes the task you are holding. The result is what the human reads in
+`horde task list --all`, so make it a real answer, not "done".
+
+If you cannot do it, hand it back rather than sitting on it:
+
+```sh
+horde task release <id>           # back on the board for someone else
+horde task release <id> --drop    # abandon it; the attempt stays on the record
+```
+
+**You never have to release on exit.** If your pane goes away while holding a task, horde
+puts it back on the board automatically and tells the human why.
+
+### The worker loop
+
+This is the pattern the board exists for. Every agent runs the same loop, so adding agents
+adds throughput without anyone scheduling anything:
+
+```sh
+while work=$(horde task claim); [ -n "$work" ]; do
+  # do $work
+  horde task done --result "<what happened>"
+done
+```
+
+Do the work as your normal turn — think, edit, test. Claim one at a time; claiming a batch
+starves the other agents.
+
+---
+
+## 9. Worked patterns
 
 ### Delegate and wait
 
@@ -296,6 +354,24 @@ done
 horde bus tail --limit 20        # read what they all reported
 ```
 
+### Work a queue instead of dispatching
+
+Ten jobs, three agents, and you do not want to decide who does what.
+
+```sh
+for f in src/*.rs; do horde task add "review $f and report anything broken"; done
+
+for n in a b c; do horde spawn --cmd claude --name "$n"; done
+horde broadcast "run: while w=\$(horde task claim); [ -n \"\$w\" ]; do <do \$w>; \
+horde task done --result \"<summary>\"; done"
+
+horde task list                  # watch it drain
+horde task list --all            # every result, once it is empty
+```
+
+Unlike a fan-out, this self-balances: a fast agent takes more tasks, and an agent that dies
+mid-task returns it to the board instead of losing it.
+
 ### Review pipeline
 
 Hand work down a chain, each stage told who to notify next.
@@ -326,7 +402,7 @@ esac
 
 ---
 
-## 9. Rules of the road
+## 10. Rules of the road
 
 Things that will save you a wasted turn:
 
@@ -347,7 +423,7 @@ Things that will save you a wasted turn:
 
 ---
 
-## 10. Everything is recorded
+## 11. Everything is recorded
 
 Every message horde routes is appended to `~/.config/horde/bus.jsonl`, one JSON object per
 line:
@@ -365,7 +441,7 @@ Read it live with `horde bus tail -f`, or watch it in the drawer with `ctrl+b b`
 
 ---
 
-## 11. Command reference
+## 12. Command reference
 
 Everything an agent needs, in one place:
 
@@ -387,6 +463,15 @@ horde bus tail -f                  # follow
 # coordinate
 horde wait <name> --until idle --timeout 300
 horde pane read <name> --source detection --lines 40
+horde ask <name> "question"        # send and block until they answer
+
+# the shared board
+horde task add "text"              # put work up for whoever is free
+horde task claim                   # take the oldest open task (exclusive)
+horde task claim <id>              # take a specific one
+horde task done --result "text"    # finish the one you hold
+horde task release <id>            # give it back  (--drop to abandon)
+horde task list                    # outstanding  (--all for finished too)
 
 # build a team
 horde spawn --cmd claude --name reviewer --split right
@@ -403,7 +488,7 @@ speak the protocol directly, see [socket-api.md](socket-api.md).
 
 ---
 
-## 12. Why it works this way
+## 13. Why it works this way
 
 Two design decisions explain most of the behaviour above, and knowing them makes the rest
 predictable.

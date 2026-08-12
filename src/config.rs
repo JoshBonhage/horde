@@ -44,6 +44,10 @@ pub fn bus_log_path() -> PathBuf {
     config_dir().join("bus.jsonl")
 }
 
+pub fn tasks_path() -> PathBuf {
+    config_dir().join("tasks.jsonl")
+}
+
 pub fn log_path() -> PathBuf {
     config_dir().join("horde.log")
 }
