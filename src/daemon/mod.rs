@@ -6,7 +6,9 @@
 
 pub mod agents;
 pub mod bus;
+pub mod digest;
 pub mod handoff;
+pub mod journal;
 pub mod layout;
 pub mod manifest;
 pub mod pane;
@@ -70,6 +72,15 @@ pub struct Engine {
     pub session: Session,
     pub bus: bus::Bus,
     pub board: tasks::Board,
+    pub journal: journal::Journal,
+    /// Pane names as of the start of this tick. An exit event is emitted after the pane has
+    /// already been removed, so the name has to have been captured before that.
+    pane_names: HashMap<PaneId, String>,
+    /// When this daemon started, unix millis. The fallback window for a first digest.
+    pub started: u64,
+    /// When you last read a digest. The window a digest covers, in other words — it advances
+    /// only on a read, so ignoring digests widens the window instead of losing the history.
+    pub last_seen: u64,
     pub agents: agents::Detector,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
@@ -260,6 +271,10 @@ async fn engine_loop(
         session,
         bus: bus::Bus::new(crate::config::bus_log_path()),
         board: tasks::Board::new(crate::config::tasks_path()),
+        journal: journal::Journal::new(crate::config::journal_path()),
+        pane_names: HashMap::new(),
+        started: now_millis(),
+        last_seen: 0,
         agents,
         cfg,
         clients: HashMap::new(),
@@ -411,6 +426,14 @@ fn handle_msg(eng: &mut Engine, msg: DaemonMsg) -> bool {
             let cfg = eng.cfg.clone();
             eng.session.set_client_size(&cfg, cols, rows);
             eng.dirty_shape = true;
+
+            // Coming back to five panes of scrollback tells you nothing. Say what changed,
+            // and leave the window open so `horde digest` still has the detail — the toast
+            // is a pointer, not the report.
+            let since = if eng.last_seen == 0 { eng.started } else { eng.last_seen };
+            if let Some(line) = digest::build(eng, since).headline() {
+                eng.notice(NoticeLevel::Info, format!("{line} — see `horde digest`"));
+            }
         }
         DaemonMsg::Detached { id } => {
             eng.clients.remove(&id);
@@ -620,6 +643,8 @@ fn new_ticker(attached: bool) -> tokio::time::Interval {
 fn tick(eng: &mut Engine, detect_due: bool) {
     let theme = eng.cfg.theme.clone();
     let pane_ids: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+    eng.pane_names =
+        pane_ids.iter().map(|id| (*id, bus::Bus::sender_name(&eng.session, Some(*id)))).collect();
     for id in &pane_ids {
         if let Some(p) = eng.session.panes.get_mut(id) {
             p.pump(&theme);
@@ -703,6 +728,21 @@ fn agent_fingerprint(session: &Session) -> Vec<(PaneId, String, crate::proto::Ag
 }
 
 fn broadcast(eng: &mut Engine) {
+    // Journal before anything can drop the events: the detached path clears them, and the
+    // detached path is exactly when a digest is being accumulated.
+    if !eng.pending_events.is_empty() {
+        // Names come from the start-of-tick map, not from the session: a pane that exited was
+        // already reaped, and "builder exited" is the useful line, not "pane2 exited".
+        let events = std::mem::take(&mut eng.pending_events);
+        let names = std::mem::take(&mut eng.pane_names);
+        for ev in &events {
+            eng.journal
+                .record(ev, |id| names.get(&id).cloned().unwrap_or_else(|| format!("pane{id}")));
+        }
+        eng.pane_names = names;
+        eng.pending_events = events;
+    }
+
     if eng.clients.is_empty() {
         // Nothing attached: drain dirty rows anyway so they cannot pile up unboundedly.
         let ids: Vec<PaneId> = eng.session.panes.keys().copied().collect();
@@ -961,6 +1001,10 @@ mod tests {
             session,
             bus: bus::Bus::new(std::env::temp_dir().join("horde-test-bus.jsonl")),
             board: tasks::Board::new(std::env::temp_dir().join("horde-test-tasks.jsonl")),
+            journal: journal::Journal::new(std::env::temp_dir().join("horde-test-journal.jsonl")),
+            pane_names: HashMap::new(),
+            started: now_millis(),
+            last_seen: 0,
             agents,
             cfg,
             clients: HashMap::new(),

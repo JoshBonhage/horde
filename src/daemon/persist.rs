@@ -29,6 +29,10 @@ pub struct SavedState {
     pub version: u32,
     pub spaces: Vec<SavedSpace>,
     pub focused_space: Option<usize>,
+    /// When a digest was last read. Saved so the window a digest covers survives the daemon
+    /// restart it may well be reporting on. Defaulted, so older state files still load.
+    #[serde(default)]
+    pub last_seen: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +97,7 @@ pub fn save(eng: &Engine, path: &Path) -> Result<()> {
         version: STATE_VERSION,
         focused_space: s.focused_space.and_then(|id| s.spaces.iter().position(|x| x.id == id)),
         spaces,
+        last_seen: eng.last_seen,
     };
 
     if let Some(p) = path.parent() {
@@ -148,6 +153,7 @@ pub fn load(path: &Path) -> Result<Option<SavedState>> {
 
 pub fn restore(eng: &mut Engine, saved: SavedState) -> Result<()> {
     let cfg = eng.cfg.clone();
+    eng.last_seen = saved.last_seen;
     for (si, space) in saved.spaces.iter().enumerate() {
         let cwd = PathBuf::from(&space.cwd);
         // A saved directory can be gone by the next start; fall back rather than fail.
@@ -316,6 +322,7 @@ mod tests {
                 version: STATE_VERSION + 99,
                 spaces: vec![],
                 focused_space: None,
+                last_seen: 0,
             })
             .unwrap(),
         )
@@ -439,7 +446,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("state.json");
         let state =
-            SavedState { version: STATE_VERSION, spaces: vec![], focused_space: None };
+            SavedState { version: STATE_VERSION, spaces: vec![], focused_space: None, last_seen: 0 };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json).unwrap();

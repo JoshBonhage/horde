@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use crate::daemon::digest::Digest;
 use crate::daemon::tasks::Task;
 use crate::proto::{Request, Response};
 
@@ -117,6 +118,19 @@ pub enum Command {
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
+    },
+    /// What happened while you were away.
+    ///
+    /// Reading it advances the window, so the next digest starts where this one ended.
+    Digest {
+        /// Look back this far instead, e.g. 30m, 2h, 90s.
+        #[arg(long)]
+        since: Option<String>,
+        /// Do not advance the window.
+        #[arg(long)]
+        keep: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Show recent bus messages.
     Bus {
@@ -611,6 +625,19 @@ pub fn run(cmd: Command) -> Result<()> {
             }
         },
 
+        Command::Digest { since, keep, json: as_json } => {
+            let mut params = json!({ "keep": keep });
+            if let Some(spec) = &since {
+                params["since"] = json!(parse_duration(spec)?);
+            }
+            let v = call("digest", params)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            }
+            print_digest(&serde_json::from_value(v)?);
+        }
+
         Command::Bus { cmd } => match cmd {
             BusCmd::Tail { limit, follow, json: as_json } => {
                 let mut seen: u64 = 0;
@@ -832,6 +859,156 @@ fn print_roster(v: &Value) {
     }
 }
 
+/// `90s`, `30m`, `2h`, `1d`, or a bare number of seconds. Returned as seconds.
+fn parse_duration(spec: &str) -> Result<u64> {
+    let spec = spec.trim();
+    let (digits, mult) = match spec.chars().last() {
+        Some('s') => (&spec[..spec.len() - 1], 1),
+        Some('m') => (&spec[..spec.len() - 1], 60),
+        Some('h') => (&spec[..spec.len() - 1], 3600),
+        Some('d') => (&spec[..spec.len() - 1], 86_400),
+        _ => (spec, 1),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| anyhow!("cannot read {spec:?} as a duration — try 30m, 2h, or 90s"))?;
+    Ok(n * mult)
+}
+
+/// `42m`, `3h`, `2d` — how long ago, at the coarsest unit that is still true.
+fn ago(millis: u64) -> String {
+    let secs = millis / 1000;
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// The digest, in the order you would want to be told: what is stuck, what finished, what
+/// the board did, then what was said.
+fn print_digest(d: &Digest) {
+    let elapsed = d.now.saturating_sub(d.since);
+    let window = ago(elapsed);
+    if d.is_empty() {
+        // Say which window was checked — "nothing happened" without a window is
+        // unfalsifiable. Except right after a read, when the window is the point.
+        if elapsed < 5_000 && !d.fresh {
+            println!("nothing new since you last looked");
+        } else {
+            println!("nothing to report from the last {window}");
+        }
+        for a in &d.working {
+            println!("  ◐ {} still working, {}", a.name, ago(a.elapsed * 1000));
+        }
+        return;
+    }
+
+    println!("while you were away · {window}");
+
+    if !d.needs_you.is_empty() {
+        println!("\n  needs you");
+        for a in &d.needs_you {
+            println!("    ◍ {:<16} stuck {:<6} {}", a.name, ago(a.elapsed * 1000), a.reason);
+        }
+    }
+    if !d.finished.is_empty() {
+        println!("\n  finished");
+        for a in &d.finished {
+            let detail = a.activity.clone().unwrap_or_else(|| a.reason.clone());
+            println!("    ● {:<16} {:<6} {}", a.name, ago(a.elapsed * 1000), detail);
+        }
+    }
+    if !d.working.is_empty() {
+        println!("\n  still working");
+        for a in &d.working {
+            let detail = a.activity.clone().unwrap_or_default();
+            println!("    ◐ {:<16} {:<6} {}", a.name, ago(a.elapsed * 1000), detail);
+        }
+    }
+
+    if !d.tasks_done.is_empty() || d.tasks_added > 0 || d.tasks_open + d.tasks_claimed > 0 {
+        println!("\n  board");
+        for t in &d.tasks_done {
+            let glyph = if t.dropped { "✕" } else { "●" };
+            let owner = t.owner.clone().unwrap_or_else(|| "?".into());
+            println!("    {glyph} #{:<3} {}  [{}]", t.id, t.text, owner);
+            match (&t.result, t.dropped) {
+                (Some(r), _) => println!("           → {r}"),
+                (None, true) => println!("           → dropped, no result"),
+                (None, false) => {}
+            }
+        }
+        let mut standing = Vec::new();
+        if d.tasks_added > 0 {
+            standing.push(format!("{} added", d.tasks_added));
+        }
+        if d.tasks_open > 0 {
+            standing.push(format!("{} open", d.tasks_open));
+        }
+        if d.tasks_claimed > 0 {
+            standing.push(format!("{} claimed", d.tasks_claimed));
+        }
+        if !standing.is_empty() {
+            println!("    {}", standing.join(", "));
+        }
+    }
+
+    if !d.messages.is_empty() {
+        println!("\n  bus · {}", plural(d.messages.len(), "message"));
+        for m in &d.messages {
+            // A glyph is enough for delivered — that is the expected case. The other two
+            // are the ones you would want to act on, so they say so in words.
+            let mark = match m.delivery {
+                crate::proto::Delivery::Delivered => "✓",
+                crate::proto::Delivery::Queued => "⧗ queued",
+                crate::proto::Delivery::Dropped => "✕ dropped",
+            };
+            let tag = match (m.expects_reply, m.reply_to) {
+                (_, Some(n)) => format!("re #{n} "),
+                (true, None) => format!("ask #{} ", m.id),
+                _ => String::new(),
+            };
+            let arrow = if m.broadcast { "→ all" } else { &format!("→ {}", m.to) };
+            println!("    {mark} {tag}{} {arrow}: {}", m.from, one_line(&m.body, 60));
+        }
+    }
+
+    if !d.gone.is_empty() {
+        println!("\n  exited");
+        for name in &d.gone {
+            println!("    ✕ {name}");
+        }
+    }
+    if !d.warnings.is_empty() {
+        println!("\n  warnings");
+        for w in &d.warnings {
+            println!("    ! {w}");
+        }
+    }
+}
+
+/// `1 message` / `3 messages`. A count that says "1 messages" reads as a bug.
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
+/// Collapse a message body to one line for a list. A digest is a scan, not a transcript.
+fn one_line(body: &str, max: usize) -> String {
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
 fn print_message(m: &Value) {
     let from = m.get("from").and_then(|x| x.as_str()).unwrap_or("?");
     let to = m.get("to").and_then(|x| x.as_str()).unwrap_or("?");
@@ -858,6 +1035,41 @@ fn print_message(m: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_accept_the_units_a_human_would_type() {
+        assert_eq!(parse_duration("90s").unwrap(), 90);
+        assert_eq!(parse_duration("30m").unwrap(), 1800);
+        assert_eq!(parse_duration("2h").unwrap(), 7200);
+        assert_eq!(parse_duration("1d").unwrap(), 86_400);
+        // A bare number is seconds, which is what the socket API takes.
+        assert_eq!(parse_duration("45").unwrap(), 45);
+        let err = parse_duration("soon").unwrap_err().to_string();
+        assert!(err.contains("30m"), "the error should show the format: {err}");
+    }
+
+    #[test]
+    fn ago_uses_the_coarsest_unit_that_is_still_true() {
+        assert_eq!(ago(0), "0s");
+        assert_eq!(ago(59_000), "59s");
+        assert_eq!(ago(60_000), "1m");
+        assert_eq!(ago(3_600_000), "1h");
+        assert_eq!(ago(90_000_000), "1d");
+    }
+
+    #[test]
+    fn one_line_flattens_and_truncates_a_body() {
+        assert_eq!(one_line("two\n  lines", 40), "two lines");
+        let long = one_line(&"x".repeat(100), 20);
+        assert_eq!(long.chars().count(), 20, "{long}");
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn counts_read_correctly_at_one() {
+        assert_eq!(plural(1, "message"), "1 message");
+        assert_eq!(plural(3, "message"), "3 messages");
+    }
 
     #[test]
     fn direction_names_are_validated() {
@@ -889,6 +1101,11 @@ mod tests {
         Cli::try_parse_from(["horde", "hook", "claude", "Stop"]).unwrap();
         Cli::try_parse_from(["horde", "api", "ping"]).unwrap();
         Cli::try_parse_from(["horde", "layout", "duo"]).unwrap();
+        Cli::try_parse_from(["horde", "task", "add", "write the tests"]).unwrap();
+        Cli::try_parse_from(["horde", "task", "claim"]).unwrap();
+        Cli::try_parse_from(["horde", "task", "done", "--result", "green"]).unwrap();
+        Cli::try_parse_from(["horde", "digest"]).unwrap();
+        Cli::try_parse_from(["horde", "digest", "--since", "30m", "--keep"]).unwrap();
     }
 
     #[test]

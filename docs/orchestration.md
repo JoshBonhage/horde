@@ -473,6 +473,10 @@ horde task done --result "text"    # finish the one you hold
 horde task release <id>            # give it back  (--drop to abandon)
 horde task list                    # outstanding  (--all for finished too)
 
+# catch up
+horde digest                       # what happened while you were away
+horde digest --since 2h --keep     # a wider window, without advancing it
+
 # build a team
 horde spawn --cmd claude --name reviewer --split right
 horde pane rename <name-or-id> <new-name>

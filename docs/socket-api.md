@@ -133,6 +133,38 @@ Spawns or closes panes to match the preset's pane count.
 `delivery` is `delivered`, `queued`, or `dropped`. Queued is not a failure — see
 [orchestration §4](orchestration.md).
 
+### Tasks
+
+| Method | Params | Notes |
+|---|---|---|
+| `task.add` | `text`, `from?` | returns the new `Task` |
+| `task.claim` | `from?`, `task?` | omit `task` to take the oldest open one |
+| `task.done` | `from?`, `task?`, `result?` | omit `task` to finish the one you hold |
+| `task.release` | `task`, `drop?` | back on the board, or abandoned |
+| `task.list` | — | every task, including finished ones |
+
+`task.claim` returns `null` — not an error — when the board is empty, so a worker loop can
+tell "no work" from "broken". Claiming a specific task that someone else already holds *is*
+an error: the claim is a compare-and-set, and losing the race has to be visible.
+
+A task whose owner is no longer a live pane is returned to the board automatically.
+
+### Digest
+
+| Method | Params | Notes |
+|---|---|---|
+| `digest` | `since?`, `keep?` | `since` is a lookback in **seconds** |
+
+Returns everything that happened in the window: agents that need a human, agents that
+finished, the board's closures, routed messages, panes that exited, and warnings.
+
+Reading advances the watermark so the next call starts where this one ended. Pass
+`keep: true` to look without advancing — that is what the client does to build its on-attach
+toast, so that `horde digest` afterwards still has the detail.
+
+With no `since` and no previous read, the window starts at daemon start rather than at the
+beginning of the logs; the returned `fresh` flag says when that happened.
+
 ### Commands
 
 | Method | Params |
