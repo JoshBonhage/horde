@@ -170,6 +170,13 @@ horde roster --json | grep queued
 Held messages also show as `⧗ queued` in the bus drawer (`ctrl+b b`), so a human watching
 can see a message waiting rather than wondering why nothing happened.
 
+**A held message survives the daemon restarting.** The queue itself lives in memory and
+cannot, so it is recovered from the log instead: a message whose newest log entry still says
+`queued` was never delivered, and gets handed back to the agent it was addressed to — by
+name — as soon as one answering to that name exists again. Until then it stays outstanding
+and keeps reading as queued, because it has not arrived. Only panes that actually have an
+agent receive one, so a restored pane that came back as a plain shell never gets typed into.
+
 ### `--now` exists and you should almost never use it
 
 ```sh

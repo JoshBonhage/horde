@@ -64,6 +64,15 @@ pub struct Bus {
     log_path: PathBuf,
     messages: VecDeque<Message>,
     next_id: u64,
+    /// Messages that were still queued when the last daemon stopped.
+    ///
+    /// A held message lives on the target's `AgentRuntime`, which does not survive a restart —
+    /// the panes come back as fresh processes with no agent until detection runs. Rather than
+    /// persist the queue separately, it is recovered from the log: a message whose newest entry
+    /// still says `queued` was, by definition, never delivered. They are re-homed by *name*
+    /// once an agent answering to it exists again, which is the same addressing the bus uses
+    /// everywhere else.
+    orphaned: Vec<Message>,
 }
 
 /// Whether a message can be written into a pane right now.
@@ -80,7 +89,49 @@ impl Bus {
     pub fn new(log_path: PathBuf) -> Bus {
         let messages = read_tail(&log_path, RING);
         let next_id = messages.iter().map(|m| m.id).max().unwrap_or(0) + 1;
-        Bus { log_path, messages, next_id }
+        // Anything still marked queued in the log outlived the daemon that was holding it.
+        let orphaned: Vec<Message> =
+            messages.iter().filter(|m| m.delivery == Delivery::Queued).cloned().collect();
+        if !orphaned.is_empty() {
+            super::log_line(&format!(
+                "bus: {} undelivered message(s) recovered from the log",
+                orphaned.len()
+            ));
+        }
+        Bus { log_path, messages, next_id, orphaned }
+    }
+
+    /// How many recovered messages are still waiting for their target to come back.
+    pub fn orphan_count(&self) -> usize {
+        self.orphaned.len()
+    }
+
+    /// Hand recovered messages back to the agents they were addressed to.
+    ///
+    /// Resolution is by name and happens on every flush pass, because the agent may not exist
+    /// yet: after a restart a pane takes a moment to boot and be detected. Until then the
+    /// message stays here and keeps showing as queued, which is honest — it has not arrived.
+    fn rehome_orphans(&mut self, session: &mut Session) {
+        if self.orphaned.is_empty() {
+            return;
+        }
+        let mut still_waiting = Vec::new();
+        for msg in std::mem::take(&mut self.orphaned) {
+            match Self::resolve(session, &msg.to)
+                .and_then(|p| session.panes.get_mut(&p))
+                .and_then(|p| p.agent.as_mut())
+            {
+                Some(agent) => {
+                    super::log_line(&format!(
+                        "bus: message {} re-homed to {} after a restart",
+                        msg.id, msg.to
+                    ));
+                    agent.queued.push(msg);
+                }
+                None => still_waiting.push(msg),
+            }
+        }
+        self.orphaned = still_waiting;
     }
 
     pub fn recent(&self, n: usize) -> Vec<Message> {
@@ -301,6 +352,10 @@ impl Bus {
 
     /// Deliver anything held for agents that have since reached their prompt.
     pub fn flush_queued(&mut self, session: &mut Session, cfg: &Config) -> Vec<Event> {
+        // Messages recovered from the log join the normal queues first, so they take the same
+        // gate and the same one-per-pass pacing as anything else.
+        self.rehome_orphans(session);
+
         let candidates: Vec<PaneId> = session
             .panes
             .values()
@@ -823,5 +878,121 @@ mod tests {
             took < std::time::Duration::from_millis(500),
             "send blocked for {took:?} — the engine would have been frozen for that long"
         );
+    }
+
+    /// A queued message must survive the daemon that was holding it.
+    ///
+    /// The queue itself lives on an `AgentRuntime` and cannot survive — so this is recovered
+    /// from the log instead, which already records the final delivery of every message.
+    #[test]
+    fn messages_still_queued_at_shutdown_are_recovered_from_the_log() {
+        let p = std::env::temp_dir().join("horde-bus-orphan.jsonl");
+        let _ = std::fs::remove_file(&p);
+        let held = Message {
+            id: 1,
+            ts: 1,
+            from: "builder".into(),
+            to: "target".into(),
+            body: "still waiting".into(),
+            delivery: Delivery::Queued,
+            broadcast: false,
+            expects_reply: false,
+            reply_to: None,
+        };
+        let done = Message { id: 2, delivery: Delivery::Delivered, ..held.clone() };
+        // Message 3 was queued and then delivered — the later entry must win, so it is *not*
+        // an orphan. This is the case a naive "any queued line" scan would get wrong.
+        let requeued = Message { id: 3, ..held.clone() };
+        let settled = Message { id: 3, delivery: Delivery::Delivered, ..held.clone() };
+        let dropped = Message { id: 4, delivery: Delivery::Dropped, ..held.clone() };
+        let text = [&held, &done, &requeued, &settled, &dropped]
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, format!("{text}\n")).unwrap();
+
+        let bus = Bus::new(p.clone());
+        assert_eq!(bus.orphan_count(), 1, "only the still-queued message is outstanding");
+        assert_eq!(bus.orphaned[0].id, 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_recovered_message_is_delivered_once_its_agent_is_back() {
+        let (cfg, mut session) = session_with_cat();
+        let pane = *session.panes.keys().next().unwrap();
+
+        let p = std::env::temp_dir().join("horde-bus-rehome.jsonl");
+        let _ = std::fs::remove_file(&p);
+        let held = Message {
+            id: 1,
+            ts: 1,
+            from: "builder".into(),
+            to: "target".into(),
+            body: "from before the restart".into(),
+            delivery: Delivery::Queued,
+            broadcast: false,
+            expects_reply: false,
+            reply_to: None,
+        };
+        std::fs::write(&p, format!("{}\n", serde_json::to_string(&held).unwrap())).unwrap();
+        let mut bus = Bus::new(p.clone());
+
+        // No agent yet — the pane is still booting. The message must wait, not vanish.
+        let events = bus.flush_queued(&mut session, &cfg);
+        assert!(events.is_empty());
+        assert_eq!(bus.orphan_count(), 1, "nothing to deliver to yet");
+
+        // Detection finds the agent; now it can be re-homed and sent.
+        give_agent(&mut session, pane, AgentState::Idle);
+        let events = bus.flush_queued(&mut session, &cfg);
+        assert_eq!(bus.orphan_count(), 0, "it should have been handed over");
+        assert_eq!(events.len(), 1, "and delivered on the same pass");
+        match &events[0] {
+            Event::BusMessage(m) => {
+                assert_eq!(m.id, 1);
+                assert_eq!(m.delivery, Delivery::Delivered);
+            }
+            other => panic!("expected a bus message, got {other:?}"),
+        }
+
+        // The log now ends with a delivered entry, so a further restart will not re-send it.
+        let reread = Bus::new(p.clone());
+        assert_eq!(reread.orphan_count(), 0, "delivery must be recorded, or it loops forever");
+
+        for pane in session.panes.values_mut() {
+            pane.kill();
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_recovered_message_for_an_agent_that_never_returns_is_kept_not_dropped() {
+        let (cfg, mut session) = session_with_cat();
+        let p = std::env::temp_dir().join("horde-bus-orphan-forever.jsonl");
+        let _ = std::fs::remove_file(&p);
+        let held = Message {
+            id: 1,
+            ts: 1,
+            from: "builder".into(),
+            to: "someone-else".into(),
+            body: "hello?".into(),
+            delivery: Delivery::Queued,
+            broadcast: false,
+            expects_reply: false,
+            reply_to: None,
+        };
+        std::fs::write(&p, format!("{}\n", serde_json::to_string(&held).unwrap())).unwrap();
+
+        let mut bus = Bus::new(p.clone());
+        for _ in 0..3 {
+            assert!(bus.flush_queued(&mut session, &cfg).is_empty());
+        }
+        assert_eq!(bus.orphan_count(), 1, "it stays outstanding rather than being discarded");
+        for pane in session.panes.values_mut() {
+            pane.kill();
+        }
+        let _ = std::fs::remove_file(&p);
     }
 }
