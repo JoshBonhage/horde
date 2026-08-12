@@ -15,6 +15,8 @@ use crate::theme::Theme;
 pub struct PaneView<'a> {
     pub rows: &'a [Row],
     pub theme: &'a Theme,
+    /// A mouse highlight to paint over the cells, when one belongs to this pane.
+    pub selection: Option<&'a crate::client::selection::Selection>,
 }
 
 impl Widget for PaneView<'_> {
@@ -33,6 +35,31 @@ impl Widget for PaneView<'_> {
             }
         }
 
+        self.blit(area, buf);
+        self.highlight(area, buf);
+    }
+}
+
+impl PaneView<'_> {
+    /// Repaint the selected cells' background, leaving their text and colour alone.
+    ///
+    /// A separate pass over the area rather than a test inside the blit: that loop already has
+    /// wide glyphs and combining marks to think about, and this needs nothing it computes.
+    fn highlight(&self, area: TRect, buf: &mut Buffer) {
+        let Some(sel) = self.selection else { return };
+        let bg = color(self.theme.ui.selection);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if sel.contains(x, y) {
+                    if let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) {
+                        cell.set_bg(bg);
+                    }
+                }
+            }
+        }
+    }
+
+    fn blit(&self, area: TRect, buf: &mut Buffer) {
         for (y, row) in self.rows.iter().enumerate().take(area.height as usize) {
             let mut x: u16 = 0;
             let py = area.y + y as u16;
@@ -238,12 +265,37 @@ mod tests {
         let area = TRect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
         let theme = Theme::horde();
-        PaneView { rows, theme: &theme }.render(area, &mut buf);
+        PaneView { rows, theme: &theme, selection: None }.render(area, &mut buf);
         buf
     }
 
     fn line_of(buf: &Buffer, y: u16, w: u16) -> String {
         (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect()
+    }
+
+    /// The highlight has to land on exactly the selected cells, and change only their
+    /// background — a selection that repainted the text would make it unreadable.
+    #[test]
+    fn a_selection_paints_the_cells_it_covers_and_no_others() {
+        use crate::client::selection::Selection;
+        let area = TRect::new(0, 0, 12, 2);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::horde();
+        let rows = [row("cargo test"), row("ok")];
+
+        let mut sel = Selection::new(1, (6, 0));
+        sel.extend((9, 0)); // "test"
+        PaneView { rows: &rows, theme: &theme, selection: Some(&sel) }.render(area, &mut buf);
+
+        let want = color(theme.ui.selection);
+        for x in 0..12u16 {
+            let cell = buf.cell((x, 0)).unwrap();
+            let selected = (6..=9).contains(&x);
+            assert_eq!(cell.bg == want, selected, "column {x} background");
+        }
+        // The text itself is untouched, and the row below is not involved.
+        assert_eq!(line_of(&buf, 0, 12), "cargo test  ");
+        assert_ne!(buf.cell((0, 1)).unwrap().bg, want, "an unselected row stays as it was");
     }
 
     #[test]
@@ -324,7 +376,8 @@ mod tests {
         let area = TRect::new(0, 0, 0, 0);
         let mut buf = Buffer::empty(TRect::new(0, 0, 4, 1));
         let theme = Theme::horde();
-        PaneView { rows: &[row("x")], theme: &theme }.render(area, &mut buf);
+        PaneView { rows: &[row("x")], theme: &theme, selection: None }
+            .render(area, &mut buf);
         assert_eq!(line_of(&buf, 0, 4), "    ");
     }
 

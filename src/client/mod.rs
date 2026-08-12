@@ -5,6 +5,7 @@
 
 pub mod input;
 pub mod menu;
+pub mod selection;
 pub mod settings;
 pub mod ui;
 
@@ -100,6 +101,8 @@ pub struct App {
     pub settings_cat_hits: Vec<(u16, usize)>,
     /// Screen row to settings-row index.
     pub settings_row_hits: Vec<(u16, usize)>,
+    /// Text highlighted with the mouse, if any. Belongs to exactly one pane.
+    pub selection: Option<selection::Selection>,
     pub quit: bool,
 }
 
@@ -126,6 +129,7 @@ impl App {
             menu_rect: crate::proto::Rect::default(),
             settings_cat_hits: Vec::new(),
             settings_row_hits: Vec::new(),
+            selection: None,
             quit: false,
         }
     }
@@ -531,6 +535,9 @@ fn handle_key(
     if k.kind == KeyEventKind::Release {
         return Ok(());
     }
+    // Typing means you have finished reading what you highlighted. Leaving it up while new
+    // output arrives underneath points at text that is no longer there.
+    app.selection = None;
     let chord = Chord::new(k.modifiers, k.code);
 
     // Overlay modes consume keys entirely.
@@ -1195,6 +1202,19 @@ fn handle_mouse(
         return Ok(());
     }
 
+    // A drag that began in a pane belongs to that pane until the button comes up, wherever the
+    // pointer wanders. Overshooting into the sidebar is how you select to the bottom of a pane,
+    // and letting the hit-test re-target mid-drag would freeze the selection there — or, on
+    // release, drop the copy entirely.
+    if app.selection.as_ref().is_some_and(|s| s.dragging)
+        && matches!(
+            m.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        )
+    {
+        return continue_drag(app, m, &snap);
+    }
+
     // Clicks on the settings page pick a category or a row.
     if let Mode::Settings { cat, sel, .. } = app.mode.clone() {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -1246,7 +1266,12 @@ fn handle_mouse(
     }
 
     let inside = pane.content.contains(x, y);
-    if pane.wants_mouse && inside {
+
+    // Shift takes the mouse back from a program that asked for it, which is the convention every
+    // terminal already uses for exactly this — otherwise there is no way to copy out of `vim` or
+    // anything else running its own mouse handling.
+    let take_over = m.modifiers.contains(KeyModifiers::SHIFT);
+    if pane.wants_mouse && inside && !take_over {
         // The program asked for mouse reporting, so it gets the event verbatim.
         if let Some(bytes) = input::encode_mouse(
             m.kind,
@@ -1259,17 +1284,92 @@ fn handle_mouse(
         return Ok(());
     }
 
-    // Otherwise the wheel drives horde's own scrollback.
+    // Content-relative, so the selection never has to know where the pane sits on screen.
+    let at = (x.saturating_sub(pane.content.x), y.saturating_sub(pane.content.y));
+
     match m.kind {
+        MouseEventKind::Down(MouseButton::Left) if inside => {
+            // Any new press abandons the previous highlight, including one in another pane.
+            app.selection = Some(selection::Selection::new(pane.id, at));
+        }
+        // Extending and finishing are handled before the hit-test, so they still work when the
+        // pointer has left the pane.
+        // The wheel drives horde's own scrollback. The rows move out from under a highlight,
+        // so it goes rather than pointing at whatever scrolled into its place.
         MouseEventKind::ScrollUp => {
+            app.selection = None;
             let _ = out.send(ClientFrame::Command(Cmd::Scroll { pane: pane.id, lines: 3 }));
         }
         MouseEventKind::ScrollDown => {
+            app.selection = None;
             let _ = out.send(ClientFrame::Command(Cmd::Scroll { pane: pane.id, lines: -3 }));
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Extend or finish a drag already in progress, wherever the pointer now is.
+fn continue_drag(
+    app: &mut App,
+    m: crossterm::event::MouseEvent,
+    snap: &Snapshot,
+) -> Result<()> {
+    let Some(id) = app.selection.as_ref().map(|s| s.pane) else { return Ok(()) };
+    let Some(pane) = snap.panes.iter().find(|p| p.id == id) else {
+        // The pane went away mid-drag. Nothing to copy out of.
+        app.selection = None;
+        return Ok(());
+    };
+    let at = clamp_to(pane, m.column, m.row);
+
+    if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left)) {
+        if let Some(sel) = app.selection.as_mut() {
+            sel.extend(at);
+        }
+        return Ok(());
+    }
+
+    // Button up: settle the selection and copy what it holds.
+    let Some(sel) = app.selection.as_mut() else { return Ok(()) };
+    sel.extend(at);
+    sel.dragging = false;
+    let sel = sel.clone();
+
+    // A click that never moved is how you focus a pane, and must not touch the clipboard.
+    if sel.is_empty() {
+        app.selection = None;
+        return Ok(());
+    }
+
+    let empty: Vec<Row> = Vec::new();
+    let text = sel.text(app.rows.get(&sel.pane).unwrap_or(&empty));
+    if text.is_empty() {
+        app.selection = None;
+        return Ok(());
+    }
+    let lines = text.lines().count();
+    match copy_to_clipboard(&text) {
+        Ok(()) => app.toast(NoticeLevel::Info, format!("copied {}", plural(lines, "line"))),
+        Err(e) => app.toast(NoticeLevel::Warn, format!("copy failed: {e}")),
+    }
+    Ok(())
+}
+
+/// A pointer position clamped into a pane's content, content-relative.
+fn clamp_to(pane: &crate::proto::PaneInfo, x: u16, y: u16) -> (u16, u16) {
+    let cx = x.clamp(pane.content.x, pane.content.x + pane.content.w.saturating_sub(1));
+    let cy = y.clamp(pane.content.y, pane.content.y + pane.content.h.saturating_sub(1));
+    (cx - pane.content.x, cy - pane.content.y)
+}
+
+/// `1 line` / `3 lines`. "copied 1 lines" reads as a bug in the tool.
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
 }
 
 #[cfg(test)]
