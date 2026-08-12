@@ -10,6 +10,7 @@ pub mod digest;
 pub mod handoff;
 pub mod journal;
 pub mod layout;
+pub mod logfile;
 pub mod manifest;
 pub mod pane;
 pub mod persist;
@@ -282,6 +283,10 @@ async fn engine_loop(
         detect_soon: true,
         pending_events: Vec::new(),
     };
+
+    // Nothing replays the daemon log, so it only needs bounding — done once at startup, where
+    // a size check costs nothing, rather than on every line.
+    logfile::rotate_plain(&crate::config::log_path(), logfile::MAX_BYTES);
 
     let mut import = import;
     match &mut import {
