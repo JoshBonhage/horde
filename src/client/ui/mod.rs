@@ -418,6 +418,11 @@ mod frame_tests {
                 agent: agent.map(|(n, s, e)| AgentInfo {
                     kind: "claude".into(), name: n.into(), state: s, elapsed: e,
                     authority: "hook".into(), reason: "reported by integration".into(),
+                    // The demo frame shows the activity line the hooks make possible.
+                    activity: crate::proto::Activity {
+                        tools: 12, files: 3, errors: 0, turns: 2,
+                        last_tool: Some("Edit".into()),
+                    },
                 }),
                 exited: false, scroll_offset: 0, wants_mouse: false, bracketed_paste: true,
             }

@@ -271,6 +271,19 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             let session_id = str_arg(req, "session").map(|s| s.to_string());
             let Engine { agents, session, .. } = eng;
             let ev = agents.report(session, p, state, session_id);
+
+            // Activity is recorded after the state report, so the agent record exists.
+            if let Some(agent) = session.panes.get_mut(&p).and_then(|x| x.agent.as_mut()) {
+                if bool_arg(req, "new_turn") {
+                    agent.begin_turn();
+                }
+                if bool_arg(req, "counts_tool") {
+                    agent.record_tool(str_arg(req, "tool"), str_arg(req, "file"));
+                }
+                if bool_arg(req, "tool_failed") {
+                    agent.record_error();
+                }
+            }
             if let Some(ev) = ev {
                 eng.emit(ev);
             }
@@ -318,6 +331,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                             "authority": a.authority,
                             "reason": a.reason,
                             "queued": a.queued.len(),
+                        "activity": a.activity,
                             "space": s.name,
                             "tab": tab.name,
                             "pane": pid,

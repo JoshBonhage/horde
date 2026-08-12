@@ -582,6 +582,8 @@ impl Pane {
                 seen: a.seen,
                 session_id: a.session_id.clone(),
                 queued: a.queued.clone(),
+                activity: Default::default(),
+                touched: Default::default(),
             }),
             term,
             parser: Processor::new(),

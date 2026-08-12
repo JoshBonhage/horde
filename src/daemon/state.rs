@@ -984,6 +984,10 @@ pub struct AgentRuntime {
     pub session_id: Option<String>,
     /// Messages held back because the agent was mid-stream.
     pub queued: Vec<crate::proto::Message>,
+    /// Counted from lifecycle hooks.
+    pub activity: crate::proto::Activity,
+    /// Files touched this turn. Kept as a set so a file edited five times counts once.
+    pub touched: std::collections::HashSet<String>,
 }
 
 impl AgentRuntime {
@@ -995,7 +999,35 @@ impl AgentRuntime {
             elapsed: self.since.elapsed().as_secs(),
             authority: self.authority.clone(),
             reason: self.reason.clone(),
+            activity: self.activity.clone(),
         }
+    }
+
+    /// Start of a new turn: the per-turn counters describe one turn, not a session.
+    pub fn begin_turn(&mut self) {
+        self.activity.turns += 1;
+        self.activity.tools = 0;
+        self.activity.files = 0;
+        self.activity.errors = 0;
+        self.activity.last_tool = None;
+        self.touched.clear();
+    }
+
+    /// A tool call started. `file` is whatever path the tool was given, when it had one.
+    pub fn record_tool(&mut self, tool: Option<&str>, file: Option<&str>) {
+        self.activity.tools += 1;
+        if let Some(t) = tool {
+            self.activity.last_tool = Some(t.to_string());
+        }
+        if let Some(f) = file {
+            if self.touched.insert(f.to_string()) {
+                self.activity.files = self.touched.len() as u32;
+            }
+        }
+    }
+
+    pub fn record_error(&mut self) {
+        self.activity.errors += 1;
     }
 }
 

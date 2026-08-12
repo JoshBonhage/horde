@@ -264,6 +264,7 @@ mod tests {
                     elapsed: 5,
                     authority: "screen".into(),
                     reason: "t".into(),
+                    activity: Default::default(),
                 }),
                 exited: false,
                 scroll_offset: 0,

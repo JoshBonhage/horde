@@ -1007,6 +1007,8 @@ mod tests {
             seen: false,
             session_id: None,
             queued: Vec::new(),
+                activity: Default::default(),
+                touched: Default::default(),
         });
 
         eng.dirty_shape = false;

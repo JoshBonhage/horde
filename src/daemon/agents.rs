@@ -110,6 +110,8 @@ impl Detector {
             seen: focused,
             session_id: None,
             queued: Vec::new(),
+                activity: Default::default(),
+                touched: Default::default(),
         });
         if session_id.is_some() {
             agent.session_id = session_id;
@@ -239,6 +241,8 @@ impl Detector {
                 seen: is_focused,
                 session_id: None,
                 queued: Vec::new(),
+                activity: Default::default(),
+                touched: Default::default(),
             });
 
             // A pane can change hands, e.g. quitting one agent and starting another.
@@ -479,6 +483,8 @@ mod tests {
             seen,
             session_id: None,
             queued: Vec::new(),
+                activity: Default::default(),
+                touched: Default::default(),
         }
     }
 

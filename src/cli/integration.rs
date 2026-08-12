@@ -45,6 +45,7 @@ const CLAUDE_EVENTS: &[(&str, Option<AgentState>)] = &[
     ("SessionStart", None),
     ("UserPromptSubmit", Some(AgentState::Working)),
     ("PreToolUse", Some(AgentState::Working)),
+    ("PostToolUse", Some(AgentState::Working)),
     ("Notification", Some(AgentState::Blocked)),
     ("Stop", Some(AgentState::Idle)),
 ];
@@ -213,22 +214,40 @@ struct HookInput {
     session_id: Option<String>,
     /// Present when the event came from a subagent rather than the main conversation.
     agent_id: Option<String>,
+    /// Which tool is running, on the tool events.
+    tool: Option<String>,
+    /// The path the tool was given, when it had one. This is what makes "3 files" possible.
+    file: Option<String>,
+    /// Set when a tool reported failure.
+    failed: bool,
 }
 
 fn parse_hook_input(text: &str) -> HookInput {
     let Ok(v) = serde_json::from_str::<Value>(text) else { return HookInput::default() };
+    let non_empty = |x: Option<&Value>| {
+        x.and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string())
+    };
+    // Tools name their target under different keys depending on the tool, so try the ones
+    // that carry a path and ignore the rest.
+    let input = v.get("tool_input");
+    let file = ["file_path", "path", "notebook_path"]
+        .iter()
+        .find_map(|k| non_empty(input.and_then(|i| i.get(k))));
+    let failed = v
+        .get("tool_response")
+        .and_then(|r| r.get("success"))
+        .and_then(|s| s.as_bool())
+        .map(|ok| !ok)
+        .unwrap_or(false)
+        || v.get("hook_event_name").and_then(|x| x.as_str()) == Some("PostToolUseFailure");
+
     HookInput {
         event: v.get("hook_event_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        session_id: v
-            .get("session_id")
-            .and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string()),
-        agent_id: v
-            .get("agent_id")
-            .and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string()),
+        session_id: non_empty(v.get("session_id")),
+        agent_id: non_empty(v.get("agent_id")),
+        tool: non_empty(v.get("tool_name")),
+        file,
+        failed,
     }
 }
 
@@ -238,6 +257,11 @@ enum HookAction {
     Report { state: Option<AgentState>, session: bool },
     /// Deliberately do nothing.
     Ignore(&'static str),
+}
+
+/// Which event this firing really is, preferring Claude's own report over the argument.
+fn event_is(payload: &HookInput, want: &str) -> bool {
+    payload.event == want
 }
 
 /// Decide what to do about one hook firing.
@@ -290,10 +314,24 @@ pub fn run_hook(agent: &str, event: &str) -> Result<()> {
                 params["state"] = Value::from("idle");
             }
             if session || payload.session_id.is_some() {
-                if let Some(sid) = payload.session_id {
+                if let Some(sid) = payload.session_id.clone() {
                     params["session"] = Value::from(sid);
                 }
             }
+            // Activity travels with the state report, so one hook firing is one call.
+            if let Some(t) = &payload.tool {
+                params["tool"] = Value::from(t.clone());
+            }
+            if let Some(f) = &payload.file {
+                params["file"] = Value::from(f.clone());
+            }
+            if payload.failed {
+                params["tool_failed"] = Value::from(true);
+            }
+            // A tool starting is the countable moment; PostToolUse only reports the outcome.
+            params["counts_tool"] = Value::from(event_is(&payload, "PreToolUse"));
+            params["new_turn"] = Value::from(event_is(&payload, "UserPromptSubmit"));
+
             // Failure here is not the agent's problem; stay silent.
             let _ = super::call("pane.report_agent", params);
             Ok(())
@@ -382,8 +420,36 @@ mod tests {
 
     #[test]
     fn unmapped_events_are_ignored() {
-        let p = HookInput { event: "PostToolUse".into(), ..Default::default() };
-        assert!(matches!(decide("PostToolUse", &p), HookAction::Ignore(_)));
+        // PostToolUse is mapped now (it is how tool failures are counted), so use an event
+        // horde genuinely does not care about.
+        let p = HookInput { event: "PreCompact".into(), ..Default::default() };
+        assert!(matches!(decide("PreCompact", &p), HookAction::Ignore(_)));
+    }
+
+    #[test]
+    fn tool_activity_is_extracted_from_a_real_payload() {
+        let p = parse_hook_input(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Edit",
+                "tool_input":{"file_path":"/x/src/bus.rs","old_string":"a"}}"#,
+        );
+        assert_eq!(p.tool.as_deref(), Some("Edit"));
+        assert_eq!(p.file.as_deref(), Some("/x/src/bus.rs"));
+        assert!(!p.failed);
+
+        // Tools that touch no file still count as a tool call.
+        let p = parse_hook_input(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash",
+                "tool_input":{"command":"cargo test"}}"#,
+        );
+        assert_eq!(p.tool.as_deref(), Some("Bash"));
+        assert!(p.file.is_none());
+
+        // A failed tool is recognised from the response.
+        let p = parse_hook_input(
+            r#"{"hook_event_name":"PostToolUse","tool_name":"Edit",
+                "tool_response":{"success":false}}"#,
+        );
+        assert!(p.failed, "a failed tool must be counted as one");
     }
 
     #[test]

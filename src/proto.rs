@@ -224,6 +224,44 @@ pub struct PaneInfo {
     pub bracketed_paste: bool,
 }
 
+/// What an agent has actually been doing, counted from its lifecycle hooks.
+///
+/// Screen detection can see *that* an agent is busy; only the hooks can see what it is busy
+/// with. Counters reset when a new turn starts, so these describe the turn in progress (or
+/// the one that just finished), not the whole session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Activity {
+    /// Tool calls in this turn.
+    pub tools: u32,
+    /// Distinct files touched in this turn.
+    pub files: u32,
+    /// Tool calls that failed.
+    pub errors: u32,
+    /// Turns completed since the agent started.
+    pub turns: u32,
+    /// The tool most recently started, for a live "what is it doing" readout.
+    pub last_tool: Option<String>,
+}
+
+impl Activity {
+    /// Compact one-line summary, or None when nothing has been recorded.
+    ///
+    /// A sidebar is about 20 columns wide, so this shows two facts, not three. Failures
+    /// outrank the file count: one is something you may need to act on, the other is
+    /// texture.
+    pub fn summary(&self) -> Option<String> {
+        if self.tools == 0 && self.files == 0 {
+            return None;
+        }
+        let tools = format!("{} tools", self.tools);
+        Some(match (self.errors, self.files) {
+            (0, 0) => tools,
+            (0, f) => format!("{tools} · {f} files"),
+            (e, _) => format!("{tools} · {e} failed"),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     /// Detected kind, e.g. "claude".
@@ -237,6 +275,9 @@ pub struct AgentInfo {
     pub authority: String,
     /// Why the state was chosen — the matched rule name, or a fallback reason.
     pub reason: String,
+    /// Counted from lifecycle hooks; empty when no integration is installed.
+    #[serde(default)]
+    pub activity: Activity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

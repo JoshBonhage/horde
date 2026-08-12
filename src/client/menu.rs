@@ -343,6 +343,7 @@ mod tests {
                 elapsed: 1,
                 authority: "hook".into(),
                 reason: "t".into(),
+                activity: Default::default(),
             }),
             exited: false,
             scroll_offset: 0,

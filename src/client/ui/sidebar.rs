@@ -43,6 +43,8 @@ struct AgentRow {
     elapsed: u64,
     /// False when the agent lives in a space other than the focused one.
     here: bool,
+    /// What it has been doing this turn, when hooks are installed to tell us.
+    activity: Option<String>,
 }
 
 impl Widget for Sidebar<'_> {
@@ -68,8 +70,9 @@ impl Widget for Sidebar<'_> {
         let available = bottom.saturating_sub(top).saturating_sub(footer_h);
         let space_need = self.snap.spaces.len() as u16 + 1; // label + rows
         // rule + label + rows, or just rule + label + "none yet" when empty.
-        let agent_need =
-            if agents.is_empty() { 3 } else { agents.len() as u16 + 2 };
+        let agent_rows: u16 =
+            agents.iter().map(|a| 1 + u16::from(a.activity.is_some())).sum();
+        let agent_need = if agents.is_empty() { 3 } else { agent_rows + 2 };
 
         let (space_h, agent_h) = if space_need + agent_need <= available {
             (space_need, agent_need)
@@ -170,12 +173,28 @@ impl Widget for Sidebar<'_> {
                     );
                 }
             } else {
+                // Fit as many agents as their rows allow. An agent with an activity line
+                // needs two. The overflow note only costs a line when there is overflow, so
+                // try the whole list first and only then make room for the note.
                 let room = end.saturating_sub(y) as usize;
-                // Never silently truncate: the last row says how many are hidden.
-                let (visible, hidden) = if agents.len() > room && room > 0 {
-                    (&agents[..room - 1], agents.len() - room + 1)
+                let rows_for = |a: &AgentRow| 1 + usize::from(a.activity.is_some());
+                let total: usize = agents.iter().map(rows_for).sum();
+
+                let (visible, hidden) = if total <= room {
+                    (&agents[..], 0)
                 } else {
-                    (&agents[..agents.len().min(room)], 0)
+                    let budget = room.saturating_sub(1);
+                    let mut used = 0usize;
+                    let mut fit = 0usize;
+                    for a in &agents {
+                        let h = rows_for(a);
+                        if used + h > budget {
+                            break;
+                        }
+                        used += h;
+                        fit += 1;
+                    }
+                    (&agents[..fit], agents.len() - fit)
                 };
 
                 for a in visible {
@@ -212,6 +231,32 @@ impl Widget for Sidebar<'_> {
                     );
                     self.hits.push((y, Hit::Pane(a.pane)));
                     y += 1;
+
+                    // What it is doing, indented under the name. Hooks only — screen
+                    // detection cannot see tool calls.
+                    if let Some(act) = &a.activity {
+                        if y < end {
+                            put_line(
+                                buf,
+                                area.x,
+                                y,
+                                area.width,
+                                Line::from(vec![
+                                    Span::styled(
+                                        "    ",
+                                        Style::default().bg(color(t.ui.panel_bg)),
+                                    ),
+                                    Span::styled(
+                                        truncate(act, inner_w.saturating_sub(4) as usize),
+                                        Style::default()
+                                            .fg(color(t.ui.text_faint))
+                                            .bg(color(t.ui.panel_bg)),
+                                    ),
+                                ]),
+                            );
+                            y += 1;
+                        }
+                    }
                 }
                 if hidden > 0 {
                     put_line(
@@ -284,6 +329,11 @@ fn collect_agents(snap: &Snapshot) -> Vec<AgentRow> {
                     state: a.state,
                     elapsed: a.elapsed,
                     here: snap.focused_space == Some(space.id),
+                    // Only while it is actually doing something; a finished turn's counts
+                    // would be stale trivia.
+                    activity: (a.state == AgentState::Working)
+                        .then(|| a.activity.summary())
+                        .flatten(),
                 });
             }
         }
@@ -424,6 +474,7 @@ mod tests {
                 elapsed: 138,
                 authority: "hook".into(),
                 reason: "t".into(),
+                activity: Default::default(),
             }),
             exited: false,
             scroll_offset: 0,
@@ -573,6 +624,52 @@ mod tests {
         let (out, _) = render(&s, 24, 20);
         assert!(out.contains("AGENTS"), "{out}");
         assert!(out.contains("none yet"), "{out}");
+    }
+
+    /// Activity comes only from lifecycle hooks; screen detection cannot see a tool call.
+    /// It is shown on a second line under the agent, and only while it is working — a
+    /// finished turn's counts would be stale trivia.
+    #[test]
+    fn a_working_agent_shows_what_it_is_doing_underneath() {
+        let mut s = snap();
+        for p in s.panes.iter_mut() {
+            if let Some(a) = p.agent.as_mut() {
+                a.activity = crate::proto::Activity {
+                    tools: 12,
+                    files: 3,
+                    errors: 1,
+                    turns: 2,
+                    last_tool: Some("Edit".into()),
+                };
+            }
+        }
+        let (out, hits) = render(&s, 26, 22);
+        println!("\n{out}\n");
+        assert!(out.contains("12 tools"), "{out}");
+        // Failures outrank the file count in a 20-column gutter: one is actionable.
+        assert!(out.contains("1 failed"), "{out}");
+        assert!(!out.contains("3 files"), "the file count should yield to the failure: {out}");
+
+        // The detail line is not clickable; only the agent row itself is.
+        let pane_hits = hits.iter().filter(|(_, h)| matches!(h, Hit::Pane(_))).count();
+        assert_eq!(pane_hits, 3, "one hit row per agent, not per rendered line");
+
+        // Only the working agent gets a line; the blocked and idle ones do not.
+        let agents_block = &out[out.find("AGENTS").unwrap()..];
+        assert_eq!(agents_block.matches("12 tools").count(), 1, "{agents_block}");
+    }
+
+    #[test]
+    fn the_activity_summary_shows_files_when_nothing_failed() {
+        use crate::proto::Activity;
+        let a = Activity { tools: 9, files: 2, errors: 0, turns: 1, last_tool: None };
+        assert_eq!(a.summary().as_deref(), Some("9 tools · 2 files"));
+        let a = Activity { tools: 9, files: 2, errors: 3, turns: 1, last_tool: None };
+        assert_eq!(a.summary().as_deref(), Some("9 tools · 3 failed"));
+        let a = Activity { tools: 4, files: 0, errors: 0, turns: 1, last_tool: None };
+        assert_eq!(a.summary().as_deref(), Some("4 tools"));
+        // Nothing recorded means no line at all, rather than a row of zeroes.
+        assert_eq!(Activity::default().summary(), None);
     }
 
     #[test]
