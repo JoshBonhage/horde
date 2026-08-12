@@ -224,7 +224,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
         let empty: Vec<crate::proto::Row> = Vec::new();
         let rows = app.rows.get(&pane.id).unwrap_or(&empty);
-        pane_widget::PaneView { rows, theme: &theme }
+        // Only the pane the highlight belongs to gets one; a selection is never shared.
+        let sel = app.selection.as_ref().filter(|s| s.pane == pane.id);
+        pane_widget::PaneView { rows, theme: &theme, selection: sel }
             .render(trect(pane.content), f.buffer_mut());
 
         if focused {

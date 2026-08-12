@@ -57,6 +57,29 @@ in a toast rather than opening an empty panel.
 Left-click a pane or a sidebar row to focus it, click a tab to switch, scroll to page back
 through scrollback.
 
+### Selecting text
+
+**Drag across a pane to highlight, and it copies when you let go.** No key to press, nothing to
+confirm.
+
+- The selection belongs to **one pane** and stops at its edge, so dragging across a split never
+  welds two panes' output together the way a plain terminal selection does.
+- It is **line-oriented**: from the middle of one line to the middle of another takes everything
+  in between, and trailing blanks are trimmed off each line.
+- A **click that does not move** selects nothing and leaves your clipboard alone — that is how
+  you focus a pane, and it should not cost you what you had copied.
+- The highlight clears when you type, scroll, or start another selection.
+- Wide glyphs are counted in the columns they are actually drawn in, so a selection after CJK
+  text or an emoji is not shifted.
+
+For a program running its own mouse handling (`vim`, `htop`, anything with mouse mode on), the
+mouse goes to the program. **Hold shift to take it back** and select instead. Some terminals
+intercept shift-drag for their own native selection before horde sees it — that still copies, it
+just uses the terminal's idea of where panes are rather than horde's.
+
+Right-click a pane and choose **copy visible text** to take the whole pane instead of a
+selection.
+
 **Right-click anything** for a context menu built from what is under the cursor:
 
 | Right-click | You get |
