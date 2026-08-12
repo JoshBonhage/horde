@@ -317,6 +317,20 @@ async fn engine_loop(
         eng.notice(NoticeLevel::Warn, w);
     }
 
+    // Undelivered messages from the previous run are about to be re-homed. Say so, because
+    // an agent receiving a message from an hour ago is confusing without the context.
+    match eng.bus.orphan_count() {
+        0 => {}
+        n => eng.notice(
+            NoticeLevel::Info,
+            format!(
+                "{n} message{} from before the restart {} waiting to be delivered",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "is" } else { "are" }
+            ),
+        ),
+    }
+
     // Everything is rebuilt: tell the predecessor to stand down and take over its socket.
     if let Some(sock) = &mut import {
         upgrade::complete_import(sock).context("completing the handoff")?;
