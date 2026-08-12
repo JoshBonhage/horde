@@ -1,25 +1,16 @@
-# Claude Code screen manifest.
+# Claude Code detection manifest.
 #
-# This is the FALLBACK tier. Run `horde integration install claude` to wire up lifecycle
-# hooks, which report state authoritatively and make everything below unnecessary.
+# This is the FALLBACK tier. `horde integration install claude` wires up lifecycle hooks,
+# which report state authoritatively and make everything below unnecessary.
 #
-# Patterns are single-quoted TOML literals so regex backslashes need no escaping.
-# Matching is case-insensitive and `^`/`$` bind to line boundaries.
-#
-# Two things every pattern here has to survive:
-#
-# 1. **Truncation.** Claude elides its own status line to fit the pane, so at ~50 columns
-#    `· esc to interrupt` renders as `· esc to inte…`. Match a short prefix, never the
-#    whole phrase.
-# 2. **Transcript history.** The snapshot covers the last ~40 lines, which includes what
-#    Claude *said*, not just what it is doing. `within` restricts a rule to the bottom few
-#    lines — the live status area — so a "Thinking…" from ten minutes ago cannot pin the
-#    pane to `working` forever.
+# Rules are matched highest `priority` first, against a `region` rather than the whole
+# snapshot. Prefer `contains` (plain, case-insensitive substrings) over regex; it is what
+# most patterns need and there is no escaping to get wrong.
 
 name = "claude"
 
-# `claude` on disk is often a symlink to a versioned binary, so the process name alone is not
-# dependable — though when `ps` does say `claude`, that beats any screen guess.
+# When `ps` says `claude` that beats any screen guess. It often will not, because `claude` on
+# disk is usually a symlink to a versioned binary, which is what `detect` is for.
 processes = ["claude"]
 
 # Presence patterns must be unique to Claude. Anything generic ("esc to interrupt") is shared
@@ -31,40 +22,118 @@ detect = [
   '⏵⏵',
 ]
 
-# Blocked is checked first and kept deliberately strict: only a visible approval, question, or
-# permission UI counts. Silence is never treated as blocked.
+# --- the terminal title: the signal that cannot be truncated or go stale ---------------
 #
-# `❯\s*\d+\.` matches a numbered selection menu, which is distinct from the bare `❯` input
-# caret — matching the caret here would mark every idle pane as blocked.
+# Claude sets the title to a spinner glyph while a turn runs and to `✳` at rest. The title is
+# an escape sequence, not drawn into the grid, so it survives any pane width and is never
+# left over from scrollback. These rules therefore outrank everything else.
+#
+# Two spinner families have shipped: quarter-circles (U+25D0..U+25D3) in current builds and
+# braille (U+2800..U+28FF) in others. Both are recognised.
+
+# The spinner is authoritative: nothing else can be true while a turn is running, so this
+# outranks every other rule. Its idle counterpart sits near the bottom instead — see below.
 [[rules]]
-name = "blocked-permission"
+id = "osc_title_working"
+state = "working"
+priority = 1100
+region = "osc_title"
+regex = ['^[\x{25D0}-\x{25D3}]', '^[\x{2800}-\x{28FF}]']
+
+
+# --- suppression: UI that looks like a prompt but is not -------------------------------
+#
+# A transcript viewer or a model picker contains the same words as a permission dialog.
+# Matching one leaves the state alone rather than flipping the pane to `blocked`.
+
+[[rules]]
+id = "transcript_viewer"
+state = "unknown"
+priority = 1000
+region = "bottom_non_empty_lines(3)"
+skip_state_update = true
+contains = ["showing detailed transcript"]
+
+[[rules]]
+id = "model_picker"
+state = "unknown"
+priority = 990
+region = "whole_recent"
+skip_state_update = true
+contains = ["select model", "esc to cancel"]
+not = [{ contains = ["do you want to proceed?"] }]
+
+# --- blocked: only a visible approval, question, or permission UI ----------------------
+#
+# Never inferred from silence. A numbered menu (`❯ 1. Yes`) is the distinguishing mark, and
+# is quite different from the bare `❯` input caret.
+
+[[rules]]
+id = "permission_prompt"
 state = "blocked"
+priority = 900
+region = "whole_recent"
+contains = ["do you want to"]
 any = [
-  'Do you want to (proceed|continue|make this edit|create|run)',
-  'Do you trust the files',
-  'Would you like to proceed',
-  '❯\s*\d+\.\s',
-  'No, and tell Claude',
+  { line_regex = ['^\s*❯?\s*\d+\.\s*yes\b'] },
+  { line_regex = ['^\s*\d+\.\s*no\b'] },
+  { contains = ["no, and tell claude"] },
 ]
 
-# VERIFIED: while a turn runs, `· esc to interrupt` is appended to the mode line at the very
-# bottom and removed the moment it finishes. `within` pins this to that line so the words
-# cannot be picked up from scrollback, and the pattern is short enough to survive elision.
 [[rules]]
-name = "working-esc-to-interrupt"
-state = "working"
-within = 4
-any = ['esc to int']
+id = "trust_prompt"
+state = "blocked"
+priority = 890
+region = "whole_recent"
+contains = ["do you trust the files"]
 
-# VERIFIED: at rest the composer is a bare `❯` line framed by rules, with the mode line
-# beneath it and no interrupt hint.
 [[rules]]
-name = "idle-prompt"
+id = "would_you_like_to_proceed"
+state = "blocked"
+priority = 880
+region = "after_last_horizontal_rule"
+contains = ["would you like to proceed"]
+
+# --- screen fallbacks, for when the title is unavailable -------------------------------
+#
+# `esc to int` rather than the whole phrase: Claude elides its own status line to fit, so at
+# ~50 columns `· esc to interrupt` renders as `· esc to inte…`. Scoped to the status area so
+# the words cannot be picked up from the transcript.
+
+[[rules]]
+id = "status_line_working"
+state = "working"
+priority = 600
+region = "bottom_non_empty_lines(3)"
+contains = ["esc to int"]
+
+[[rules]]
+id = "composer_idle"
 state = "idle"
-within = 6
+priority = 500
+region = "prompt_box_body"
+line_regex = ['^\s*❯']
+not = [
+  { contains = ["esc to cancel"] },
+  { contains = ["enter to select"] },
+]
+
+# The resting glyph is a *weak* signal and deliberately outranked by every blocker above.
+# It only means "not generating", and an agent waiting on a permission prompt is not
+# generating either — so trusting it early would read a blocked pane as idle.
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 250
+region = "osc_title"
+regex = ['^\x{2733}']
+
+[[rules]]
+id = "mode_line_idle"
+state = "idle"
+priority = 400
+region = "bottom_non_empty_lines(3)"
 any = [
-  '^❯',
-  'shift\+tab to cycle',
-  '(auto mode|accept edits|plan mode) on',
-  '\? for shortcuts',
+  { contains = ["shift+tab to cycle"] },
+  { contains = ["? for shortcuts"] },
 ]

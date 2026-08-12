@@ -14,9 +14,13 @@ truncated off and a working agent reads as idle. Fix: `horde integration install
 widen the pane.
 
 **It says it is generating and never stops.** A rule is matching the agent's own transcript
-rather than its live status line — "Thinking…" from ten minutes ago is still on screen. The
-rule needs `within = N` to scope it to the bottom few lines. See
-[agents](agents.md).
+rather than its live status line — "Thinking…" from ten minutes ago is still on screen. Scope
+the rule with `region = "bottom_non_empty_lines(3)"`, or better, key it off
+`region = "osc_title"`, which cannot go stale. See [agents](agents.md).
+
+**A blocked agent reads as idle.** Check the priority of any `osc_title` idle rule: the
+resting title only means "not generating", which is also true of an agent waiting on a
+permission prompt. Every blocker has to outrank it.
 
 **It has the wrong agent's name.** Two manifests are claiming the pane because one has a
 generic `detect` pattern that the other agent also shows. `horde agent explain` prints

@@ -1,4 +1,4 @@
-# aider screen manifest. Untested locally.
+# aider detection manifest. Untested locally.
 #
 # aider is prompt-driven rather than a full-screen TUI, so its blocked state is the more
 # recognisable one — it asks explicit yes/no questions inline.
@@ -6,6 +6,7 @@
 name = "aider"
 processes = ["aider"]
 
+# Presence patterns must be unique to this agent.
 detect = [
   'aider v',
   'Added .* to the chat',
@@ -13,26 +14,22 @@ detect = [
 ]
 
 [[rules]]
-name = "blocked-question"
+id = "blocked_question"
 state = "blocked"
-any = [
-  '\(Y\)es/\(N\)o',
-  '\(y/n\)',
-  'Add .* to the chat\?',
-  'Apply edits\?',
-  'Run shell command\?',
-]
+priority = 900
+region = "bottom_non_empty_lines(6)"
+any = [{ contains = ["(y)es/(n)o"] }, { contains = ["(y/n)"] }, { contains = ["apply edits?"] }, { contains = ["run shell command?"] }]
 
 [[rules]]
-name = "working"
+id = "status_working"
 state = "working"
-within = 4
-any = [
-  '^\s*Thinking',
-  'Applying edit',
-]
+priority = 600
+region = "bottom_non_empty_lines(3)"
+any = [{ contains = ["thinking"] }, { contains = ["applying edit"] }]
 
 [[rules]]
-name = "idle-prompt"
+id = "prompt_idle"
 state = "idle"
-any = ['^\s*>\s*$', 'multi\. exit']
+priority = 500
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\\s*>\\s*$']

@@ -54,8 +54,7 @@ tool's hooks alone, and is safe to re-run.
 
 ### Tier 2: screen manifests (fallback)
 
-Without hooks, horde identifies the foreground process and matches regexes against the live
-bottom of the pane buffer.
+Without hooks, horde identifies the foreground process and matches rules against the pane.
 
 **Which agent is in a pane** is decided in order of how much the signal can be trusted:
 
@@ -67,70 +66,84 @@ bottom of the pane buffer.
 The order matters because agent UIs share phrases. `esc to interrupt` appears in Claude Code,
 Codex, and Cursor Agent alike, so a `detect` list containing it makes several manifests claim
 the same pane — and if the winner is decided by hash order, the pane flickers between names
-between one scan and the next. Every bundled `detect` list is now specific to its own agent,
-and the iteration is sorted.
+from one scan to the next. Every bundled `detect` list is specific to its own agent, and the
+iteration is sorted.
 
-Bundled manifests live in `agents/*.toml` and are compiled into the binary. Override one
-wholesale by dropping a file at `~/.config/horde/agents/<name>.toml`.
+#### Regions: what a rule looks at
 
-```toml
-name = "claude"
-processes = ["claude"]
+A rule matches a **region**, not the whole snapshot. This is the single most important idea
+in the file, because both ways screen detection goes wrong are regional:
 
-# Patterns proving *this* agent's UI is on screen. Must be unique to it: anything generic
-# makes two manifests claim one pane.
-detect = ['Claude Code', '\? for shortcuts', 'shift\+tab to cycle', '⏵⏵']
+| Region | What it is |
+|---|---|
+| `osc_title` | the terminal title, set by escape sequence |
+| `whole_recent` | the whole snapshot (the default) |
+| `bottom_non_empty_lines(N)` | the last N non-blank lines — the live status area |
+| `after_last_horizontal_rule` | everything below the last rule — usually the current dialog |
+| `prompt_box_body` | between the last two rules — the composer itself |
 
-# First matching rule wins. Order matters — blocked before working before idle.
-[[rules]]
-name = "blocked-permission"
-state = "blocked"
-any = ['Do you want to (proceed|make this edit)', '❯\s*\d+\.\s']
+**`osc_title` is the one that changes the game.** The title is an escape sequence, not
+characters in the grid, so it is never truncated by a narrow pane and never left over from
+scrollback. Claude Code sets it to a spinner glyph while a turn runs and to `✳` at rest — so
+horde can read the state of a 38-column pane, where the on-screen marker is not rendered at
+all.
 
-[[rules]]
-name = "working-esc-to-interrupt"
-state = "working"
-within = 4              # the live status area only, not scrollback
-any = ['esc to int']    # short prefix: survives the pane eliding the line
+#### Priority, and why the idle title ranks low
 
-[[rules]]
-name = "idle-prompt"
-state = "idle"
-within = 6
-any = ['^❯', 'shift\+tab to cycle']
+Rules carry an explicit `priority`; highest wins, and declaration order only breaks ties.
+Order-dependence is how a manifest rots — inserting a rule silently changes what the ones
+below it mean.
+
+The priorities encode an asymmetry worth understanding:
+
+```
+osc_title_working    1100   ← nothing else can be true while a turn runs
+transcript_viewer    1000   ← suppression (see below)
+permission_prompt     900
+status_line_working   600   ← screen fallback, for when the title is unavailable
+composer_idle         500
+osc_title_idle        250   ← weak: only means "not generating"
 ```
 
-Patterns are single-quoted TOML literals so regex backslashes need no escaping. Matching is
-case-insensitive and `^`/`$` bind to line boundaries. A rule fires when at least one `any`
-matches, every `all` matches, and no `none` matches. An unmatched screen falls back to
-`idle` with a labelled reason rather than `unknown` — a known agent sitting at a prompt horde
-does not recognise is far more likely idle than indeterminate.
+The **working** title is authoritative. The **idle** title is not: it only says the agent
+is not generating, and an agent waiting on a permission prompt is not generating either. Rank
+it high and every blocked pane reads as idle.
 
-The snapshot comes from the **live bottom** of the buffer, not the scrolled viewport, so
-scrolling back never changes what horde thinks an agent is doing.
+#### Suppression
 
-#### `within` — and why a stuck state usually means a missing one
+`skip_state_update = true` makes a rule match without setting a state, leaving whatever was
+there before. This is for UI that reads like a prompt but is not one — a transcript viewer or
+a model picker both contain the words a permission dialog does.
 
-`within = N` restricts a rule to the last N lines. Use it for anything describing what an
-agent is doing *right now*.
+#### Predicates
 
-The snapshot is ~40 lines, which includes what the agent **said**, not only its live chrome.
-An agent that printed "Thinking…" ten minutes ago still has those words on screen, so a
-`working` rule without `within` keeps firing forever — the spinner never stops and the
-elapsed timer counts up indefinitely. Scoping the rule to the bottom few lines, where the
-status area lives, fixes it.
+Prefer `contains`: a list of case-insensitive substrings, **all** of which must be present.
+No regex escaping to get wrong, which is where most pattern bugs come from. `regex` and
+`line_regex` are lists where **any** may match. `any` / `all` / `not` take nested predicates,
+so a rule can say "contains this, and one of those, but not that".
+
+```toml
+[[rules]]
+id = "permission_prompt"
+state = "blocked"
+priority = 900
+region = "whole_recent"
+contains = ["do you want to"]
+any = [
+  { line_regex = ['^\s*❯?\s*\d+\.\s*yes\b'] },
+  { contains = ["no, and tell claude"] },
+]
+```
+
+An empty predicate matches nothing, and a rule with no conditions is rejected at parse time —
+a rule that fired on everything would be worse than a missing rule.
 
 #### Truncation
 
-Agents elide their own status lines to fit the pane. Claude renders
-`· esc to interrupt` as `· esc to inte…` at around 50 columns, and drops it entirely below
-about 30. So:
-
-- **match a short prefix**, never a whole phrase — `esc to int` survives elision
-- below roughly 30 columns there is nothing left to match, and **only hooks can tell you
-  what an agent is doing**
-
-This is the single best reason to run `horde integration install claude`.
+Agents elide their own status lines to fit. Claude renders `· esc to interrupt` as
+`· esc to inte…` at around 50 columns and drops it entirely below about 30. So screen rules
+match a short prefix (`esc to int`) rather than a whole phrase, and the title carries the
+load when the grid cannot.
 
 ### Why hooks are worth installing
 

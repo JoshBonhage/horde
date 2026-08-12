@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::proto::{AgentState, Event, PaneId};
 
-use super::manifest::{self, Manifest, Verdict};
+use super::manifest::{self, Manifest, Screen, Verdict};
 use super::state::{AgentRuntime, Session};
 
 /// How long a hook report stays authoritative. If an integration is installed but the
@@ -167,10 +167,13 @@ impl Detector {
 
         for &id in &pane_ids {
             let process = self.processes.get(&id).cloned();
-            let screen = match session.panes.get(&id) {
-                Some(p) => p.detection_snapshot(cfg.detection_lines).join("\n"),
+            // The title is captured from OSC 0/2 rather than read off the grid, which is why
+            // it survives a narrow pane and never lingers from scrollback.
+            let (lines, title) = match session.panes.get(&id) {
+                Some(p) => (p.detection_snapshot(cfg.detection_lines), p.osc_title.clone()),
                 None => continue,
             };
+            let screen = lines.join("\n");
 
             // Which agent, if any, is in this pane? A fresh hook report is itself proof,
             // and outranks guessing from the process name or the screen.
@@ -207,10 +210,14 @@ impl Detector {
                 continue;
             };
 
+            // `evaluate` returning None means a rule matched that deliberately leaves the
+            // state alone — a transcript viewer or model picker, which reads like a prompt.
             let verdict: Option<Verdict> = if hook_fresh {
                 None
             } else {
-                self.manifests.get(&kind).map(|m| m.evaluate(&screen))
+                self.manifests
+                    .get(&kind)
+                    .and_then(|m| m.evaluate(&Screen { lines: &lines, osc_title: &title }))
             };
 
             let names = self.taken_names(session, id);
@@ -326,6 +333,7 @@ impl Detector {
         };
         let lines = p.detection_snapshot(cfg.detection_lines);
         let screen = lines.join("\n");
+        let title = p.osc_title.clone();
         let mut present: Vec<String> = self
             .manifests
             .values()
@@ -345,12 +353,23 @@ impl Detector {
             self.hook_reports.get(&pane).is_some_and(|t| t.elapsed() < HOOK_TTL);
 
         let evaluated = chosen.as_ref().and_then(|k| self.manifests.get(k)).map(|m| {
-            let v = m.evaluate(&screen);
+            let v = m.evaluate(&Screen { lines: &lines, osc_title: &title });
             serde_json::json!({
                 "manifest": m.name,
-                "state": v.state.label(),
-                "matched_rule": v.reason,
-                "rules_tried": m.rules.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+                "state": v.as_ref().map(|v| v.state.label()),
+                "matched_rule": v.as_ref().map(|v| v.reason.clone()),
+                "suppressed": v.is_none(),
+                "rules": m
+                    .rules
+                    .iter()
+                    .map(|r| serde_json::json!({
+                        "id": r.id,
+                        "state": r.state.label(),
+                        "priority": r.priority,
+                        "region": format!("{:?}", r.region),
+                        "skip_state_update": r.skip_state_update,
+                    }))
+                    .collect::<Vec<_>>(),
             })
         });
 
@@ -371,6 +390,7 @@ impl Detector {
                 "seen": a.seen,
                 "queued_messages": a.queued.len(),
             })),
+            "osc_title": title,
             "snapshot_lines": lines,
         })
     }

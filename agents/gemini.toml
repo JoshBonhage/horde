@@ -1,37 +1,35 @@
-# Gemini CLI screen manifest. Untested locally.
+# Gemini CLI detection manifest. Untested locally.
+#
+# `esc to cancel` is deliberately absent from `detect`: it is generic enough that other agents
+# show it, which previously mislabelled Claude panes as gemini mid-prompt.
 
 name = "gemini"
 processes = ["gemini"]
 
+# Presence patterns must be unique to this agent.
 detect = [
   'Gemini CLI',
   'gemini-2',
-  'GEMINI\.md',
+  'GEMINI\\.md',
 ]
 
 [[rules]]
-name = "blocked-approval"
+id = "blocked_approval"
 state = "blocked"
-any = [
-  'Allow execution',
-  'Apply this change\?',
-  'Do you want to',
-  '❯\s*1\.\s*Yes',
-]
+priority = 900
+region = "whole_recent"
+any = [{ contains = ["allow execution"] }, { contains = ["apply this change?"] }, { contains = ["do you want to"], any = [{ line_regex = ['^\\s*❯?\\s*\\d+\\.\\s*yes\\b'] }] }]
 
 [[rules]]
-name = "working"
+id = "status_line_working"
 state = "working"
-within = 4
-any = [
-  'esc to cancel',
-  '\bThinking\b',
-]
+priority = 600
+region = "bottom_non_empty_lines(3)"
+any = [{ contains = ["esc to cancel"] }, { contains = ["thinking"] }]
 
 [[rules]]
-name = "idle-prompt"
+id = "composer_idle"
 state = "idle"
-any = [
-  'Type your message',
-  '^\s*│\s*>',
-]
+priority = 500
+region = "prompt_box_body"
+any = [{ contains = ["type your message"] }, { line_regex = ['^\\s*[>❯]'] }]

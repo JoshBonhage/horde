@@ -1,12 +1,15 @@
-# OpenAI Codex CLI screen manifest.
+# OpenAI Codex CLI detection manifest.
 #
-# Untested locally — codex is not installed on this machine. `esc to interrupt` was
-# removed from `detect`: Claude Code shows the same phrase, so it made both manifests claim
-# the same pane and the winner was whichever the map happened to yield first.
+# Untested locally — codex is not installed on this machine. Refine with
+# `horde agent explain <pane>`, which prints the region slices and the rule that fired.
+#
+# `esc to interrupt` is deliberately absent from `detect`: Claude Code shows the same phrase,
+# and a shared presence pattern makes two manifests claim one pane.
 
 name = "codex"
 processes = ["codex"]
 
+# Presence patterns must be unique to this agent.
 detect = [
   'Codex CLI',
   'OpenAI Codex',
@@ -14,29 +17,23 @@ detect = [
 ]
 
 [[rules]]
-name = "blocked-approval"
+id = "blocked_approval"
 state = "blocked"
-any = [
-  'Allow command\?',
-  'Do you want to allow',
-  'Approve this',
-  '\[y/n\]',
-  '❯\s*1\.\s*Yes',
-]
+priority = 900
+region = "whole_recent"
+contains = ["allow command"]
+any = [{ contains = ["y/n"] }, { line_regex = ['^\\s*❯?\\s*\\d+\\.\\s*yes\\b'] }]
 
 [[rules]]
-name = "working"
+id = "status_line_working"
 state = "working"
-within = 4
-any = [
-  'esc to interrupt',
-  '\bWorking\b',
-]
+priority = 600
+region = "bottom_non_empty_lines(3)"
+any = [{ contains = ["esc to interrupt"] }, { contains = ["working"] }]
 
 [[rules]]
-name = "idle-prompt"
+id = "composer_idle"
 state = "idle"
-any = [
-  '^\s*│\s*>',
-  'send a message',
-]
+priority = 500
+region = "prompt_box_body"
+line_regex = ['^\\s*[>❯]']
