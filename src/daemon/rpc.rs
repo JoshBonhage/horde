@@ -496,6 +496,28 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             serde_json::to_value(eng.board.all()).map_err(|e| failed(e.to_string()))
         }
 
+        // -- digest ------------------------------------------------------
+        // What happened while nobody was watching. Reading it advances the watermark, so
+        // the window is always "since you last looked" — `keep` leaves it where it was, for
+        // the client's own on-attach peek.
+        "digest" => {
+            let since = match req.params.get("since").and_then(|v| v.as_u64()) {
+                // A caller-supplied window is a lookback in seconds, which is what a human
+                // means by `--since 30m`.
+                Some(secs) => super::now_millis().saturating_sub(secs * 1000),
+                // First ever read has no watermark; fall back to the daemon's own start so
+                // the first digest covers this session rather than all of history.
+                None if eng.last_seen == 0 => eng.started,
+                None => eng.last_seen,
+            };
+            let d = super::digest::build(eng, since);
+            if !bool_arg(req, "keep") {
+                eng.last_seen = super::now_millis();
+                eng.touch();
+            }
+            serde_json::to_value(d).map_err(|e| failed(e.to_string()))
+        }
+
         // -- commands ----------------------------------------------------
         // Everything a keybinding can do is also reachable by name, which is what makes
         // the command palette and scripting share one implementation.

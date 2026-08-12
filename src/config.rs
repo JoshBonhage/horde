@@ -48,6 +48,12 @@ pub fn tasks_path() -> PathBuf {
     config_dir().join("tasks.jsonl")
 }
 
+/// Agent state changes and pane exits, for `horde digest`. Distinct from the bus and task
+/// logs: each of the three owns facts the others do not.
+pub fn journal_path() -> PathBuf {
+    config_dir().join("events.jsonl")
+}
+
 pub fn log_path() -> PathBuf {
     config_dir().join("horde.log")
 }

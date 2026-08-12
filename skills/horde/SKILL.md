@@ -99,6 +99,17 @@ States: `working`, `blocked`, `done`, `idle`, `unknown`. Two rules worth knowing
 - **A message to a busy agent is queued, not lost.** horde delivers it when they reach their
   prompt. `queued` in the output is a normal result, not a failure.
 
+## Catching up
+
+If you were restarted, or you are picking up a session someone else was driving:
+
+```bash
+horde digest --keep
+```
+
+Tells you which agents need a human, what the board closed, and what was said — without
+advancing the human's own window. Use `--keep`; the digest belongs to them, not to you.
+
 ## Working with another agent's output
 
 ```bash

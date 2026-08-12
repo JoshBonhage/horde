@@ -59,6 +59,34 @@ horde send reviewer "read src/bus.rs and tell me if the gating logic is sound"
 Open the bus drawer with `ctrl+b b` to watch it routed. Full detail in
 [orchestration](orchestration.md).
 
+## Come back later
+
+Detach with `ctrl+b d` and go do something else. When you reattach, horde tells you what
+changed rather than leaving you to read five panes of scrollback:
+
+```sh
+horde digest
+```
+
+```
+while you were away · 42m
+
+  needs you
+    ◍ reviewer         stuck 12m    approval prompt
+
+  board
+    ● #4   write the bus tests  [builder]
+           → 18 tests added, all passing
+    2 open, 1 claimed
+
+  bus · 3 messages
+    ✓ ask #7 builder → reviewer: is the gating logic sound?
+    ✓ re #7 reviewer → builder: yes — queued messages flush on the next idle pass
+```
+
+Reading it advances the window, so the next digest picks up where this one stopped. Use
+`--since 2h` to look further back and `--keep` to look without moving the window.
+
 ## Worth doing once
 
 ```sh
