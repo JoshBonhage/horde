@@ -1092,6 +1092,51 @@ mod tests {
         kill_all(&mut s);
     }
 
+    /// Every pane's pty must end up the size of the rect it is drawn in, or the program inside
+    /// paints into a region that does not match its box — which is what a stale-looking pane in
+    /// the corner of a big one actually is.
+    #[test]
+    fn every_pane_pty_matches_the_rect_it_is_drawn_in() {
+        let (cfg, mut s) = session();
+        s.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        s.split(&cfg, None, Dir::Right, None).unwrap();
+        s.split(&cfg, None, Dir::Down, None).unwrap();
+
+        for (cols, rows) in [(120u16, 40u16), (200, 60), (80, 24), (100, 30)] {
+            s.set_client_size(&cfg, cols, rows);
+            for (id, _cell, content) in s.visible_rects(&cfg) {
+                let p = &s.panes[&id];
+                assert_eq!(
+                    (p.cols, p.rows),
+                    (content.w, content.h),
+                    "pane {id} at terminal {cols}x{rows}"
+                );
+            }
+        }
+        kill_all(&mut s);
+    }
+
+    /// The wobble that forces a program to repaint has to land back where it started. A redraw
+    /// that left every pane one row short would be worse than the problem it solves.
+    #[test]
+    fn forcing_a_redraw_leaves_the_size_exactly_as_it_was() {
+        let (cfg, mut s) = session();
+        s.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        s.split(&cfg, None, Dir::Right, None).unwrap();
+        s.set_client_size(&cfg, 140, 44);
+
+        let before: Vec<(PaneId, u16, u16)> =
+            s.panes.iter().map(|(id, p)| (*id, p.cols, p.rows)).collect();
+        for p in s.panes.values_mut() {
+            p.force_redraw().unwrap();
+        }
+        for (id, cols, rows) in before {
+            let p = &s.panes[&id];
+            assert_eq!((p.cols, p.rows), (cols, rows), "pane {id} came back a different size");
+        }
+        kill_all(&mut s);
+    }
+
     /// Creating a tab focuses it too, for the same reason.
     #[test]
     fn creating_a_tab_focuses_it() {

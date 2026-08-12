@@ -131,3 +131,22 @@ log is opened per write rather than held:
 ```sh
 tail -n 2000 ~/.config/horde/bus.jsonl > /tmp/b && mv /tmp/b ~/.config/horde/bus.jsonl
 ```
+
+## A pane's text sits in a small box in the corner
+
+The pane is the right size; the program inside it is painting at a size it no longer has.
+
+horde resizes the pty and the program gets a `SIGWINCH`, but what it does next is up to it. A
+full-screen program that repaints halfway through a window drag paints for a size that is already
+stale, and nothing horde holds can fix that afterwards — the emulator only has what the program
+last drew.
+
+Two things help:
+
+- **Automatic.** After a drag stops delivering sizes, horde waits 120ms and then nudges every
+  program to repaint at the size it actually has now. So letting go of a window edge settles.
+- **Manual.** `ctrl+b r` redraws everything, at any time. Reach for it if a pane ever looks wrong
+  — it costs one repaint and nothing else.
+
+A plain shell is a different case and not a bug: output already on screen was written for the old
+width and stays as it was drawn. The next prompt uses the new width.

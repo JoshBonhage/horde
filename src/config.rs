@@ -546,6 +546,7 @@ impl Default for Keymap {
             ("toggle_sidebar", Trigger::Prefix(d("e")), Action::Cmd(ToggleSidebar)),
             ("toggle_bus", Trigger::Prefix(d("b")), Action::Cmd(ToggleBus)),
             ("jump_attention", Trigger::Prefix(d("a")), Action::Cmd(JumpAttention)),
+            ("redraw", Trigger::Prefix(d("r")), Action::Cmd(Redraw)),
             ("digest", Trigger::Prefix(d("D")), Action::Cmd(RequestDigest)),
             ("palette", Trigger::Prefix(d("g")), Action::Palette),
             ("copy_mode", Trigger::Prefix(d("[")), Action::CopyMode),

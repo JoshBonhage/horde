@@ -660,6 +660,7 @@ fn command_by_name(name: &str, req: &Request) -> Option<Cmd> {
         "toggle-sidebar" => Cmd::ToggleSidebar,
         "toggle-bus" => Cmd::ToggleBus,
         "jump-attention" => Cmd::JumpAttention,
+        "redraw" => Cmd::Redraw,
         "digest" => Cmd::RequestDigest,
         _ => return None,
     })

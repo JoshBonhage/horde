@@ -730,6 +730,29 @@ impl Pane {
         Ok(())
     }
 
+    /// Make the program redraw, without its size having changed.
+    ///
+    /// `request_full_repaint` only re-sends the mirror horde already holds; it cannot conjure
+    /// content the program never drew. After a resize the emulator keeps whatever was last
+    /// painted, so a program that misses its `SIGWINCH` — or repaints while a drag is still
+    /// delivering sizes — leaves its output sitting in a corner of a pane that has since grown.
+    /// Nothing horde can ask the emulator will fix that. Only the program can.
+    ///
+    /// So the size is wobbled: one cell shorter, then back. Two `SIGWINCH`es the program cannot
+    /// mistake for the size it already believes it has, which is the one thing every terminal
+    /// program is guaranteed to repaint for. A same-size `TIOCSWINSZ` would be tidier, but
+    /// whether it signals at all is up to the platform.
+    pub fn force_redraw(&mut self) -> Result<()> {
+        let (cols, rows) = (self.cols, self.rows);
+        if rows > MIN_ROWS {
+            self.resize(cols, rows - 1)?;
+        } else {
+            self.resize(cols + 1, rows)?;
+        }
+        self.resize(cols, rows)?;
+        Ok(())
+    }
+
     pub fn request_full_repaint(&mut self) {
         self.full_repaint = true;
         for y in 0..self.rows {
