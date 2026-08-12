@@ -62,6 +62,9 @@ task_nudge = true           # tell an idle agent when the board has work
 delivery = "horde"          # horde · system · off
 command = "~/bin/horde-ping"  # run when something needs you and nothing is attached
 
+[triggers]
+unattended = false          # master switch: no rule fires until this is on
+
 [keys]
 zoom = "prefix+f"
 detach = "ctrl+alt+q"       # a modified chord binds directly
@@ -160,6 +163,19 @@ rather than a matter of trusting that it worked.
 `delivery = "system"` now also fires from the daemon while you are detached. That works because
 the daemon inherits your GUI session; if you started horde over SSH with no such session,
 macOS has nowhere to post a notification and `command` is the sink that still works.
+
+## `triggers.unattended`
+
+Off by default, and the one switch that changes what horde *is*. On, scheduled rules may put work
+on the board while nobody is watching; off, they can be added and listed but never fire.
+
+```bash
+horde trigger add --at 09:00 --task "review yesterday's diff"
+```
+
+The sidebar footer shows `◈ 2 triggers armed` whenever anything could fire, because that horde is
+allowed to act on its own should be visible rather than remembered. Full reference:
+[unattended](unattended.md).
 
 ## Bad values do not stop startup
 

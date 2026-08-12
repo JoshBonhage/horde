@@ -26,6 +26,7 @@ Read any page from the terminal with `horde docs <topic>`.
 | Page | What it covers |
 |---|---|
 | [configuration](configuration.md) | `config.toml`, themes, the settings page |
+| [unattended](unattended.md) | triggers, and how horde reaches you when nothing is attached |
 | [troubleshooting](troubleshooting.md) | when something looks wrong |
 
 ## Point your agents at this

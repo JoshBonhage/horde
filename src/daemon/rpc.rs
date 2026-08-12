@@ -49,6 +49,13 @@ fn pane_arg(eng: &Engine, req: &Request, key: &str) -> Option<PaneId> {
     None
 }
 
+fn trigger_arg(req: &Request) -> Result<u64, Err_> {
+    req.params
+        .get("trigger")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| bad("trigger id required"))
+}
+
 fn str_arg<'a>(req: &'a Request, key: &str) -> Option<&'a str> {
     req.params.get(key).and_then(|v| v.as_str())
 }
@@ -494,6 +501,71 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         }
         "task.list" => {
             serde_json::to_value(eng.board.all()).map_err(|e| failed(e.to_string()))
+        }
+
+        // -- triggers ----------------------------------------------------
+        // Scheduled rules. Parsing lives in the daemon rather than the CLI so that an agent
+        // calling this method gets the same validation, and the same error text, as a person.
+        "trigger.add" => {
+            let when = match (str_arg(req, "every"), str_arg(req, "at")) {
+                (Some(e), None) => super::triggers::parse_every(e).map_err(|e| bad(e.to_string()))?,
+                (None, Some(a)) => super::triggers::parse_at(a).map_err(|e| bad(e.to_string()))?,
+                (Some(_), Some(_)) => return Err(bad("give either every or at, not both")),
+                (None, None) => return Err(bad("a trigger needs every or at")),
+            };
+            let what = match (str_arg(req, "task"), str_arg(req, "to")) {
+                (Some(text), None) => super::triggers::What::Task { text: text.to_string() },
+                (None, Some(to)) => {
+                    let body = str_arg(req, "body").ok_or_else(|| bad("body required with to"))?;
+                    super::triggers::What::Send { to: to.to_string(), body: body.to_string() }
+                }
+                (Some(_), Some(_)) => return Err(bad("give either task or to, not both")),
+                (None, None) => return Err(bad("a trigger needs task or to")),
+            };
+            let by = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
+            let t = eng.triggers.add(when, what, &by).map_err(|e| failed(e.to_string()))?;
+            eng.touch();
+            // `armed` travels with the reply so the caller never has to re-read the config file
+            // and guess whether the daemon agrees with it.
+            Ok(json!({ "trigger": t, "armed": eng.cfg.unattended }))
+        }
+        "trigger.list" => {
+            let all: Vec<_> = eng.triggers.all().collect();
+            Ok(json!({ "triggers": all, "armed": eng.cfg.unattended }))
+        }
+        "trigger.rm" => {
+            let id = trigger_arg(req)?;
+            let t = eng.triggers.remove(id).map_err(|e| not_found(e.to_string()))?;
+            eng.touch();
+            serde_json::to_value(t).map_err(|e| failed(e.to_string()))
+        }
+        "trigger.enable" => {
+            // `all: false` is the kill switch, and has to work without naming anything.
+            if req.params.get("trigger").is_none() {
+                if bool_arg(req, "on") {
+                    return Err(bad("name a trigger to turn on, or use `off --all`"));
+                }
+                let off = eng.triggers.disable_all();
+                eng.touch();
+                return Ok(json!({ "disabled": off.len() }));
+            }
+            let id = trigger_arg(req)?;
+            let t = eng
+                .triggers
+                .set_enabled(id, bool_arg(req, "on"))
+                .map_err(|e| not_found(e.to_string()))?;
+            eng.touch();
+            serde_json::to_value(t).map_err(|e| failed(e.to_string()))
+        }
+        "trigger.fire" => {
+            let id = trigger_arg(req)?;
+            let (what, events) =
+                super::triggers::fire_now(eng, id).map_err(|e| failed(e.to_string()))?;
+            for ev in events {
+                eng.emit(ev);
+            }
+            eng.touch();
+            Ok(json!({ "trigger": id, "did": what }))
         }
 
         // -- digest ------------------------------------------------------

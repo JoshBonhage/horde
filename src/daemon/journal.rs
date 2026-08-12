@@ -32,6 +32,12 @@ pub enum Kind {
     Gone,
     /// Something went wrong that a human should know about.
     Warned,
+    /// A trigger fired, and what it did.
+    ///
+    /// The record that horde decided something on its own. Also load-bearing: the hourly
+    /// firing ceiling is counted straight off these entries, so the audit trail and the guard
+    /// are the same fact rather than two that can disagree.
+    Fired,
     /// horde reached out to you — a system notification, or your own notify command.
     ///
     /// The only record that an alert was ever sent. Everything else here is something horde

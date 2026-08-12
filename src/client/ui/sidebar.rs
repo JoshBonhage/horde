@@ -71,6 +71,12 @@ impl Widget for Sidebar<'_> {
                 (o, _) => summary.push(("◇", o, "tasks open", AgentState::Unknown)),
             }
         }
+        // That horde is allowed to act on its own should never be something you have to
+        // remember rather than see. Counted, not a bare word, because "which rules" is the
+        // immediate next question and `horde trigger list` is the answer.
+        if self.snap.triggers_armed > 0 {
+            summary.push(("◈", self.snap.triggers_armed, "triggers armed", AgentState::Working));
+        }
 
         // -- vertical budget, allocated from the bottom up -----------------
         // Footer and the agent list earn their space first; spaces get the remainder,
@@ -535,6 +541,7 @@ mod tests {
             tabbar: Rect::default(),
             tasks_open: 0,
             tasks_claimed: 0,
+            triggers_armed: 0,
         }
     }
 
@@ -730,6 +737,22 @@ mod tests {
     fn outstanding_board_work_appears_in_the_footer() {
         let (out, _) = render_board(&snap(), 26, 22, Some((3, 1)));
         assert!(out.contains("3 tasks open"), "unclaimed work is the headline:\n{out}");
+    }
+
+    /// That horde may act on its own has to be visible, not remembered.
+    #[test]
+    fn armed_triggers_show_in_the_footer() {
+        let mut s = snap();
+        s.triggers_armed = 2;
+        let (out, _) = render_board(&s, 26, 22, None);
+        assert!(out.contains("2 triggers armed"), "{out}");
+    }
+
+    /// And with the master switch off the daemon reports zero, so the row costs nothing.
+    #[test]
+    fn a_disarmed_session_shows_no_trigger_row() {
+        let (out, _) = render(&snap(), 26, 22);
+        assert!(!out.contains("armed"), "{out}");
     }
 
     #[test]

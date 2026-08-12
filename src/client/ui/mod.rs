@@ -462,6 +462,7 @@ mod frame_tests {
             tabbar: Rect::new(0, 0, 146, 1),
             tasks_open: 2,
             tasks_claimed: 1,
+            triggers_armed: 0,
         };
 
         app.rows.insert(1, vec![

@@ -19,6 +19,11 @@ pub const PAGES: &[(&str, &str, &str)] = &[
     ("agents", "detection, states, lifecycle hooks", include_str!("../../docs/agents.md")),
     ("socket-api", "the control protocol, every method", include_str!("../../docs/socket-api.md")),
     ("configuration", "config.toml and the settings page", include_str!("../../docs/configuration.md")),
+    (
+        "unattended",
+        "triggers, and how horde reaches you when nothing is attached",
+        include_str!("../../docs/unattended.md"),
+    ),
     ("keys", "keybindings, mouse, right-click menus", include_str!("../../docs/keys.md")),
     ("troubleshooting", "when something looks wrong", include_str!("../../docs/troubleshooting.md")),
 ];

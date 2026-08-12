@@ -306,6 +306,7 @@ mod tests {
             tabbar: Rect::default(),
             tasks_open: 0,
             tasks_claimed: 0,
+            triggers_armed: 0,
         }
     }
 

@@ -326,6 +326,12 @@ pub struct Snapshot {
     pub tasks_open: usize,
     #[serde(default)]
     pub tasks_claimed: usize,
+    /// Triggers that could fire right now — enabled, with the master switch on.
+    ///
+    /// Zero when `unattended` is off, however many rules exist: the question the sidebar is
+    /// answering is "can this thing act on its own", and a disarmed switch means no.
+    #[serde(default)]
+    pub triggers_armed: usize,
 }
 
 /// Panel visibility. Lives in the daemon so geometry has exactly one owner.
@@ -517,6 +523,12 @@ pub struct Digest {
     pub gone: Vec<String>,
     /// Warnings the daemon raised while nobody was watching them.
     pub warnings: Vec<String>,
+    /// Triggers that fired in the window, and what each did.
+    ///
+    /// The answer to "what did this thing decide to do while I was gone", which is the question
+    /// an unattended daemon has to be able to answer to be worth arming.
+    #[serde(default)]
+    pub fired: Vec<String>,
     pub tasks_done: Vec<TaskLine>,
     pub tasks_added: usize,
     pub tasks_open: usize,
@@ -560,6 +572,7 @@ impl Digest {
             && self.warnings.is_empty()
             && self.tasks_done.is_empty()
             && self.messages.is_empty()
+            && self.fired.is_empty()
             && self.tasks_added == 0
     }
 
@@ -587,6 +600,9 @@ impl Digest {
         if !self.gone.is_empty() {
             parts.push(format!("{} exited", self.gone.len()));
         }
+        // Firings are deliberately not here. A notification should carry what the work came to,
+        // not that a schedule went off — the finished tasks and the blocked agents above are the
+        // outcomes, and this line is only two facts wide.
         if parts.is_empty() {
             return None;
         }
@@ -636,6 +652,7 @@ mod digest_tests {
             working: vec![],
             gone: vec![],
             warnings: vec![],
+            fired: vec![],
             tasks_done: vec![],
             tasks_added: 0,
             tasks_open: 0,
