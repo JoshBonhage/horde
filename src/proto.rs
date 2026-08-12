@@ -450,6 +450,8 @@ pub enum Cmd {
     ToggleBus,
     /// Jump to the next agent that is blocked or done.
     JumpAttention,
+    /// Make every program on screen repaint at the size it actually has.
+    Redraw,
     Scroll { pane: PaneId, lines: i32 },
     ScrollBottom { pane: PaneId },
     FocusPane(PaneId),

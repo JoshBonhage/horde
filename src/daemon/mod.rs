@@ -54,6 +54,11 @@ const TICK_DETACHED: Duration = Duration::from_millis(150);
 const DETECT_INTERVAL: Duration = Duration::from_millis(640);
 /// Quiet period before the session shape is written to disk.
 const SAVE_DELAY: Duration = Duration::from_millis(1000);
+/// Quiet period after the last resize before programs are told to redraw.
+///
+/// Long enough that dragging a window edge counts as one gesture rather than forty, short enough
+/// that letting go feels immediate.
+const RESIZE_SETTLE: Duration = Duration::from_millis(120);
 
 type ClientId = u64;
 
@@ -96,6 +101,12 @@ pub struct Engine {
     /// Set when a pane appeared, so detection runs on the next tick instead of waiting for
     /// the slow cadence.
     detect_soon: bool,
+    /// When the last resize arrived, while a drag is still delivering them.
+    ///
+    /// Cleared once the flurry stops, at which point every pane is told to redraw. A program
+    /// that repainted halfway through a drag painted for a size that is already stale, and
+    /// nothing else in horde can prompt it to try again — see [`pane::Pane::force_redraw`].
+    resize_settling: Option<std::time::Instant>,
     pending_events: Vec<Event>,
 }
 
@@ -384,6 +395,7 @@ async fn engine_loop(
         clients: HashMap::new(),
         dirty_shape: true,
         detect_soon: true,
+        resize_settling: None,
         pending_events: Vec::new(),
     };
 
@@ -578,7 +590,12 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
             eng.clients.remove(&id);
         }
         ClientFrame::Resize { cols, rows } => {
+            // Applied immediately so the layout tracks the drag, but remembered as pending so
+            // the tick can settle it afterwards. Dragging a window edge delivers dozens of
+            // sizes a second, and a program that repaints for each of them is repainting for a
+            // size that is already out of date.
             eng.session.set_client_size(&cfg, cols, rows);
+            eng.resize_settling = Some(std::time::Instant::now());
             // Every pane moved, so nothing the client has cached is still valid.
             let panes: Vec<PaneId> = eng.session.panes.keys().copied().collect();
             for p in &panes {
@@ -698,6 +715,20 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         Cmd::ToggleSidebar => eng.session.toggle_sidebar(&cfg),
         Cmd::ToggleBus => eng.session.toggle_bus(&cfg),
+        Cmd::Redraw => {
+            // The escape hatch. A program can always miss a resize, and until now the only
+            // cure was resizing the window again to jog it.
+            let ids: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+            for id in ids {
+                if let Some(p) = eng.session.panes.get_mut(&id) {
+                    let _ = p.force_redraw();
+                }
+            }
+            for p in eng.session.panes.values_mut() {
+                p.request_full_repaint();
+            }
+            eng.touch();
+        }
         Cmd::JumpAttention => match eng.session.next_attention() {
             Some(p) => {
                 eng.session.focus_pane(p);
@@ -849,6 +880,19 @@ fn tick(eng: &mut Engine, detect_due: bool) {
             eng.dirty_shape = true;
         }
     }
+    // A drag has stopped delivering sizes: give every program one clean chance to repaint at
+    // the size it actually has now.
+    if eng.resize_settling.is_some_and(|t| t.elapsed() >= RESIZE_SETTLE) {
+        eng.resize_settling = None;
+        let ids: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+        for id in ids {
+            if let Some(p) = eng.session.panes.get_mut(&id) {
+                let _ = p.force_redraw();
+            }
+        }
+        eng.dirty_shape = true;
+    }
+
     // Before the notifier, so a firing is something this pass can already tell you about.
     let fired = triggers::fire_due(eng);
     if !fired.is_empty() {
@@ -1185,6 +1229,7 @@ mod tests {
             clients: HashMap::new(),
             dirty_shape: true,
             detect_soon: true,
+            resize_settling: None,
             pending_events: Vec::new(),
         };
         let cfg = eng.cfg.clone();

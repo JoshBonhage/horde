@@ -17,6 +17,7 @@ authoritative version — this page describes the defaults.
 | `x` | close pane |
 | `,` | rename pane (also renames its agent) |
 | `[` | scrollback |
+| `r` | redraw — force every program to repaint at its current size |
 
 ## Tabs and spaces
 
