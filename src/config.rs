@@ -48,6 +48,12 @@ pub fn tasks_path() -> PathBuf {
     config_dir().join("tasks.jsonl")
 }
 
+/// Scheduled rules. Its own log for the same reason the board has one: replayed on start, and
+/// the record of what fired has to survive the restart it may have caused.
+pub fn triggers_path() -> PathBuf {
+    config_dir().join("triggers.jsonl")
+}
+
 /// Agent state changes and pane exits, for `horde digest`. Distinct from the bus and task
 /// logs: each of the three owns facts the others do not.
 pub fn journal_path() -> PathBuf {
@@ -78,6 +84,8 @@ struct RawConfig {
     agents: RawAgents,
     #[serde(default)]
     notifications: RawNotifications,
+    #[serde(default)]
+    triggers: RawTriggers,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -117,6 +125,12 @@ struct RawAgents {
 struct RawNotifications {
     delivery: Option<String>,
     command: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTriggers {
+    unattended: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +173,9 @@ pub struct Config {
     pub detection_lines: usize,
     pub force_inject: bool,
     pub task_nudge: bool,
+    /// Whether triggers may fire at all. Off by default: acting with nobody watching is a
+    /// different promise from running side by side, and has to be asked for.
+    pub unattended: bool,
     pub notify: Notify,
     /// Program run when the daemon has something to tell you and nothing is attached. The
     /// summary arrives as `$1` and the full digest as JSON on stdin, which is what keeps
@@ -186,6 +203,7 @@ impl Default for Config {
             detection_lines: 40,
             force_inject: false,
             task_nudge: true,
+            unattended: false,
             notify: Notify::Horde,
             notify_command: None,
             keys: Keymap::default(),
@@ -259,6 +277,7 @@ impl Config {
         cfg.detection_lines = raw.agents.detection_lines.unwrap_or(cfg.detection_lines).clamp(5, 200);
         cfg.force_inject = raw.agents.force_inject.unwrap_or(cfg.force_inject);
         cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
+        cfg.unattended = raw.triggers.unattended.unwrap_or(cfg.unattended);
 
         if let Some(d) = &raw.notifications.delivery {
             cfg.notify = match d.as_str() {

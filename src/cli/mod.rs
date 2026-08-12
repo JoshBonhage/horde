@@ -13,6 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use crate::daemon::tasks::Task;
+use crate::daemon::triggers::Trigger;
 use crate::proto::{Digest, Request, Response};
 
 #[derive(Parser)]
@@ -118,6 +119,14 @@ pub enum Command {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// Scheduled rules that put work on the board while nobody is watching.
+    ///
+    /// Nothing fires until `triggers.unattended = true` is set in config.toml: acting on its
+    /// own is a different promise from running side by side, and has to be asked for.
+    Trigger {
+        #[command(subcommand)]
+        cmd: TriggerCmd,
+    },
     /// What happened while you were away.
     ///
     /// Reading it advances the window, so the next digest starts where this one ended.
@@ -176,6 +185,51 @@ pub enum Command {
         #[arg(long, default_value = "{}")]
         params: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum TriggerCmd {
+    /// Add a rule. Needs one of --every/--at, and one of --task/--to.
+    ///
+    /// `--task` is the one to reach for: the work lands on the board and whichever agent is
+    /// free claims it, so the rule never has to know who is idle.
+    Add {
+        /// How often, e.g. 30m, 2h, 1d. At least 60s.
+        #[arg(long, conflicts_with = "at")]
+        every: Option<String>,
+        /// Daily at a local time, e.g. 09:00.
+        #[arg(long)]
+        at: Option<String>,
+        /// Work to put on the board.
+        #[arg(long, conflicts_with = "to")]
+        task: Option<String>,
+        /// Agent to push a line at instead of using the board.
+        #[arg(long, requires = "body")]
+        to: Option<String>,
+        /// Message body, with --to.
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Show every rule, when it last fired, and what it does.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a rule.
+    Rm { trigger: u64 },
+    /// Turn a rule back on.
+    On { trigger: u64 },
+    /// Turn a rule off, keeping it. `--all` is the kill switch.
+    Off {
+        trigger: Option<u64>,
+        /// Turn every rule off at once.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Run a rule now, ignoring its schedule.
+    ///
+    /// The only way to test a rule set for nine in the morning at any other time of day.
+    Fire { trigger: u64 },
 }
 
 #[derive(Subcommand)]
@@ -624,6 +678,92 @@ pub fn run(cmd: Command) -> Result<()> {
             }
         },
 
+        Command::Trigger { cmd } => match cmd {
+            TriggerCmd::Add { every, at, task, to, body } => {
+                let v = call(
+                    "trigger.add",
+                    json!({
+                        "every": every, "at": at,
+                        "task": task, "to": to, "body": body,
+                        "from": self_pane(),
+                    }),
+                )?;
+                let armed = v.get("armed").and_then(|x| x.as_bool()).unwrap_or(false);
+                let t: Trigger = serde_json::from_value(v["trigger"].clone())?;
+                println!("#{} added — {} · {}", t.id, t.when.describe(), t.what.describe());
+                if !armed {
+                    // Adding a rule that cannot fire is the one mistake worth interrupting
+                    // for: everything looks right, and nothing ever happens.
+                    eprintln!(
+                        "note: triggers are off. Set `unattended = true` under [triggers] in \
+                         config.toml to arm them, or use `horde trigger fire {}` to run this \
+                         one by hand.",
+                        t.id
+                    );
+                }
+            }
+            TriggerCmd::List { json: as_json } => {
+                let v = call("trigger.list", json!({}))?;
+                if as_json {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                    return Ok(());
+                }
+                let armed = v.get("armed").and_then(|x| x.as_bool()).unwrap_or(false);
+                let items: Vec<Trigger> = serde_json::from_value(v["triggers"].clone())?;
+                if items.is_empty() {
+                    println!(
+                        "no triggers — add one with `horde trigger add --every 1d --task \"...\"`"
+                    );
+                    return Ok(());
+                }
+                if !armed {
+                    println!("triggers are off — [triggers] unattended = true arms them\n");
+                }
+                for t in &items {
+                    let last = match t.last_fired {
+                        Some(ms) => {
+                            format!("last {} ago", ago(crate::daemon::now_millis().saturating_sub(ms)))
+                        }
+                        None => "never fired".to_string(),
+                    };
+                    println!(
+                        "{} #{:<4} {} · {}",
+                        if t.enabled { "○" } else { "✕" },
+                        t.id,
+                        t.when.describe(),
+                        t.what.describe()
+                    );
+                    println!("       {last}, {} so far, by {}", t.fire_count, t.by);
+                }
+            }
+            TriggerCmd::Rm { trigger } => {
+                call("trigger.rm", json!({ "trigger": trigger }))?;
+                println!("#{trigger} removed");
+            }
+            TriggerCmd::On { trigger } => {
+                call("trigger.enable", json!({ "trigger": trigger, "on": true }))?;
+                println!("#{trigger} on");
+            }
+            TriggerCmd::Off { trigger, all } => {
+                if all || trigger.is_none() {
+                    if !all {
+                        return Err(anyhow!("name a trigger, or pass --all to turn every one off"));
+                    }
+                    let v = call("trigger.enable", json!({ "on": false }))?;
+                    let n = v.get("disabled").and_then(|x| x.as_u64()).unwrap_or(0);
+                    println!("{n} turned off");
+                } else {
+                    let id = trigger.unwrap();
+                    call("trigger.enable", json!({ "trigger": id, "on": false }))?;
+                    println!("#{id} off");
+                }
+            }
+            TriggerCmd::Fire { trigger } => {
+                let v = call("trigger.fire", json!({ "trigger": trigger }))?;
+                println!("{}", v.get("did").and_then(|x| x.as_str()).unwrap_or("fired"));
+            }
+        },
+
         Command::Digest { since, keep, json: as_json } => {
             let mut params = json!({ "keep": keep });
             if let Some(spec) = &since {
@@ -859,7 +999,7 @@ fn print_roster(v: &Value) {
 }
 
 /// `90s`, `30m`, `2h`, `1d`, or a bare number of seconds. Returned as seconds.
-fn parse_duration(spec: &str) -> Result<u64> {
+pub(crate) fn parse_duration(spec: &str) -> Result<u64> {
     let spec = spec.trim();
     let (digits, mult) = match spec.chars().last() {
         Some('s') => (&spec[..spec.len() - 1], 1),
@@ -925,6 +1065,14 @@ fn print_digest(d: &Digest) {
         for a in &d.working {
             let detail = a.activity.clone().unwrap_or_default();
             println!("    ◐ {:<16} {:<6} {}", a.name, ago(a.elapsed * 1000), detail);
+        }
+    }
+
+    // Before the board, because a firing is the reason some of the board's work exists.
+    if !d.fired.is_empty() {
+        println!("\n  horde decided");
+        for f in &d.fired {
+            println!("    ▸ {f}");
         }
     }
 

@@ -669,6 +669,18 @@ fn digest_lines(d: &Digest, w: usize, t: &Theme) -> Vec<Line<'static>> {
         agent_rows(&mut out, &d.working, t.ui.text_dim);
     }
 
+    // Before the board, because a firing is the reason some of the board's work exists.
+    if !d.fired.is_empty() {
+        heading(&mut out, "horde decided");
+        for f in &d.fired {
+            out.push(Line::from(vec![
+                Span::styled("  ".to_string(), panel),
+                Span::styled("▸ ".to_string(), panel.fg(color(t.ui.working))),
+                Span::styled(truncate(f, w.saturating_sub(6)), panel.fg(color(t.ui.text))),
+            ]));
+        }
+    }
+
     if !d.tasks_done.is_empty() || d.tasks_added > 0 || d.tasks_open + d.tasks_claimed > 0 {
         heading(&mut out, "board");
         for task in &d.tasks_done {
@@ -876,6 +888,7 @@ mod tests {
             working: vec![],
             gone: vec!["worker3".into()],
             warnings: vec![],
+            fired: vec![],
             tasks_done: vec![TaskLine {
                 id: 4,
                 text: "write the bus tests".into(),
@@ -898,6 +911,22 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// What horde decided on its own goes above the board, because a firing is the reason some
+    /// of that work exists — and it is the section that makes arming triggers reviewable.
+    #[test]
+    fn what_horde_decided_is_reported_above_the_board_it_filled() {
+        let mut d = sample_digest();
+        d.fired = vec!["#1 put task #7 on the board: review yesterday's diff".into()];
+        let out = digest_text(&d, 70);
+        let decided = out.find("horde decided").expect("a firing must be reported");
+        let board = out.find("board").expect("the board section should be present");
+        assert!(decided < board, "the cause comes before the effect:\n{out}");
+        assert!(out.contains("review yesterday's diff"), "{out}");
+
+        // And a digest with no firings costs no heading.
+        assert!(!digest_text(&sample_digest(), 70).contains("horde decided"));
     }
 
     #[test]

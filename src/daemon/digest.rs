@@ -44,11 +44,13 @@ pub fn build(eng: &Engine, since: u64) -> Digest {
 
     let mut gone = Vec::new();
     let mut warnings = Vec::new();
+    let mut fired = Vec::new();
     let mut turns = 0usize;
     for e in eng.journal.since(since) {
         match e.kind {
             Kind::Gone => gone.push(e.subject.clone()),
             Kind::Warned => warnings.push(e.subject.clone()),
+            Kind::Fired => fired.push(e.subject.clone()),
             // A finished turn is the unit of agent work, and counting it from the journal
             // keeps the total honest when the agent itself is no longer around.
             Kind::Finished => turns += 1,
@@ -87,6 +89,7 @@ pub fn build(eng: &Engine, since: u64) -> Digest {
         working,
         gone,
         warnings,
+        fired,
         tasks_done,
         tasks_added,
         tasks_open: eng.board.open_count(),

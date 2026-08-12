@@ -112,7 +112,37 @@ landed on that millisecond.
 Useful on its own with zero triggers: detach, get pinged when an agent blocks. That standalone
 value is why it's first.
 
-## Phase 2 — the trigger engine
+## Phase 2 — the trigger engine — **shipped**
+
+`src/daemon/triggers.rs`, fired from `tick` just before the notifier so a firing is something the
+same pass can already report. Sources: `every <dur>` and `at HH:MM` (local, via `libc::localtime_r`
+— no date crate). Actions: `task add` and `send`. All six guards in place, `horde trigger
+add/list/rm/on/off/fire`, a "horde decided" digest section above the board, and `◈ n triggers
+armed` in the sidebar footer.
+
+Three decisions that departed from the plan as written:
+
+- **Ids, not names.** The plan wanted `name`. The board already addresses work by id
+  (`horde task claim 4`), `trigger list` prints the schedule and action on every row, and a name
+  needs uniqueness validation to earn its keep. Dropped.
+- **`fire` skips every guard.** Including the master switch and the one-in-flight check. All of
+  them bound what horde does *unasked*, and a manual fire is asked. It is journaled identically
+  and does count toward the hourly ceiling, so the record cannot disagree with the guard reading
+  it.
+- **The depth guard came free.** With actions limited to `task`/`send`, a trigger's action cannot
+  create a trigger, so nothing had to be written to refuse it. It becomes real work in phase 3,
+  when a spawned agent could call `trigger.add` itself.
+
+The one-in-flight guard turned out to be the load-bearing one, and its subtlety is that a skip
+must **not** spend the interval — otherwise clearing the board starts a fresh wait instead of
+letting the held firing go immediately. Both halves are pinned by tests.
+
+Verified against a real daemon: no firing while disarmed; manual fire working while disarmed;
+the in-flight guard holding across ~53 ticks; automatic firing at exactly the 60s mark; the digest
+section; the kill switch; and `off` surviving a restart — a restart that silently re-armed
+disabled rules would be the worst possible surprise in this feature.
+
+## Phase 2 as planned
 
 **Store.** `src/daemon/triggers.rs`, modelled directly on `tasks.rs`: an append-log replayed
 with later-entries-supersede-by-id, `CAP`-bounded, carried across rotation. The board already

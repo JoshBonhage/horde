@@ -19,6 +19,7 @@ pub mod pty;
 pub mod rpc;
 pub mod state;
 pub mod tasks;
+pub mod triggers;
 pub mod upgrade;
 
 use std::collections::{HashMap, HashSet};
@@ -74,6 +75,7 @@ pub struct Engine {
     pub session: Session,
     pub bus: bus::Bus,
     pub board: tasks::Board,
+    pub triggers: triggers::Store,
     pub journal: journal::Journal,
     /// Pane names as of the start of this tick. An exit event is emitted after the pane has
     /// already been removed, so the name has to have been captured before that.
@@ -371,6 +373,7 @@ async fn engine_loop(
         session,
         bus: bus::Bus::new(crate::config::bus_log_path()),
         board: tasks::Board::new(crate::config::tasks_path()),
+        triggers: triggers::Store::new(crate::config::triggers_path()),
         journal: journal::Journal::new(crate::config::journal_path()),
         pane_names: HashMap::new(),
         started: now_millis(),
@@ -846,6 +849,13 @@ fn tick(eng: &mut Engine, detect_due: bool) {
             eng.dirty_shape = true;
         }
     }
+    // Before the notifier, so a firing is something this pass can already tell you about.
+    let fired = triggers::fire_due(eng);
+    if !fired.is_empty() {
+        eng.pending_events.extend(fired);
+        eng.dirty_shape = true;
+    }
+
     // With nobody attached, this is the only way anything gets out. Called every tick rather
     // than only on detection passes because its own quiet window is what limits it, and that
     // check is cheaper than deciding when to run the check.
@@ -921,6 +931,7 @@ fn broadcast(eng: &mut Engine) {
         let mut s = eng.session.snapshot(&cfg);
         s.tasks_open = eng.board.open_count();
         s.tasks_claimed = eng.board.claimed_count();
+        s.triggers_armed = if eng.cfg.unattended { eng.triggers.armed_count() } else { 0 };
         Some(Box::new(s))
     } else {
         None
@@ -1161,6 +1172,9 @@ mod tests {
             session,
             bus: bus::Bus::new(std::env::temp_dir().join("horde-test-bus.jsonl")),
             board: tasks::Board::new(std::env::temp_dir().join("horde-test-tasks.jsonl")),
+            triggers: triggers::Store::new(
+                std::env::temp_dir().join("horde-test-triggers.jsonl"),
+            ),
             journal: journal::Journal::new(std::env::temp_dir().join("horde-test-journal.jsonl")),
             pane_names: HashMap::new(),
             started: now_millis(),

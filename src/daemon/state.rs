@@ -937,9 +937,10 @@ impl Session {
             bus: self.chrome.bus,
             status: self.chrome.status,
             tabbar: self.chrome.tabbar,
-            // Filled in by the engine, which owns the board.
+            // Filled in by the engine, which owns the board and the trigger set.
             tasks_open: 0,
             tasks_claimed: 0,
+            triggers_armed: 0,
         }
     }
 }
