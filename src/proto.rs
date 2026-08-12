@@ -16,7 +16,14 @@ pub type PaneId = u32;
 
 /// Bumped when the wire format changes incompatibly. The client refuses to attach to a
 /// daemon that disagrees, which is the whole reason both halves ship in one binary.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Bumped whenever a client and daemon of different builds can no longer understand each other.
+///
+/// Postcard is positional on both counts — struct fields by order, enum variants by index — so
+/// *adding* a field to `Snapshot`, `PaneInfo`, or `Digest`, or a variant anywhere in `Cmd` or
+/// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
+/// The attach handshake compares this number over newline JSON, before either side switches to
+/// postcard, which is why it can report the mismatch instead of failing to parse it.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -450,8 +457,6 @@ pub enum Cmd {
     ToggleBus,
     /// Jump to the next agent that is blocked or done.
     JumpAttention,
-    /// Make every program on screen repaint at the size it actually has.
-    Redraw,
     Scroll { pane: PaneId, lines: i32 },
     ScrollBottom { pane: PaneId },
     FocusPane(PaneId),
@@ -467,7 +472,16 @@ pub enum Cmd {
     /// Ask for a digest. The daemon answers with [`ServerFrame::Digest`] to the asking client
     /// only — unlike every other command, this one has a result rather than an effect.
     RequestDigest,
+    /// Make every program on screen repaint at the size it actually has.
+    Redraw,
 }
+
+// Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
+// which identifies a variant by its *index* — inserting one silently renumbers everything below
+// it, so a client one build ahead of the daemon sends `FocusPane` and the daemon decodes some
+// other variant, reads a field that is not there, and drops the connection. Found the hard way:
+// clicking a pane killed the session while every keybinding above the inserted variant still
+// worked.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dir {
