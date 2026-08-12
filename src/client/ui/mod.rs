@@ -1,6 +1,7 @@
 //! Frame composition and shared drawing helpers.
 
 pub mod bus_drawer;
+pub mod logo;
 pub mod overlays;
 pub mod pane_widget;
 pub mod sidebar;

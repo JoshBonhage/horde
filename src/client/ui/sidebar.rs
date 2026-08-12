@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use super::pane_widget::{fmt_elapsed, spinner_frame};
-use super::{color, fill, put_line, truncate};
+use super::{color, fill, logo, put_line, truncate};
 use crate::proto::{AgentState, PaneId, Rgb, Snapshot, SpaceId};
 use crate::theme::Theme;
 
@@ -77,7 +77,8 @@ impl Widget for Sidebar<'_> {
         // because a project list is short while the agent list is what you actually watch.
         let bottom = area.y + area.height;
         let footer_h = if summary.is_empty() { 0 } else { summary.len() as u16 + 1 };
-        let top = area.y + 2; // header + rule
+        let logo_h = logo::height(area.width, area.height);
+        let top = area.y + logo_h + 1; // wordmark + rule
 
         let available = bottom.saturating_sub(top).saturating_sub(footer_h);
         let space_need = self.snap.spaces.len() as u16 + 1; // label + rows
@@ -97,20 +98,7 @@ impl Widget for Sidebar<'_> {
 
         // -- header --------------------------------------------------------
         let mut y = area.y;
-        put_line(
-            buf,
-            area.x + 1,
-            y,
-            inner_w,
-            Line::from(vec![Span::styled(
-                "horde",
-                Style::default()
-                    .fg(color(t.ui.accent))
-                    .bg(color(t.ui.panel_bg))
-                    .add_modifier(Modifier::BOLD),
-            )]),
-        );
-        y += 1;
+        y += logo::draw(buf, area.x, y, area.width, area.height, t);
         rule(buf, area.x, y, area.width, t);
         y += 1;
 
