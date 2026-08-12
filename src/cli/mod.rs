@@ -12,9 +12,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use crate::daemon::digest::Digest;
 use crate::daemon::tasks::Task;
-use crate::proto::{Request, Response};
+use crate::proto::{Digest, Request, Response};
 
 #[derive(Parser)]
 #[command(

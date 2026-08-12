@@ -477,6 +477,18 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
                 eng.dirty_shape = true;
             }
         }
+        // Handled here rather than in `apply_cmd`: this is the one command that returns a
+        // value, and only the caller should get it.
+        ClientFrame::Command(Cmd::RequestDigest) => {
+            let since = if eng.last_seen == 0 { eng.started } else { eng.last_seen };
+            let d = digest::build(eng, since);
+            // Opening the overlay is looking, so the window advances — same rule as the CLI.
+            eng.last_seen = now_millis();
+            eng.touch();
+            if let Some(c) = eng.clients.get(&id) {
+                let _ = c.out.send(ServerFrame::Digest(Box::new(d)));
+            }
+        }
         ClientFrame::Command(cmd) => apply_cmd(eng, cmd),
     }
 }
@@ -615,6 +627,9 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
                 problems.push((NoticeLevel::Error, e.to_string()));
             }
         }
+        // Answered in `handle_client_frame`, which knows which client asked. Reaching here
+        // means it came from the control API, where `digest` is the method to use.
+        Cmd::RequestDigest => {}
         Cmd::ApplyLayout { preset } => {
             if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
                 problems.push((NoticeLevel::Warn, e.to_string()));

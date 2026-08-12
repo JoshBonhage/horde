@@ -35,6 +35,7 @@ authoritative version — this page describes the defaults.
 | Key | Action |
 |---|---|
 | **`a`** | **jump to the next agent that needs you** |
+| **`D`** | **what happened while you were away** |
 | `e` | toggle sidebar |
 | `b` | toggle bus drawer |
 | `g` | command palette |
@@ -45,6 +46,11 @@ authoritative version — this page describes the defaults.
 
 `ctrl+b a` is the one that earns its keep once you have more than two agents: it walks the
 queue of agents that are `blocked` or `done`, so you never hunt for the one waiting on you.
+
+`ctrl+b D` opens the digest — the same report as `horde digest`, in a scrollable panel
+(`↑↓`/`j k` to move, space to page, any other key to close). Opening it counts as looking, so
+the window advances and the next digest starts where this one ended. Nothing to report says so
+in a toast rather than opening an empty panel.
 
 ## Mouse
 

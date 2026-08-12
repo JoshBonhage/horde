@@ -553,6 +553,7 @@ fn command_by_name(name: &str, req: &Request) -> Option<Cmd> {
         "toggle-sidebar" => Cmd::ToggleSidebar,
         "toggle-bus" => Cmd::ToggleBus,
         "jump-attention" => Cmd::JumpAttention,
+        "digest" => Cmd::RequestDigest,
         _ => return None,
     })
 }
@@ -578,6 +579,7 @@ pub fn command_names() -> &'static [&'static str] {
         "toggle-sidebar",
         "toggle-bus",
         "jump-attention",
+        "digest",
     ]
 }
 
