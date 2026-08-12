@@ -1005,6 +1005,13 @@ pub struct AgentRuntime {
     /// the value stops matching the moment the agent changes state, which is precisely when
     /// telling it again would be useful rather than noise.
     pub nudged_since: Option<std::time::Instant>,
+    /// The `since` value at which an alert about this agent was last sent outside horde.
+    ///
+    /// Same key as `nudged_since`, for the same reason: one wait earns one notification. An
+    /// agent still blocked an hour later is not news a second time, and an agent that blocks,
+    /// gets answered, and blocks again is — which a plain "already told you about this one"
+    /// flag would get backwards.
+    pub alerted_since: Option<std::time::Instant>,
 }
 
 impl AgentRuntime {

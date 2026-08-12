@@ -60,6 +60,7 @@ task_nudge = true           # tell an idle agent when the board has work
 
 [notifications]
 delivery = "horde"          # horde · system · off
+command = "~/bin/horde-ping"  # run when something needs you and nothing is attached
 
 [keys]
 zoom = "prefix+f"
@@ -104,6 +105,61 @@ Three limits keep it from wasting turns, and each exists because the obvious ver
 
 Turn it off with `task_nudge = false`, or from the settings page under Agents, and the board
 becomes purely manual: agents only find work when they look.
+
+## `notifications.command`
+
+Every other way horde tells you something needs you assumes a client on screen — a toast, the
+sidebar, the digest you read when you get back. That is the one case where being told adds
+nothing, because you are already looking. So there is a second path, and it runs **only while
+nothing is attached**: the daemon is the part still awake for the hour that actually needs a
+notification.
+
+`command` runs through `sh -c`, so it can be a path or a pipeline, and it gets the news twice
+over:
+
+- **`$1`** — the one-line summary, the same line the reattach toast uses:
+  `while you were away: 1 agent needs you, 2 tasks done`
+- **stdin** — the full `horde digest --json` payload, for a script that decides what to do
+  rather than just forwarding.
+
+A two-line script is the whole integration, which is the point — horde has no HTTP client and
+nowhere to keep a token:
+
+```bash
+#!/bin/sh
+# ~/bin/horde-ping
+curl -s -F "token=$PUSHOVER_TOKEN" -F "user=$PUSHOVER_USER" \
+     -F "message=$1" https://api.pushover.net/1/messages.json
+```
+
+Telegram, ntfy, Slack, `mail` — same shape. Setting `command` is itself the opt-in, so it runs
+under `delivery = "horde"` too; `delivery` says where horde's *own* notifications go. `off`
+silences everything, including this.
+
+**What earns an alert.** The digest's own top facts, and nothing else:
+
+- an agent has wanted a human, or sat on a finished turn nobody has read, for a full minute
+- the task board emptied — the fleet is done
+
+**Four rules keep it worth reading**, and they matter more than the sink does:
+
+- **Detached only.** No overlap with the in-app toast, so nothing arrives twice.
+- **Settled facts only.** A board worker is briefly `done` between every task; a minute of
+  waiting is what separates a real stop from a state passed through.
+- **One ping per wait.** An agent stuck for an hour is reported once. One that blocks, gets
+  answered, and blocks again is reported twice — those are different waits.
+- **One ping per five minutes**, carrying the whole window in one line. A notifier you learn to
+  ignore is worse than none.
+
+Being told is not the same as having looked, so an alert does **not** advance the digest window.
+The report waiting when you get back is still the whole story.
+
+Every alert is recorded in the journal, so "was I told, and when" is answerable afterwards
+rather than a matter of trusting that it worked.
+
+`delivery = "system"` now also fires from the daemon while you are detached. That works because
+the daemon inherits your GUI session; if you started horde over SSH with no such session,
+macOS has nowhere to post a notification and `command` is the sink that still works.
 
 ## Bad values do not stop startup
 

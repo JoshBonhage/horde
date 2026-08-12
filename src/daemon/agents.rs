@@ -113,6 +113,7 @@ impl Detector {
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                alerted_since: None,
         });
         if session_id.is_some() {
             agent.session_id = session_id;
@@ -245,6 +246,7 @@ impl Detector {
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                alerted_since: None,
             });
 
             // A pane can change hands, e.g. quitting one agent and starting another.
@@ -488,6 +490,7 @@ mod tests {
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                alerted_since: None,
         }
     }
 

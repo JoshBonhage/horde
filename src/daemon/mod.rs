@@ -12,6 +12,7 @@ pub mod journal;
 pub mod layout;
 pub mod logfile;
 pub mod manifest;
+pub mod notify;
 pub mod pane;
 pub mod persist;
 pub mod pty;
@@ -82,6 +83,10 @@ pub struct Engine {
     /// When you last read a digest. The window a digest covers, in other words — it advances
     /// only on a read, so ignoring digests widens the window instead of losing the history.
     pub last_seen: u64,
+    /// When horde last reached out to you, unix millis. A separate marker from `last_seen` on
+    /// purpose: an alert reports a window without consuming it, so the digest waiting when you
+    /// get back is still the whole story. See [`notify`].
+    pub last_alert: u64,
     pub agents: agents::Detector,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
@@ -370,6 +375,7 @@ async fn engine_loop(
         pane_names: HashMap::new(),
         started: now_millis(),
         last_seen: 0,
+        last_alert: 0,
         agents,
         cfg,
         clients: HashMap::new(),
@@ -840,6 +846,11 @@ fn tick(eng: &mut Engine, detect_due: bool) {
             eng.dirty_shape = true;
         }
     }
+    // With nobody attached, this is the only way anything gets out. Called every tick rather
+    // than only on detection passes because its own quiet window is what limits it, and that
+    // check is cheaper than deciding when to run the check.
+    notify::consider(eng);
+
     if !exited.is_empty() && eng.session.spaces.is_empty() {
         // The last pane closed; recreate a space so horde is never left unusable.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1154,6 +1165,7 @@ mod tests {
             pane_names: HashMap::new(),
             started: now_millis(),
             last_seen: 0,
+            last_alert: 0,
             agents,
             cfg,
             clients: HashMap::new(),
@@ -1231,6 +1243,7 @@ mod tests {
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                alerted_since: None,
         });
 
         eng.dirty_shape = false;
@@ -1277,7 +1290,10 @@ mod tests {
     ///
     /// `tag` keeps each test on its own log files: these run in parallel, and a shared board
     /// file would leak one test's tasks into another's assertions.
-    fn engine_with_idle_agents(tag: &str, n: usize) -> Engine {
+    ///
+    /// Visible to the rest of the daemon so [`super::notify`] can build on it rather than keep
+    /// a second copy of the same twenty lines in step with this one.
+    pub(super) fn engine_with_idle_agents(tag: &str, n: usize) -> Engine {
         let p = std::env::temp_dir().join(format!("horde-nudge-{tag}-tasks.jsonl"));
         let _ = std::fs::remove_file(&p);
         let mut eng = engine();
@@ -1306,6 +1322,7 @@ mod tests {
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                alerted_since: None,
             });
         }
         eng

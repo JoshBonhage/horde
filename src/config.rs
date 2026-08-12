@@ -116,6 +116,7 @@ struct RawAgents {
 #[serde(deny_unknown_fields)]
 struct RawNotifications {
     delivery: Option<String>,
+    command: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,15 @@ pub enum Notify {
     /// Toast plus a macOS notification.
     System,
     Off,
+}
+
+impl Notify {
+    /// Whether horde may reach outside its own window at all. The alert path the daemon runs
+    /// while nothing is attached is the one thing `off` has to silence completely — an alert
+    /// arrives on your phone, where there is no toast to dismiss.
+    pub fn reaches_out(&self) -> bool {
+        *self != Notify::Off
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +160,10 @@ pub struct Config {
     pub force_inject: bool,
     pub task_nudge: bool,
     pub notify: Notify,
+    /// Program run when the daemon has something to tell you and nothing is attached. The
+    /// summary arrives as `$1` and the full digest as JSON on stdin, which is what keeps
+    /// Pushover, Telegram, ntfy and email out of horde and in a script you own.
+    pub notify_command: Option<String>,
     pub keys: Keymap,
 }
 
@@ -173,6 +187,7 @@ impl Default for Config {
             force_inject: false,
             task_nudge: true,
             notify: Notify::Horde,
+            notify_command: None,
             keys: Keymap::default(),
         }
     }
@@ -256,6 +271,10 @@ impl Config {
                 }
             };
         }
+        // Configuring a command is itself the opt-in, so it runs under `horde` delivery too —
+        // `delivery` says where horde's *own* notifications go, and `off` still means silence.
+        cfg.notify_command =
+            raw.notifications.command.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
 
         for (name, spec) in &raw.keys {
             match cfg.keys.rebind(name, spec) {
@@ -697,6 +716,7 @@ zoom = "prefix+f"
 
 [notifications]
 delivery = "system"
+command = "  ~/bin/horde-ping  "
 "##,
         );
         let (cfg, warnings) = Config::load_from(&p);
@@ -709,6 +729,8 @@ delivery = "system"
         assert_eq!(cfg.sidebar_width, 30);
         assert!(cfg.bus);
         assert_eq!(cfg.notify, Notify::System);
+        // Trimmed, because a stray space would be passed to `sh -c` and fail obscurely.
+        assert_eq!(cfg.notify_command.as_deref(), Some("~/bin/horde-ping"));
         assert_eq!(
             cfg.keys.lookup(&Trigger::Prefix(Chord::parse("f").unwrap())),
             Some(&Action::Cmd(Cmd::ToggleZoom))
