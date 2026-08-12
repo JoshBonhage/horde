@@ -4,7 +4,10 @@
 
 ```sh
 cargo build --release
-cp target/release/horde ~/.local/bin/      # or anywhere on PATH
+# Replace, never overwrite: `cp` onto a binary the running daemon is executing
+# corrupts it mid-run, and macOS then kills it with SIGKILL on every exec.
+rm -f ~/.local/bin/horde && cp target/release/horde ~/.local/bin/
+horde upgrade                                # hand the live panes to the new binary
 ```
 
 ## First session
