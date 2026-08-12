@@ -636,6 +636,7 @@ impl Pane {
                 queued: a.queued.clone(),
                 activity: Default::default(),
                 touched: Default::default(),
+                nudged_since: None,
             }),
             term,
             parser: Processor::new(),

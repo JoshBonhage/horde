@@ -327,6 +327,22 @@ horde task release <id> --drop    # abandon it; the attempt stays on the record
 **You never have to release on exit.** If your pane goes away while holding a task, horde
 puts it back on the board automatically and tells the human why.
 
+### You will be told when there is work
+
+You do not have to poll. When the board has open tasks and you are free, horde sends you one
+line:
+
+```
+[horde] message from user: 2 tasks waiting on the board. Run `horde task claim` ...
+```
+
+That is a nudge, not an assignment — the task is not yours until you claim it, and another
+agent may take it first. `claim` returning something else, or nothing, is normal.
+
+You are told once per idle stretch, so if you ignore it you will not be pestered; you will hear
+again after your next piece of work. If you would rather not be told at all, that is
+`task_nudge = false` in the human's config.
+
 ### The worker loop
 
 This is the pattern the board exists for. Every agent runs the same loop, so adding agents

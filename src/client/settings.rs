@@ -61,6 +61,7 @@ pub enum Field {
     RestoreAgents,
     DetectionLines,
     ForceInject,
+    TaskNudge,
     Scrollback,
 }
 
@@ -171,6 +172,9 @@ pub fn rows(cfg: &Config, cat: Category) -> Vec<Row> {
             separator(),
             setting("Force message delivery", onoff(cfg.force_inject), Field::ForceInject),
             note("Off is safer: messages wait rather than answering a live prompt."),
+            separator(),
+            setting("Nudge idle agents", onoff(cfg.task_nudge), Field::TaskNudge),
+            note("When the board has work, tell one idle agent to claim it."),
             separator(),
             Row {
                 label: "Install Claude Code hooks".into(),
@@ -296,6 +300,10 @@ pub fn bump(cfg: &mut Config, field: Field, delta: i32) -> (String, Value) {
             cfg.detection_lines =
                 (cfg.detection_lines as i64 + delta as i64 * 10).clamp(5, 200) as usize;
             ("agents.detection_lines".into(), Value::Int(cfg.detection_lines as i64))
+        }
+        Field::TaskNudge => {
+            cfg.task_nudge = !cfg.task_nudge;
+            ("agents.task_nudge".into(), Value::Bool(cfg.task_nudge))
         }
         Field::ForceInject => {
             cfg.force_inject = !cfg.force_inject;
@@ -707,6 +715,7 @@ sidebar_width = 30
             Field::RestoreAgents,
             Field::DetectionLines,
             Field::ForceInject,
+            Field::TaskNudge,
             Field::Scrollback,
         ] {
             let (key, value) = bump(&mut cfg, f, 1);

@@ -128,6 +128,100 @@ impl Engine {
         let Engine { bus, session, cfg, .. } = self;
         bus.flush_queued(session, cfg)
     }
+
+    /// Tell one idle agent that there is work on the board.
+    ///
+    /// The board is deliberately pull-based — nobody assigns work, whoever is free takes it.
+    /// But "pull-based" implemented as "nobody is ever told" leaves an idle agent with no
+    /// reason to ever look, so tasks sit on a board next to agents doing nothing. This closes
+    /// that gap without turning the board into a push queue: the nudge is advisory, and
+    /// `claim` remains the compare-and-set, so nothing about exclusivity depends on who got
+    /// told.
+    ///
+    /// Three deliberate limits:
+    ///
+    /// - **One agent, not a broadcast.** Ten agents woken for one task means nine turns spent
+    ///   discovering an empty board.
+    /// - **`Done` only for agents already working the board.** A `done` agent is normally
+    ///   holding a result the human has not read, and pulling it into board work would bury
+    ///   that. But an agent that finishes a board task while unfocused becomes `done` rather
+    ///   than `idle` — so excluding `done` outright stalled the loop after exactly one task
+    ///   each, which running it is how I found out. An agent that has owned a board task has
+    ///   its result recorded on the board, so nothing is buried by giving it more.
+    /// - **Once per idle period.** Keyed on the agent's `since`, so an agent that ignores the
+    ///   nudge is not asked again until it has actually done something. Ten tasks added at
+    ///   once produce one nudge, not ten.
+    fn nudge_for_tasks(&mut self) -> Vec<Event> {
+        let open = self.board.open_count();
+        if !self.cfg.task_nudge || open == 0 {
+            return Vec::new();
+        }
+
+        // An agent already holding a task does not need more.
+        let holding: Vec<String> = self
+            .board
+            .all()
+            .iter()
+            .filter(|t| t.is_claimed())
+            .filter_map(|t| t.owner.clone())
+            .collect();
+
+        // Anyone who has ever owned a task is a board worker, and stays in the loop even when
+        // finishing leaves them `done`.
+        let board_workers: Vec<String> =
+            self.board.all().iter().filter_map(|t| t.owner.clone()).collect();
+
+        // Agents told about the board that have not acted yet. They are about to consume
+        // tasks, so they count against the work available — otherwise "one per pass" simply
+        // wakes every idle agent over successive passes, which is the waste this is meant to
+        // avoid. Observed: one task, four idle agents, four nudges.
+        let already_told = self
+            .session
+            .panes
+            .values()
+            .filter_map(|p| p.agent.as_ref())
+            .filter(|a| eligible_state(a, &board_workers))
+            .filter(|a| a.nudged_since == Some(a.since))
+            .count();
+
+        // Never wake more agents than there is work for, but do wake several when there is:
+        // five tasks and three idle agents should end up with three agents working.
+        if open <= holding.len() + already_told {
+            return Vec::new();
+        }
+
+        // Whoever has been idle longest is the most available, and picking by `since` rather
+        // than by pane id spreads successive tasks across the fleet.
+        let pick = self
+            .session
+            .panes
+            .values()
+            .filter_map(|p| p.agent.as_ref().map(|a| (p.id, a)))
+            .filter(|(_, a)| eligible_state(a, &board_workers))
+            .filter(|(_, a)| a.queued.is_empty())
+            .filter(|(_, a)| !holding.contains(&a.name))
+            .filter(|(_, a)| a.nudged_since != Some(a.since))
+            .min_by_key(|(_, a)| a.since)
+            .map(|(id, a)| (id, a.name.clone(), a.since));
+
+        let Some((pane, name, since)) = pick else { return Vec::new() };
+        // Marked before sending, so a failure cannot produce a nudge loop.
+        if let Some(a) = self.session.panes.get_mut(&pane).and_then(|p| p.agent.as_mut()) {
+            a.nudged_since = Some(since);
+        }
+
+        let body = format!(
+            "{open} task{} waiting on the board. Run `horde task claim` to take the next one, \
+             do it, then `horde task done --result \"<what happened>\"`. Repeat while it keeps \
+             returning work.",
+            if open == 1 { "" } else { "s" }
+        );
+        let Engine { bus, session, cfg, .. } = self;
+        match bus.send(session, cfg, None, &name, &body, false, false, None) {
+            Ok(m) => vec![Event::BusMessage(m)],
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 pub async fn run(cfg: Config, warnings: Vec<String>) -> Result<()> {
@@ -698,6 +792,8 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         let mut events = eng.detect();
         // A message held back for a busy agent may now be deliverable.
         events.extend(eng.flush_bus());
+        // Then, if anyone is free and the board is not empty, say so.
+        events.extend(eng.nudge_for_tasks());
         let changed = !events.is_empty();
         for ev in events {
             eng.pending_events.push(ev);
@@ -752,6 +848,20 @@ fn tick(eng: &mut Engine, detect_due: bool) {
     }
 
     broadcast(eng);
+}
+
+/// Whether an agent's state means it is free to take board work.
+///
+/// `idle` always counts. `done` counts only for an agent that has already owned a task: it
+/// finished board work while unfocused, and its result is on the board rather than only on its
+/// screen. For anyone else `done` means "the human has not read this yet", which is not
+/// something to interrupt.
+fn eligible_state(a: &state::AgentRuntime, board_workers: &[String]) -> bool {
+    match a.state {
+        crate::proto::AgentState::Idle => true,
+        crate::proto::AgentState::Done => board_workers.contains(&a.name),
+        _ => false,
+    }
 }
 
 /// Cheap summary of every agent, so a detection pass can tell whether anything the client
@@ -1120,6 +1230,7 @@ mod tests {
             queued: Vec::new(),
                 activity: Default::default(),
                 touched: Default::default(),
+                nudged_since: None,
         });
 
         eng.dirty_shape = false;
@@ -1155,6 +1266,218 @@ mod tests {
         eng.dirty_shape = false;
         tick(&mut eng, false); // detection not due
         assert!(!eng.detect_soon, "the requested pass should have run");
+        kill_all(&mut eng);
+    }
+
+    // -- board nudges ---------------------------------------------------
+    // The board is pull-based, so the only thing making it work autonomously is that an idle
+    // agent gets told. These tests pin the three limits that keep telling from becoming spam.
+
+    /// A fresh engine with `n` agent panes, all idle, plus a board.
+    ///
+    /// `tag` keeps each test on its own log files: these run in parallel, and a shared board
+    /// file would leak one test's tasks into another's assertions.
+    fn engine_with_idle_agents(tag: &str, n: usize) -> Engine {
+        let p = std::env::temp_dir().join(format!("horde-nudge-{tag}-tasks.jsonl"));
+        let _ = std::fs::remove_file(&p);
+        let mut eng = engine();
+        eng.board = tasks::Board::new(p);
+        eng.bus =
+            bus::Bus::new(std::env::temp_dir().join(format!("horde-nudge-{tag}-bus.jsonl")));
+        let cfg = eng.cfg.clone();
+        let first = *eng.session.panes.keys().next().unwrap();
+        let mut ids = vec![first];
+        for _ in 1..n {
+            ids.push(eng.session.split(&cfg, Some(first), Dir::Right, None).unwrap());
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let pane = eng.session.panes.get_mut(id).unwrap();
+            pane.agent = Some(state::AgentRuntime {
+                kind: "claude".into(),
+                name: format!("worker{i}"),
+                state: crate::proto::AgentState::Idle,
+                // Staggered, so "idle longest" is well defined.
+                since: std::time::Instant::now() - Duration::from_secs(60 - i as u64),
+                authority: "hook".into(),
+                reason: "t".into(),
+                seen: false,
+                session_id: None,
+                queued: Vec::new(),
+                activity: Default::default(),
+                touched: Default::default(),
+                nudged_since: None,
+            });
+        }
+        eng
+    }
+
+    fn nudge_bodies(events: &[Event]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::BusMessage(m) => Some((m.to.clone(), m.body.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_idle_agent_is_told_when_the_board_has_work() {
+        let mut eng = engine_with_idle_agents("told", 1);
+        eng.board.add("write the tests", "user").unwrap();
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "worker0");
+        assert!(sent[0].1.contains("horde task claim"), "it must name the command: {sent:?}");
+        kill_all(&mut eng);
+    }
+
+    /// Ten tasks added at once must not cost ten turns.
+    #[test]
+    fn a_burst_of_tasks_produces_one_nudge_not_one_each() {
+        let mut eng = engine_with_idle_agents("burst", 1);
+        for i in 0..10 {
+            eng.board.add(&format!("job {i}"), "user").unwrap();
+        }
+        let first = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(first.len(), 1);
+        // Repeated passes while it stays idle add nothing.
+        for _ in 0..5 {
+            assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
+        }
+        kill_all(&mut eng);
+    }
+
+    /// Waking every agent for one task wastes every turn but one.
+    #[test]
+    fn only_one_agent_is_woken_per_pass() {
+        let mut eng = engine_with_idle_agents("one-only", 3);
+        eng.board.add("single job", "user").unwrap();
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "one task, one agent: {sent:?}");
+        // The one idle longest is the most available.
+        assert_eq!(sent[0].0, "worker0");
+        kill_all(&mut eng);
+    }
+
+    /// The bug this pins, found by running it rather than by reasoning about it: "one agent
+    /// per pass" is not the same as "one agent". Over successive detection passes every idle
+    /// agent got told about a single task — four nudges for one job, three turns wasted.
+    #[test]
+    fn one_task_wakes_one_agent_even_across_many_passes() {
+        let mut eng = engine_with_idle_agents("across-passes", 4);
+        eng.board.add("the only job", "user").unwrap();
+        let mut total = 0;
+        for _ in 0..10 {
+            total += nudge_bodies(&eng.nudge_for_tasks()).len();
+        }
+        assert_eq!(total, 1, "one task must not wake four agents");
+        kill_all(&mut eng);
+    }
+
+    /// The other half: real work for everyone should reach everyone.
+    #[test]
+    fn enough_tasks_for_everyone_wakes_everyone() {
+        let mut eng = engine_with_idle_agents("all-busy", 3);
+        for i in 0..5 {
+            eng.board.add(&format!("job {i}"), "user").unwrap();
+        }
+        let mut told: Vec<String> = Vec::new();
+        for _ in 0..10 {
+            for (to, _) in nudge_bodies(&eng.nudge_for_tasks()) {
+                told.push(to);
+            }
+        }
+        told.sort();
+        told.dedup();
+        assert_eq!(told.len(), 3, "five jobs, three agents: all three should work: {told:?}");
+        kill_all(&mut eng);
+    }
+
+    /// A `done` agent is holding a result nobody has read. Sending it off to do board work
+    /// would bury that, so it is left alone.
+    #[test]
+    fn an_agent_with_an_unread_result_is_not_reassigned() {
+        let mut eng = engine_with_idle_agents("done", 1);
+        if let Some(a) =
+            eng.session.panes.values_mut().find_map(|p| p.agent.as_mut())
+        {
+            a.state = crate::proto::AgentState::Done;
+        }
+        eng.board.add("job", "user").unwrap();
+        assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
+        kill_all(&mut eng);
+    }
+
+    /// The bug that broke the loop: an agent finishing a board task while unfocused lands in
+    /// `done`, not `idle`. Excluding `done` meant each agent took exactly one task and then
+    /// went quiet, with work still on the board. A board worker stays in the loop.
+    #[test]
+    fn a_board_worker_that_finished_while_unfocused_is_given_more() {
+        let mut eng = engine_with_idle_agents("done-worker", 1);
+        eng.board.add("first", "user").unwrap();
+        eng.board.add("second", "user").unwrap();
+        eng.board.claim("worker0", Some(1)).unwrap();
+        eng.board.done("worker0", Some(1), Some("finished")).unwrap();
+
+        // It finished unfocused, so detection calls that `done`.
+        if let Some(a) = eng.session.panes.values_mut().find_map(|p| p.agent.as_mut()) {
+            a.state = crate::proto::AgentState::Done;
+            a.since = std::time::Instant::now();
+        }
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "the remaining task should reach it: {sent:?}");
+        kill_all(&mut eng);
+    }
+
+    #[test]
+    fn an_agent_already_holding_a_task_is_left_to_it() {
+        let mut eng = engine_with_idle_agents("holding", 1);
+        eng.board.add("job one", "user").unwrap();
+        eng.board.add("job two", "user").unwrap();
+        eng.board.claim("worker0", Some(1)).unwrap();
+        assert!(
+            nudge_bodies(&eng.nudge_for_tasks()).is_empty(),
+            "it has work; a second task can wait for someone free"
+        );
+        kill_all(&mut eng);
+    }
+
+    #[test]
+    fn an_empty_board_nudges_nobody() {
+        let mut eng = engine_with_idle_agents("empty", 2);
+        assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
+        kill_all(&mut eng);
+    }
+
+    #[test]
+    fn nudging_can_be_turned_off() {
+        let mut eng = engine_with_idle_agents("off", 1);
+        eng.cfg.task_nudge = false;
+        eng.board.add("job", "user").unwrap();
+        assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
+        kill_all(&mut eng);
+    }
+
+    /// Having done something, an agent becomes available again — and by then the nudge is
+    /// useful rather than noise.
+    #[test]
+    fn a_new_idle_period_earns_a_fresh_nudge() {
+        let mut eng = engine_with_idle_agents("fresh", 1);
+        eng.board.add("job one", "user").unwrap();
+        eng.board.add("job two", "user").unwrap();
+        assert_eq!(nudge_bodies(&eng.nudge_for_tasks()).len(), 1);
+
+        // It worked and came back to idle: `since` moves, so it is eligible again.
+        if let Some(a) = eng.session.panes.values_mut().find_map(|p| p.agent.as_mut()) {
+            a.since = std::time::Instant::now();
+            a.queued.clear();
+        }
+        assert_eq!(
+            nudge_bodies(&eng.nudge_for_tasks()).len(),
+            1,
+            "a second idle period should be told about the remaining work"
+        );
         kill_all(&mut eng);
     }
 }

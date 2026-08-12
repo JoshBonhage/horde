@@ -999,6 +999,12 @@ pub struct AgentRuntime {
     pub activity: crate::proto::Activity,
     /// Files touched this turn. Kept as a set so a file edited five times counts once.
     pub touched: std::collections::HashSet<String>,
+    /// The `since` value at which this agent was last told about board work.
+    ///
+    /// Keyed on `since` rather than a timestamp so each idle period earns exactly one nudge:
+    /// the value stops matching the moment the agent changes state, which is precisely when
+    /// telling it again would be useful rather than noise.
+    pub nudged_since: Option<std::time::Instant>,
 }
 
 impl AgentRuntime {
