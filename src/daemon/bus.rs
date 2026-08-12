@@ -549,6 +549,7 @@ mod tests {
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                alerted_since: None,
         });
     }
 

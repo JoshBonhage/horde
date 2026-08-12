@@ -637,6 +637,7 @@ impl Pane {
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                alerted_since: None,
             }),
             term,
             parser: Processor::new(),

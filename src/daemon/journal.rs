@@ -32,6 +32,12 @@ pub enum Kind {
     Gone,
     /// Something went wrong that a human should know about.
     Warned,
+    /// horde reached out to you — a system notification, or your own notify command.
+    ///
+    /// The only record that an alert was ever sent. Everything else here is something horde
+    /// observed; this is something horde *did*, which is why it is worth keeping even though no
+    /// digest section reads it yet: "was I told, and when" has to be answerable after the fact.
+    Notified,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +100,20 @@ impl Journal {
             },
             _ => return,
         };
+        self.append(&entry);
+        self.entries.push(entry);
+        while self.entries.len() > CAP {
+            self.entries.remove(0);
+        }
+    }
+
+    /// Record something horde did, rather than something it saw.
+    ///
+    /// `record` translates outgoing events, which covers everything horde observes. An alert is
+    /// not an event — it never reaches a client, and while one is being sent there may be no
+    /// client to reach — so it needs a way in of its own.
+    pub fn note(&mut self, kind: Kind, subject: impl Into<String>) {
+        let entry = Entry { ts: super::now_millis(), kind, subject: subject.into(), pane: None };
         self.append(&entry);
         self.entries.push(entry);
         while self.entries.len() > CAP {
