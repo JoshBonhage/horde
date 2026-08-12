@@ -61,6 +61,53 @@ everything the board guarantees; worth it only when the work genuinely belongs t
 `--spawn` starts an agent — see [spawning](#spawning), which is a bigger decision than the other
 two put together.
 
+### Conditions
+
+`--when <command>` gates a rule on a shell command: it acts only when the command exits 0. This
+is checked when the schedule comes round, not continuously.
+
+```bash
+# every half hour, but only if the suite is broken
+horde trigger add --every 30m --when "! cargo test -q" \
+    --task "the suite is failing — find out why and fix it"
+
+# each weekday morning, but only if there is uncommitted work
+horde trigger add --at 09:00 --days mon-fri --when "! git diff --quiet" \
+    --task "there are uncommitted changes from yesterday — review and commit or discard"
+
+# only when something under src/ is newer than the last build
+horde trigger add --every 15m --when "find src -newer target/debug/horde -name '*.rs' | grep -q ." \
+    --task "rebuild and run the tests"
+```
+
+This is why there is no file watcher. "Has anything changed" is a command, "are the tests broken"
+is a command, and one gate composes with both `--every` and `--at` instead of horde growing a
+variant per question — and a dependency to go with it.
+
+Three things worth knowing:
+
+- **It runs on a thread**, because the engine drives every pane and waiting for `cargo test` inline
+  would freeze every agent's output for the duration. So a condition costs a tick or two to
+  decide rather than being answered inline.
+- **An unmet condition spends the interval.** It is not a firing — `fire_count` does not move and
+  nothing is journaled — but the rule waits out its interval before asking again. Otherwise the
+  probe re-runs on every tick, which for a real command is a fork bomb with good intentions.
+- **A condition that hangs is abandoned after 60s** with a warning, so a wedged command cannot
+  hold its rule forever.
+
+Conditions run through `sh -c`, so `!`, pipes, and `&&` all work. The daemon log records each
+answer, which is where "why didn't my rule fire" gets settled.
+
+**One trap worth knowing**, found by writing it wrong: `!` inverts *any* non-zero exit, including
+the command not existing, a bad path, or a crash. `! git -C /wrong/path diff --quiet` succeeds —
+not because there are changes, but because `git` failed. A negated condition fires on "the check
+could not run" as readily as on "the check found something". If that distinction matters, be
+explicit:
+
+```bash
+--when "git diff --quiet; test $? -eq 1"     # exactly "there are changes"
+```
+
 ### Days
 
 `--days` takes lists, ranges, and wrapping ranges: `mon-fri`, `sat,sun`, `mon,wed,fri`,

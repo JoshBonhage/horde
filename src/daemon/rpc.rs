@@ -554,7 +554,11 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 }
             }
             let by = super::bus::Bus::sender_name(&eng.session, from);
-            let t = eng.triggers.add(when, what, &by).map_err(|e| failed(e.to_string()))?;
+            let only_if = str_arg(req, "when").map(|s| s.to_string());
+            let t = eng
+                .triggers
+                .add(when, what, &by, only_if)
+                .map_err(|e| failed(e.to_string()))?;
             eng.touch();
             // `armed` travels with the reply so the caller never has to re-read the config file
             // and guess whether the daemon agrees with it.
