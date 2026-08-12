@@ -29,10 +29,12 @@
 //!   message written to a shell pane arrives as 993 bytes with no error. Agent TUIs run in
 //!   raw mode, which has no such limit, so this only bites a pane with no agent or one whose
 //!   agent is still starting — which is exactly why the answer is to hold, not to truncate.
-//! - **A pty master is a blocking fd.** It does not return short writes; it blocks until the
-//!   slave drains. Writes are issued from the single-threaded engine, so one agent that has
-//!   stopped reading would freeze every pane, the UI, and all RPCs. Asking `poll` first turns
-//!   that into a queued message.
+//! - **A pty master blocks on write by default.** It does not return short writes; it waits
+//!   until the slave drains. Writes are issued from the single-threaded engine, so one agent
+//!   that stopped reading would freeze every pane, the UI, and all RPCs. horde therefore puts
+//!   every master in non-blocking mode and buffers what the terminal will not take yet, and
+//!   the bus still checks writability first so a message for an agent that is not reading
+//!   stays visibly queued rather than piling up in a buffer.
 //!
 //! Neither is overridable by `--now`: forcing a write the terminal cannot take does not
 //! deliver the message, it loses it quietly or hangs the daemon.
@@ -994,5 +996,93 @@ mod tests {
             pane.kill();
         }
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A long message to a *slow* reader must neither block nor lose bytes.
+    ///
+    /// This is the case the writability check alone did not cover: the tty accepts the first
+    /// chunk, so the gate says go, and then the agent stops keeping up partway through. With a
+    /// blocking master that stalled the engine for the rest of the message. Now the remainder
+    /// is buffered and pushed by later ticks, so every `pump` returns promptly and the whole
+    /// message still arrives.
+    #[test]
+    fn a_long_message_to_a_slow_reader_completes_without_stalling_a_tick() {
+        let (cfg, mut session) = session_with_raw_sink();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Idle);
+        session.panes.get_mut(&pane).unwrap().resize(200, 60).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        let bus = Bus::new(std::env::temp_dir().join("horde-test-slow.jsonl"));
+        let mut m = msg(1, &"x".repeat(40_000));
+        let expected = format_for(&m).len();
+
+        let started = std::time::Instant::now();
+        bus.deliver(&mut session, pane, &mut m, true);
+        let deliver_took = started.elapsed();
+        assert_eq!(m.delivery, Delivery::Delivered);
+        assert!(
+            deliver_took < std::time::Duration::from_millis(200),
+            "deliver held the engine for {deliver_took:?}"
+        );
+        assert!(
+            session.panes[&pane].has_deferred(),
+            "the tail should still be in flight, not silently dropped"
+        );
+
+        // Now pump it out, checking that no single tick takes long.
+        let theme = cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut best = 0usize;
+        let mut worst_tick = std::time::Duration::ZERO;
+        while std::time::Instant::now() < deadline && best < expected {
+            let t = std::time::Instant::now();
+            session.panes.get_mut(&pane).unwrap().pump(&theme);
+            worst_tick = worst_tick.max(t.elapsed());
+            let flat = session.panes[&pane].visible_text().join("");
+            for part in flat.split("GOT=").skip(1) {
+                let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+                best = best.max(digits.parse::<usize>().unwrap_or(0));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+
+        assert!(best >= expected, "only {best} of {expected} bytes arrived");
+        assert!(
+            worst_tick < std::time::Duration::from_millis(150),
+            "one tick took {worst_tick:?} — the engine was blocked in a write"
+        );
+    }
+
+    /// A pane that reads nothing must fail its writes rather than buffer without limit.
+    #[test]
+    fn a_pane_that_never_reads_stops_accepting_rather_than_growing_forever() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/deaf_sink.py");
+        let mut cfg = Config::default();
+        cfg.shell = format!("python3 {script}");
+        let mut session = Session::new(&cfg);
+        session.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        let pane = *session.panes.keys().next().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        // Writes succeed into the buffer until the cap, then refuse. None of them block.
+        let chunk = vec![b'z'; 32 * 1024];
+        let started = std::time::Instant::now();
+        let mut refused = false;
+        for _ in 0..40 {
+            if session.panes.get_mut(&pane).unwrap().write(&chunk).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        let took = started.elapsed();
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+        assert!(refused, "the cap should have been reached and reported");
+        assert!(took < std::time::Duration::from_secs(2), "writes blocked for {took:?}");
     }
 }

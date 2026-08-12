@@ -60,12 +60,37 @@ impl Master {
         }
     }
 
+    /// Put the master into non-blocking mode.
+    ///
+    /// A blocking pty master does not return short writes — it blocks until the slave drains,
+    /// which on the single-threaded engine means one wedged agent stalls every pane. With
+    /// `O_NONBLOCK` a write takes what fits and reports the rest, so the remainder can be held
+    /// and pushed on later ticks.
+    ///
+    /// `O_NONBLOCK` belongs to the open file description, which `dup` shares — so this also
+    /// affects the reader thread. That is why the reader treats `WouldBlock` as "poll again"
+    /// rather than as end of file.
+    pub fn set_nonblocking(&self) -> Result<()> {
+        let fd = self.raw_fd().ok_or_else(|| anyhow!("pty master has no file descriptor"))?;
+        // SAFETY: `fd` is a live pty master; both fcntl calls are reads/writes of its flags.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error()).context("F_GETFL on pty master");
+            }
+            if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+                return Err(std::io::Error::last_os_error()).context("F_SETFL O_NONBLOCK");
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the master will accept a write right now, waiting up to `timeout_ms`.
     ///
-    /// A pty master is a blocking fd, and a write to one whose slave has stopped draining does
-    /// **not** return short — it blocks. Since writes are issued from the single-threaded
-    /// engine, one hung agent would otherwise freeze every pane, the UI, and all RPCs. Asking
-    /// first turns that into a queued message, which the bus already knows how to handle.
+    /// With the master non-blocking, a write can no longer hang the engine — so this is about
+    /// pacing rather than safety. The bus consults it before delivering, so a message for an
+    /// agent that has stopped reading stays queued and visible instead of accumulating in a
+    /// pane buffer nothing is draining.
     pub fn writable(&self, timeout_ms: i32) -> bool {
         let Some(fd) = self.raw_fd() else { return false };
         let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
@@ -289,6 +314,11 @@ pub fn spawn_reader(master: &Master, name: String) -> Result<Reader> {
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // The master is non-blocking so that *writes* cannot stall the engine
+                    // (see `Master::set_nonblocking`). That makes a spurious wakeup return
+                    // WouldBlock here, which is nothing to worry about — poll again. Treating
+                    // it as EOF would kill the reader and the pane would look dead.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                     Err(_) => break,
                 }
             }

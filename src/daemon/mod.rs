@@ -368,9 +368,14 @@ async fn engine_loop(
 
         // Drop to the slow cadence the moment the last client leaves, and back up the
         // instant one arrives.
-        let now_attached = !eng.clients.is_empty();
-        if now_attached != attached {
-            attached = now_attached;
+        //
+        // Pending pane output counts as a reason to run fast even with nobody watching: a
+        // backlogged pane only advances once per tick, so at the detached cadence a long
+        // message to a slow agent would trickle out over seconds. Ticking fast while there is
+        // a backlog costs nothing once it clears.
+        let want_fast = !eng.clients.is_empty() || eng.session.has_pending_output();
+        if want_fast != attached {
+            attached = want_fast;
             ticker = new_ticker(attached);
         }
     }

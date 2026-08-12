@@ -18,7 +18,7 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::time::Instant;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -30,6 +30,13 @@ use crate::theme::Theme;
 
 /// Minimum PTY geometry. A zero-size PTY makes programs misbehave, so panes clamp here
 /// even when the layout squeezes them further.
+/// Most unwritten input to hold for one pane.
+///
+/// Reached only if a pane stops reading entirely — the bus gate keeps normal traffic far below
+/// this. A cap rather than unbounded growth: a wedged agent should fail its writes, not consume
+/// memory until the daemon does.
+const MAX_OUTBOUND: usize = 256 * 1024;
+
 const MIN_COLS: u16 = 2;
 const MIN_ROWS: u16 = 1;
 
@@ -147,6 +154,12 @@ pub struct Pane {
     /// paste inserts a literal newline instead of submitting. Writing the text, then the CR
     /// a beat later, makes the CR read as a keypress.
     deferred: Vec<(Instant, Vec<u8>)>,
+    /// Bytes accepted for this pane but not yet taken by the tty.
+    ///
+    /// The master is non-blocking, so a write takes what fits and reports the rest. Holding the
+    /// remainder here and pushing it on later ticks is what keeps a slow or wedged agent from
+    /// stalling the engine mid-message.
+    outbound: Vec<u8>,
 }
 
 impl Pane {
@@ -191,6 +204,8 @@ impl Pane {
         drop(pair.slave);
 
         let master = Master::Owned(pair.master);
+        // Before any write can happen: the engine must never block on a pty.
+        master.set_nonblocking()?;
         let writer = master.writer()?;
         let reader = pty::spawn_reader(&master, format!("horde-pty-{id}"))?;
         let child = ChildHandle::Owned(child);
@@ -223,6 +238,7 @@ impl Pane {
             dirty: HashSet::new(),
             full_repaint: true,
             deferred: Vec::new(),
+            outbound: Vec::new(),
         })
     }
 
@@ -265,6 +281,10 @@ impl Pane {
         };
         for bytes in due {
             let _ = self.write(&bytes);
+        }
+        // Whatever the tty could not take last tick goes out now.
+        if !self.outbound.is_empty() {
+            self.push_outbound();
         }
 
         if self.exited.is_none() {
@@ -464,13 +484,43 @@ impl Pane {
         self.full_repaint = true;
     }
 
+    /// Accept bytes for the pane, pushing as much as the tty will take right now.
+    ///
+    /// Never blocks. Whatever the terminal cannot take yet stays buffered and goes out on
+    /// following ticks, so a long message to a slow agent costs no engine time.
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if self.exited.is_some() {
             return Ok(());
         }
-        self.writer.write_all(bytes)?;
-        self.writer.flush()?;
+        // A pane that has stopped reading entirely must not grow this without limit. The bus
+        // gate normally prevents it from getting close; this is the backstop.
+        if self.outbound.len() + bytes.len() > MAX_OUTBOUND {
+            return Err(anyhow!("pane {} is not reading its input", self.id));
+        }
+        self.outbound.extend_from_slice(bytes);
+        self.push_outbound();
         Ok(())
+    }
+
+    /// Hand the buffer to the tty until it stops accepting.
+    fn push_outbound(&mut self) {
+        while !self.outbound.is_empty() {
+            match self.writer.write(&self.outbound) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.outbound.drain(..n);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // The tty is full. The rest waits for a later tick.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // The pane is gone; holding its bytes forever would leak.
+                Err(_) => {
+                    self.outbound.clear();
+                    break;
+                }
+            }
+        }
+        let _ = self.writer.flush();
     }
 
     /// Typing into a pane implies you want to see the live view again.
@@ -551,6 +601,8 @@ impl Pane {
         theme: &Theme,
     ) -> Result<Pane> {
         let master = pty::adopt(fd);
+        // Before any write can happen: the engine must never block on a pty.
+        master.set_nonblocking()?;
         let writer = master.writer()?;
         let reader = pty::spawn_reader(&master, format!("horde-pty-{id}"))?;
 
@@ -596,6 +648,7 @@ impl Pane {
             dirty: HashSet::new(),
             full_repaint: true,
             deferred: Vec::new(),
+            outbound: Vec::new(),
         };
 
         // Repaint the emulator to what was on screen, then apply anything the predecessor
@@ -641,10 +694,13 @@ impl Pane {
         }
     }
 
-    /// True while a deferred write is still pending. Anything about to type into this pane
-    /// must wait, or its text would land in front of a submit that has not happened yet.
+    /// True while anything is still on its way into this pane — bytes the tty has not taken
+    /// yet, or a timed write such as the submitting Enter.
+    ///
+    /// Anything about to type into this pane must wait for both, or its text would land inside
+    /// the previous message or in front of a submit that has not fired.
     pub fn has_deferred(&self) -> bool {
-        !self.deferred.is_empty()
+        !self.deferred.is_empty() || !self.outbound.is_empty()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
