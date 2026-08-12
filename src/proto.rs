@@ -213,6 +213,9 @@ pub struct PaneInfo {
     pub rows: u16,
     /// Present only when an agent was detected in this pane.
     pub agent: Option<AgentInfo>,
+    /// The trigger that started this pane, when horde started it rather than you.
+    #[serde(default)]
+    pub spawned_by: Option<u64>,
     pub exited: bool,
     /// Rows of scrollback currently scrolled above the live view. 0 = at the bottom.
     pub scroll_offset: usize,

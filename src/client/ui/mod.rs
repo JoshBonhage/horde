@@ -429,7 +429,7 @@ mod frame_tests {
                         tools: 12, files: 3, errors: 0, turns: 2,
                         last_tool: Some("Edit".into()),
                     },
-                }),
+                }),                spawned_by: None,
                 exited: false, scroll_offset: 0, wants_mouse: false, bracketed_paste: true,
             }
         };

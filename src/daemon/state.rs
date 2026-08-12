@@ -873,6 +873,7 @@ impl Session {
                     cols: p.cols,
                     rows: p.rows,
                     agent: p.agent.as_ref().map(|a| a.info()),
+                    spawned_by: p.spawned_by,
                     exited: p.exited.is_some(),
                     scroll_offset: p.scroll_offset(),
                     wants_mouse: p.wants_mouse(),

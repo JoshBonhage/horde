@@ -82,6 +82,10 @@ pub struct HPane {
     pub cols: u16,
     pub rows: u16,
     pub agent: Option<HAgent>,
+    /// Carried across the swap, or `horde upgrade` would launder a machine-started agent into
+    /// one horde thinks you started — quietly freeing a slot under the unattended cap.
+    #[serde(default)]
+    pub spawned_by: Option<u64>,
     /// The pane's visible grid, replayed into the successor's emulator so the screen does
     /// not go blank. Programs that own the alternate screen (`nvim`, `htop`) come back
     /// looking approximate until they next redraw — their processes are untouched either way.
@@ -313,6 +317,7 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     agent: None,
+                    spawned_by: None,
                     screen: vec![],
                     pending: vec![],
                     cursor_x: 0,

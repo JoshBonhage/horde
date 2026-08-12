@@ -64,6 +64,7 @@ command = "~/bin/horde-ping"  # run when something needs you and nothing is atta
 
 [triggers]
 unattended = false          # master switch: no rule fires until this is on
+max_spawned = 2             # agents horde may run that it started itself (0–16)
 
 [keys]
 zoom = "prefix+f"

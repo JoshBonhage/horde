@@ -200,6 +200,9 @@ pub enum TriggerCmd {
         /// Daily at a local time, e.g. 09:00.
         #[arg(long)]
         at: Option<String>,
+        /// Which days, with --at: mon-fri, sat,sun, mon,wed,fri. Every day if omitted.
+        #[arg(long)]
+        days: Option<String>,
         /// Work to put on the board.
         #[arg(long, conflicts_with = "to")]
         task: Option<String>,
@@ -209,6 +212,13 @@ pub enum TriggerCmd {
         /// Message body, with --to.
         #[arg(long)]
         body: Option<String>,
+        /// Command to start an agent with, e.g. "claude". Runs with whatever permissions you
+        /// give it — horde adds no flags of its own.
+        #[arg(long, conflicts_with_all = ["task", "to"])]
+        spawn: Option<String>,
+        /// Addressable name for a spawned agent, with --spawn.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Show every rule, when it last fired, and what it does.
     List {
@@ -679,12 +689,13 @@ pub fn run(cmd: Command) -> Result<()> {
         },
 
         Command::Trigger { cmd } => match cmd {
-            TriggerCmd::Add { every, at, task, to, body } => {
+            TriggerCmd::Add { every, at, days, task, to, body, spawn, name } => {
                 let v = call(
                     "trigger.add",
                     json!({
-                        "every": every, "at": at,
+                        "every": every, "at": at, "days": days,
                         "task": task, "to": to, "body": body,
+                        "spawn": spawn, "name": name,
                         "from": self_pane(),
                     }),
                 )?;
@@ -720,10 +731,9 @@ pub fn run(cmd: Command) -> Result<()> {
                     println!("triggers are off — [triggers] unattended = true arms them\n");
                 }
                 for t in &items {
+                    let now = crate::daemon::now_millis();
                     let last = match t.last_fired {
-                        Some(ms) => {
-                            format!("last {} ago", ago(crate::daemon::now_millis().saturating_sub(ms)))
-                        }
+                        Some(ms) => format!("last {} ago", ago(now.saturating_sub(ms))),
                         None => "never fired".to_string(),
                     };
                     println!(
@@ -990,6 +1000,11 @@ fn print_roster(v: &Value) {
         let mut why = reason.to_string();
         if queued > 0 {
             why.push_str(&format!(" (+{queued} queued)"));
+        }
+        // An agent you did not start is the one fact about a roster row you would most want
+        // volunteered rather than discovered.
+        if let Some(by) = a.get("spawned_by").and_then(|x| x.as_u64()) {
+            why.push_str(&format!(" [by trigger #{by}]"));
         }
         println!(
             "{name:<14} {state:<9} {:<8} {space:<14} {why}",

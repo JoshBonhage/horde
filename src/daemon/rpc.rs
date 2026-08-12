@@ -343,6 +343,9 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                             "tab": tab.name,
                             "pane": pid,
                             "cwd": p.cwd.to_string_lossy(),
+                            // Whether you started this one or horde did. The roster is where
+                            // you look to answer "who is in here", so it has to say.
+                            "spawned_by": p.spawned_by,
                         }));
                     }
                 }
@@ -509,20 +512,48 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         "trigger.add" => {
             let when = match (str_arg(req, "every"), str_arg(req, "at")) {
                 (Some(e), None) => super::triggers::parse_every(e).map_err(|e| bad(e.to_string()))?,
-                (None, Some(a)) => super::triggers::parse_at(a).map_err(|e| bad(e.to_string()))?,
+                (None, Some(a)) => {
+                    let mut w = super::triggers::parse_at(a).map_err(|e| bad(e.to_string()))?;
+                    if let (Some(spec), super::triggers::When::At { days, .. }) =
+                        (str_arg(req, "days"), &mut w)
+                    {
+                        *days = super::triggers::parse_days(spec).map_err(|e| bad(e.to_string()))?;
+                    }
+                    w
+                }
                 (Some(_), Some(_)) => return Err(bad("give either every or at, not both")),
                 (None, None) => return Err(bad("a trigger needs every or at")),
             };
-            let what = match (str_arg(req, "task"), str_arg(req, "to")) {
-                (Some(text), None) => super::triggers::What::Task { text: text.to_string() },
-                (None, Some(to)) => {
+            if str_arg(req, "days").is_some() && !matches!(when, super::triggers::When::At { .. }) {
+                return Err(bad("days only applies to at — an interval has no day to land on"));
+            }
+            let what = match (str_arg(req, "task"), str_arg(req, "to"), str_arg(req, "spawn")) {
+                (Some(text), None, None) => super::triggers::What::Task { text: text.to_string() },
+                (None, Some(to), None) => {
                     let body = str_arg(req, "body").ok_or_else(|| bad("body required with to"))?;
                     super::triggers::What::Send { to: to.to_string(), body: body.to_string() }
                 }
-                (Some(_), Some(_)) => return Err(bad("give either task or to, not both")),
-                (None, None) => return Err(bad("a trigger needs task or to")),
+                (None, None, Some(cmd)) => super::triggers::What::Spawn {
+                    cmd: cmd.to_string(),
+                    name: str_arg(req, "name").map(|s| s.to_string()),
+                },
+                (None, None, None) => return Err(bad("a trigger needs task, to, or spawn")),
+                _ => return Err(bad("give exactly one of task, to, or spawn")),
             };
-            let by = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
+
+            // The depth guard. An agent creating a trigger is the interesting part; a
+            // machine-started agent creating one closes the loop with no human anywhere in it,
+            // and nothing downstream would ever refuse it.
+            let from = pane_arg(eng, req, "from");
+            if let Some(origin) = from.and_then(|p| eng.session.panes.get(&p)) {
+                if let Some(by_trigger) = origin.spawned_by {
+                    return Err(bad(format!(
+                        "this pane was started by trigger #{by_trigger}, so it cannot create \
+                         triggers — put work on the board instead"
+                    )));
+                }
+            }
+            let by = super::bus::Bus::sender_name(&eng.session, from);
             let t = eng.triggers.add(when, what, &by).map_err(|e| failed(e.to_string()))?;
             eng.touch();
             // `armed` travels with the reply so the caller never has to re-read the config file
@@ -658,6 +689,47 @@ pub fn command_names() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The depth guard. An agent creating a rule is the interesting part of letting agents
+    /// create rules; a *machine-started* agent creating one closes the loop with no human
+    /// anywhere in it, and nothing further down would refuse it.
+    #[test]
+    fn an_agent_horde_started_itself_cannot_create_triggers() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-depth", 1);
+        let pane = *eng.session.panes.keys().next().unwrap();
+
+        let add = |pane| Request {
+            id: String::new(),
+            method: "trigger.add".into(),
+            params: json!({ "every": "1h", "task": "look busy", "from": pane }),
+        };
+
+        // A pane you started: allowed.
+        let resp = dispatch(&mut eng, add(pane));
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+
+        // The same pane, now marked as one horde started: refused, and told why.
+        eng.session.panes.get_mut(&pane).unwrap().spawned_by = Some(7);
+        let resp = dispatch(&mut eng, add(pane));
+        let err = resp.error.expect("a machine-started pane must be refused").message;
+        assert!(err.contains("trigger #7"), "the error should name the origin: {err}");
+        assert!(err.contains("board"), "and point at what to do instead: {err}");
+
+        // Putting work on the board is still fine — only rule-making is closed off.
+        let resp = dispatch(
+            &mut eng,
+            Request {
+                id: String::new(),
+                method: "task.add".into(),
+                params: json!({ "text": "real work", "from": pane }),
+            },
+        );
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
 
     #[test]
     fn every_palette_name_maps_to_a_command() {

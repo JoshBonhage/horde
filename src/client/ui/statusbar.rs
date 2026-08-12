@@ -266,7 +266,7 @@ mod tests {
                     authority: "screen".into(),
                     reason: "t".into(),
                     activity: Default::default(),
-                }),
+                }),                spawned_by: None,
                 exited: false,
                 scroll_offset: 0,
                 wants_mouse: false,

@@ -131,6 +131,7 @@ struct RawNotifications {
 #[serde(deny_unknown_fields)]
 struct RawTriggers {
     unattended: Option<bool>,
+    max_spawned: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +177,12 @@ pub struct Config {
     /// Whether triggers may fire at all. Off by default: acting with nobody watching is a
     /// different promise from running side by side, and has to be asked for.
     pub unattended: bool,
+    /// How many agents horde may have running that it started itself.
+    ///
+    /// Small on purpose. This is the number of full-permission agents that can be working with
+    /// nobody present, so the default is "enough to be useful, few enough to read the transcript
+    /// of afterwards".
+    pub max_spawned: usize,
     pub notify: Notify,
     /// Program run when the daemon has something to tell you and nothing is attached. The
     /// summary arrives as `$1` and the full digest as JSON on stdin, which is what keeps
@@ -204,6 +211,7 @@ impl Default for Config {
             force_inject: false,
             task_nudge: true,
             unattended: false,
+            max_spawned: 2,
             notify: Notify::Horde,
             notify_command: None,
             keys: Keymap::default(),
@@ -278,6 +286,9 @@ impl Config {
         cfg.force_inject = raw.agents.force_inject.unwrap_or(cfg.force_inject);
         cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
         cfg.unattended = raw.triggers.unattended.unwrap_or(cfg.unattended);
+        // Clamped rather than trusted: this bounds how many full-permission agents can run
+        // unwatched, and a typo'd 200 should not be taken at face value.
+        cfg.max_spawned = raw.triggers.max_spawned.unwrap_or(cfg.max_spawned).clamp(0, 16);
 
         if let Some(d) = &raw.notifications.delivery {
             cfg.notify = match d.as_str() {
