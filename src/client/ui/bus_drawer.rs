@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use super::{color, fill, put_line, wrap_text};
-use crate::proto::{Delivery, Message};
+use crate::proto::{Delivery, Message, MsgKind};
 use crate::theme::Theme;
 
 pub struct BusDrawer<'a> {
@@ -126,16 +126,26 @@ fn message_block(msg: &Message, w: usize, t: &Theme, now: u64) -> Vec<Line<'stat
         Span::styled(mlabel.to_string(), panel.fg(color(mcolor))),
     ]));
 
-    let route = if msg.broadcast {
-        format!("{} → all", msg.from)
-    } else {
-        format!("{} → {}", msg.from, msg.to)
+    // A request and its reply are a pair, so label them and they read as a thread rather
+    // than as two unrelated messages.
+    let route = match msg.kind() {
+        MsgKind::Request => format!("{} ⇢ {}  ask #{}", msg.from, msg.to, msg.id),
+        MsgKind::Reply => {
+            format!("{} ⇠ {}  re #{}", msg.to, msg.from, msg.reply_to.unwrap_or(0))
+        }
+        MsgKind::Plain if msg.broadcast => format!("{} → all", msg.from),
+        MsgKind::Plain => format!("{} → {}", msg.from, msg.to),
+    };
+    let route_color = match msg.kind() {
+        MsgKind::Request => t.ui.warn,
+        MsgKind::Reply => t.ui.ok,
+        MsgKind::Plain => t.ui.accent_alt,
     };
     for (i, line) in wrap_text(&route, w).into_iter().enumerate() {
         out.push(Line::from(vec![Span::styled(
             line,
             panel
-                .fg(color(if i == 0 { t.ui.accent_alt } else { t.ui.text_dim }))
+                .fg(color(if i == 0 { route_color } else { t.ui.text_dim }))
                 .add_modifier(Modifier::BOLD),
         )]));
     }
@@ -175,6 +185,8 @@ mod tests {
             body: body.into(),
             delivery,
             broadcast: false,
+            expects_reply: false,
+            reply_to: None,
         }
     }
 
@@ -208,6 +220,22 @@ mod tests {
         assert!(out.contains("builder → reviewer"), "{out}");
         assert!(out.contains("schema is ready"), "{out}");
         assert!(out.contains('✓'), "{out}");
+    }
+
+    #[test]
+    fn a_request_and_its_reply_read_as_a_thread() {
+        let mut ask = msg(7, Delivery::Delivered, "is the gating sound?");
+        ask.expects_reply = true;
+        let mut reply = msg(8, Delivery::Delivered, "yes, it holds");
+        reply.reply_to = Some(7);
+        reply.from = "reviewer".into();
+        reply.to = "builder".into();
+
+        let out = text(&render(&[ask, reply], 34, 16), 34, 16);
+        assert!(out.contains("ask #7"), "the request should be marked: {out}");
+        assert!(out.contains("re #7"), "the reply should name its request: {out}");
+        assert!(out.contains("is the gating sound?"), "{out}");
+        assert!(out.contains("yes, it holds"), "{out}");
     }
 
     #[test]

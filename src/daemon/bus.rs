@@ -28,7 +28,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 
 use crate::config::Config;
-use crate::proto::{AgentState, Delivery, Event, Message, PaneId, SpaceId};
+use crate::proto::{AgentState, Delivery, Event, Message, MsgKind, PaneId, SpaceId};
 
 use super::state::Session;
 
@@ -153,6 +153,7 @@ impl Bus {
     }
 
     /// Route one message. Delivers now if the target is at its prompt, else queues it.
+    #[allow(clippy::too_many_arguments)]
     pub fn send(
         &mut self,
         session: &mut Session,
@@ -161,6 +162,8 @@ impl Bus {
         to: &str,
         body: &str,
         force: bool,
+        expects_reply: bool,
+        reply_to: Option<u64>,
     ) -> Result<Message> {
         let target = Self::resolve(session, to)
             .ok_or_else(|| anyhow!("no agent or pane called {to:?} (try `horde roster`)"))?;
@@ -177,6 +180,8 @@ impl Bus {
             body: body.to_string(),
             delivery: Delivery::Queued,
             broadcast: false,
+            expects_reply,
+            reply_to,
         };
         self.next_id += 1;
 
@@ -210,7 +215,7 @@ impl Bus {
     /// agent reading text and CR in one chunk treats the whole thing as a paste and turns
     /// the CR into a newline. See [`SUBMIT_DELAY`].
     fn deliver(&self, session: &mut Session, pane: PaneId, msg: &mut Message, submit: bool) {
-        let text = format_message(&msg.from, &msg.body);
+        let text = format_for(msg);
         match session.panes.get_mut(&pane) {
             Some(p) => {
                 msg.delivery = match p.write(text.as_bytes()) {
@@ -248,7 +253,7 @@ impl Bus {
         let mut out = Vec::new();
         for t in targets {
             let name = Self::sender_name(session, Some(t));
-            match self.send(session, cfg, from_pane, &name, body, false) {
+            match self.send(session, cfg, from_pane, &name, body, false, false, None) {
                 Ok(mut m) => {
                     m.broadcast = true;
                     out.push(m);
@@ -292,6 +297,43 @@ impl Bus {
         events
     }
 
+    /// Record a reply for an asker that owns no pane — a `horde ask` run from a plain shell,
+    /// where the sender is "user". There is nothing to type the answer into, but the waiting
+    /// CLI polls [`Bus::reply_for`], so landing in the log *is* the delivery.
+    pub fn record_reply(
+        &mut self,
+        session: &Session,
+        from_pane: Option<PaneId>,
+        to: &str,
+        body: &str,
+        reply_to: u64,
+    ) -> Message {
+        let msg = Message {
+            id: self.next_id,
+            ts: super::now_millis(),
+            from: Self::sender_name(session, from_pane),
+            to: to.to_string(),
+            body: body.to_string(),
+            delivery: Delivery::Delivered,
+            broadcast: false,
+            expects_reply: false,
+            reply_to: Some(reply_to),
+        };
+        self.next_id += 1;
+        self.record(msg.clone());
+        msg
+    }
+
+    /// The first reply to `request`, if one has arrived.
+    pub fn reply_for(&self, request: u64) -> Option<Message> {
+        self.messages.iter().find(|m| m.reply_to == Some(request)).cloned()
+    }
+
+    /// A message by id, so a reply can be addressed back to whoever asked.
+    pub fn message(&self, id: u64) -> Option<Message> {
+        self.messages.iter().find(|m| m.id == id).cloned()
+    }
+
     /// Mark a previously queued message as delivered, in the ring and in the log.
     fn update_delivery(&mut self, id: u64, delivery: Delivery) {
         if let Some(m) = self.messages.iter_mut().find(|m| m.id == id) {
@@ -327,11 +369,35 @@ impl Bus {
 /// The exact bytes written into a recipient's terminal, minus the Enter that follows.
 ///
 /// Newlines are flattened: a body containing one would submit early, one line at a time,
-/// turning a single message into several half-messages. The `[horde] message from <name>:`
-/// prefix is the recipient's signal that this is another agent rather than the human.
-pub fn format_message(from: &str, body: &str) -> String {
-    let body = body.trim().replace(['\r', '\n'], " ");
-    format!("[horde] message from {from}: {body}")
+/// turning a single message into several half-messages. The `[horde]` prefix is the
+/// recipient's signal that this is another agent rather than the human.
+///
+/// A request additionally spells out the command to answer with. Without that the sender has
+/// to embed instructions by hand and hope they are followed, which is the difference between
+/// a delegation that returns a value and one that returns nothing.
+///
+/// A request spells out the exact command to run. Without that the sender has to embed
+/// instructions by hand and hope they are followed, which is the difference between a
+/// delegation that returns a value and one that returns nothing.
+pub fn format_for(msg: &Message) -> String {
+    let body = msg.body.trim().replace(['\r', '\n'], " ");
+    match msg.kind() {
+        // Deliberately explicit. A recipient that treats `horde reply` as something to
+        // investigate rather than run will spend a turn grepping for it — observed in
+        // testing before this wording, and before the skill was installed.
+        MsgKind::Request => format!(
+            "[horde] request #{} from {}: {} \u{2014} answer by running this shell command \
+             exactly once, and nothing else: horde reply {} \"<your one-line answer>\"",
+            msg.id, msg.from, body, msg.id
+        ),
+        MsgKind::Reply => format!(
+            "[horde] reply from {} (re #{}): {}",
+            msg.from,
+            msg.reply_to.unwrap_or(0),
+            body
+        ),
+        MsgKind::Plain => format!("[horde] message from {}: {}", msg.from, body),
+    }
 }
 
 /// Replay the tail of the log. Later entries for the same id supersede earlier ones, which
@@ -392,6 +458,8 @@ mod tests {
             body: body.into(),
             delivery: Delivery::Queued,
             broadcast: false,
+            expects_reply: false,
+            reply_to: None,
         }
     }
 
@@ -400,7 +468,7 @@ mod tests {
         // The bug this guards: an agent reading text and CR in one chunk treats the whole
         // thing as a paste and inserts a newline instead of submitting, leaving the message
         // sitting unsent in its input box. Enter has to be a separate write.
-        let text = format_message("builder", "please review src/bus.rs");
+        let text = format_for(&msg(1, "please review src/bus.rs"));
         assert!(!text.contains('\r'), "{text:?}");
         assert!(!text.contains('\n'), "{text:?}");
         assert_eq!(text, "[horde] message from builder: please review src/bus.rs");
@@ -409,8 +477,8 @@ mod tests {
     #[test]
     fn newlines_in_a_body_are_flattened_not_submitted() {
         // Otherwise each line submits separately, splitting one message into several.
-        let text = format_message("a", "line one\nline two\r\nline three");
-        assert_eq!(text, "[horde] message from a: line one line two  line three");
+        let text = format_for(&msg(1, "line one\nline two\r\nline three"));
+        assert_eq!(text, "[horde] message from builder: line one line two  line three");
         assert!(!text.contains('\n') && !text.contains('\r'));
     }
 
@@ -518,6 +586,8 @@ mod tests {
             body: "hi".into(),
             delivery: Delivery::Queued,
             broadcast: false,
+            expects_reply: false,
+            reply_to: None,
         };
         let delivered = Message { delivery: Delivery::Delivered, ..queued.clone() };
         let text = format!(
@@ -554,6 +624,8 @@ mod tests {
                 body: String::new(),
                 delivery: Delivery::Delivered,
                 broadcast: false,
+                expects_reply: false,
+                reply_to: None,
             });
             while bus.messages.len() > RING {
                 bus.messages.pop_front();

@@ -462,11 +462,14 @@ mod frame_tests {
         app.rows.insert(3, vec![row("PASS  42   FAIL  0"), row("$ ")]);
 
         app.bus = vec![
+            // A request and its reply, so the demo frame shows the threading.
             Message { id: 1, ts: 1_000_000, from: "builder".into(), to: "reviewer".into(),
-                body: "schema is ready, please review".into(),
-                delivery: Delivery::Delivered, broadcast: false },
+                body: "is the gating logic sound?".into(),
+                delivery: Delivery::Delivered, broadcast: false,
+                expects_reply: true, reply_to: None },
             Message { id: 2, ts: 1_000_000, from: "reviewer".into(), to: "builder".into(),
-                body: "LGTM, ship it".into(), delivery: Delivery::Queued, broadcast: false },
+                body: "yes, it holds".into(), delivery: Delivery::Queued,
+                broadcast: false, expects_reply: false, reply_to: Some(1) },
         ];
         (app, snap)
     }

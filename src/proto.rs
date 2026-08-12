@@ -328,6 +328,31 @@ pub struct Message {
     pub body: String,
     pub delivery: Delivery,
     pub broadcast: bool,
+    /// The sender is blocked waiting for a reply, so the recipient is told exactly how to
+    /// send one. This is what turns delegation into a call rather than a hope.
+    #[serde(default)]
+    pub expects_reply: bool,
+    /// Set on a reply, naming the request it answers.
+    #[serde(default)]
+    pub reply_to: Option<u64>,
+}
+
+impl Message {
+    /// How this message should be introduced to its recipient.
+    pub fn kind(&self) -> MsgKind {
+        match (self.expects_reply, self.reply_to) {
+            (_, Some(_)) => MsgKind::Reply,
+            (true, None) => MsgKind::Request,
+            _ => MsgKind::Plain,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgKind {
+    Plain,
+    Request,
+    Reply,
 }
 
 // ---------------------------------------------------------------------------

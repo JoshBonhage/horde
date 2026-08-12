@@ -13,6 +13,30 @@ use std::path::PathBuf;
 
 use crate::proto::AgentState;
 
+/// The skill that teaches an agent to use the bus.
+///
+/// Hooks tell horde what an agent is doing; this tells the agent what horde can do. Without
+/// it an agent receiving `[horde] request #7 … run: horde reply 7 "…"` may treat the command
+/// as something to investigate rather than run — observed in testing.
+const SKILL: &str = include_str!("../../skills/horde/SKILL.md");
+
+fn skill_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("cannot find your home directory"))?;
+    Ok(home.join(".claude").join("skills").join("horde").join("SKILL.md"))
+}
+
+/// Write the skill where Claude Code will find it. Idempotent, and overwrites in place so an
+/// upgrade ships the current text.
+fn install_skill() -> Result<PathBuf> {
+    let path = skill_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+    }
+    std::fs::write(&path, SKILL).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
 /// Claude Code hook events horde cares about, and the state each implies.
 ///
 /// `SessionStart` reports identity rather than state — it is where the session id for
@@ -117,7 +141,14 @@ pub fn install(agent: &str) -> Result<()> {
 
     println!("installed {added} hooks into {}", path.display());
     println!("existing hooks from other tools were left untouched");
-    println!("restart any running Claude Code sessions for hooks to take effect");
+
+    match install_skill() {
+        Ok(p) => println!("installed the horde skill at {}", p.display()),
+        // The hooks are the important half; a missing skill is worth reporting, not fatal.
+        Err(e) => eprintln!("warning: could not install the skill: {e:#}"),
+    }
+
+    println!("restart any running Claude Code sessions for both to take effect");
     Ok(())
 }
 
@@ -163,6 +194,15 @@ pub fn uninstall(agent: &str) -> Result<()> {
 
     std::fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
     println!("removed {removed} horde hooks from {}", path.display());
+
+    if let Ok(p) = skill_path() {
+        if p.exists() {
+            match std::fs::remove_file(&p) {
+                Ok(()) => println!("removed the skill at {}", p.display()),
+                Err(e) => eprintln!("warning: could not remove {}: {e}", p.display()),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -264,6 +304,32 @@ pub fn run_hook(agent: &str, event: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_skill_is_present_and_teaches_the_commands_it_needs_to() {
+        // A skill that omits a command an agent is told to run is worse than none.
+        assert!(SKILL.len() > 500);
+        assert!(SKILL.starts_with("---"), "needs frontmatter to be discovered");
+        for needed in [
+            "name: horde",
+            "description:",
+            "HORDE_PANE",
+            "horde reply",
+            "horde ask",
+            "horde send",
+            "horde roster",
+            "horde wait",
+            "horde spawn",
+            "[horde] request",
+        ] {
+            assert!(SKILL.contains(needed), "the skill never mentions {needed}");
+        }
+        // The point of the skill is that `reply` is run, not researched.
+        assert!(
+            SKILL.contains("Do not investigate"),
+            "the skill must tell the agent to run horde reply directly"
+        );
+    }
 
     #[test]
     fn maps_events_to_states() {

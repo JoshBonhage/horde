@@ -361,13 +361,60 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             let body = str_arg(req, "body").ok_or_else(|| bad("body required"))?;
             let from = pane_arg(eng, req, "from");
             let force = bool_arg(req, "force");
+            let expects_reply = bool_arg(req, "expects_reply");
             let cfg = eng.cfg.clone();
             let Engine { bus, session, .. } = eng;
             let msg = bus
-                .send(session, &cfg, from, to, body, force)
+                .send(session, &cfg, from, to, body, force, expects_reply, None)
                 .map_err(|e| failed(e.to_string()))?;
             eng.emit(crate::proto::Event::BusMessage(msg.clone()));
             serde_json::to_value(msg).map_err(|e| failed(e.to_string()))
+        }
+
+        // Answer a request. The target is whoever sent it, so a replying agent needs to know
+        // only the request number it was given.
+        "bus.reply" => {
+            let id = req
+                .params
+                .get("request")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| bad("request id required"))?;
+            let body = str_arg(req, "body").ok_or_else(|| bad("body required"))?;
+            let from = pane_arg(eng, req, "from");
+            let cfg = eng.cfg.clone();
+
+            let original = eng
+                .bus
+                .message(id)
+                .ok_or_else(|| not_found(format!("no request #{id} in the log")))?;
+            if !original.expects_reply {
+                return Err(bad(format!("message #{id} was not a request")));
+            }
+            // Reply to the sender by name; they may have moved pane since asking.
+            let Engine { bus, session, .. } = eng;
+            let msg = match crate::daemon::bus::Bus::resolve(session, &original.from) {
+                Some(_) => bus
+                    .send(session, &cfg, from, &original.from, body, false, false, Some(id))
+                    .map_err(|e| failed(e.to_string()))?,
+                // The asker has no pane to type into — a `horde ask` from a plain shell. It
+                // is polling for the answer, so recording it is what delivers it.
+                None => bus.record_reply(session, from, &original.from, body, id),
+            };
+            eng.emit(crate::proto::Event::BusMessage(msg.clone()));
+            serde_json::to_value(msg).map_err(|e| failed(e.to_string()))
+        }
+
+        // Has a reply landed yet? The CLI polls this rather than blocking the engine.
+        "bus.reply_for" => {
+            let id = req
+                .params
+                .get("request")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| bad("request id required"))?;
+            Ok(match eng.bus.reply_for(id) {
+                Some(m) => serde_json::to_value(m).map_err(|e| failed(e.to_string()))?,
+                None => Value::Null,
+            })
         }
         "bus.broadcast" => {
             let body = str_arg(req, "body").ok_or_else(|| bad("body required"))?;

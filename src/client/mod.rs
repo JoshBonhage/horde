@@ -1341,6 +1341,8 @@ mod tests {
             body: "hi".into(),
             delivery: crate::proto::Delivery::Queued,
             broadcast: false,
+            expects_reply: false,
+            reply_to: None,
         };
         apply_frame(&mut app, ServerFrame::Event(crate::proto::Event::BusMessage(queued.clone())));
         let delivered = Message { delivery: crate::proto::Delivery::Delivered, ..queued };

@@ -63,6 +63,25 @@ pub enum Command {
         #[arg(long)]
         now: bool,
     },
+    /// Ask another agent something and wait for its answer.
+    ///
+    /// Unlike `send`, this blocks until the agent replies and prints the reply to stdout, so
+    /// it can be captured: `answer=$(horde ask reviewer "is this sound?")`. The recipient is
+    /// told the exact command to answer with.
+    Ask {
+        /// Agent name, pane name, pane id, or space:tab:pane.
+        to: String,
+        /// The question.
+        body: Vec<String>,
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
+    /// Answer a request you were sent. The request number is in the message.
+    Reply {
+        /// Request number, as printed in `[horde] request #N`.
+        request: u64,
+        body: Vec<String>,
+    },
     /// Send a message to every agent.
     Broadcast {
         body: Vec<String>,
@@ -388,6 +407,56 @@ pub fn run(cmd: Command) -> Result<()> {
             }
         }
 
+        Command::Ask { to, body, timeout } => {
+            let body = body.join(" ");
+            if body.trim().is_empty() {
+                return Err(anyhow!("question is empty"));
+            }
+            let sent = call(
+                "bus.send",
+                json!({ "to": to, "body": body, "from": self_pane(), "expects_reply": true }),
+            )?;
+            let id = sent.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let target = sent.get("to").and_then(|v| v.as_str()).unwrap_or(&to).to_string();
+            let delivery = sent.get("delivery").and_then(|v| v.as_str()).unwrap_or("");
+            if delivery == "queued" {
+                eprintln!("request #{id} queued for {target} — it is busy; still waiting");
+            } else {
+                eprintln!("asked {target} (request #{id})");
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(timeout);
+            loop {
+                let v = call("bus.reply_for", json!({ "request": id }))?;
+                if let Some(reply) = v.as_object() {
+                    // The answer goes to stdout alone, so it can be captured in a variable.
+                    println!("{}", reply.get("body").and_then(|b| b.as_str()).unwrap_or(""));
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "no reply to request #{id} from {target} within {timeout}s \
+                         (it may still answer — check `horde bus tail`)"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        }
+
+        Command::Reply { request, body } => {
+            let body = body.join(" ");
+            if body.trim().is_empty() {
+                return Err(anyhow!("reply is empty"));
+            }
+            let v = call(
+                "bus.reply",
+                json!({ "request": request, "body": body, "from": self_pane() }),
+            )?;
+            let to = v.get("to").and_then(|x| x.as_str()).unwrap_or("?");
+            let how = v.get("delivery").and_then(|x| x.as_str()).unwrap_or("sent");
+            println!("{how} to {to} (re #{request})");
+        }
+
         Command::Broadcast { body, space } => {
             let body = body.join(" ");
             if body.trim().is_empty() {
@@ -675,7 +744,17 @@ fn print_message(m: &Value) {
         "queued" => "⧗",
         _ => "✕",
     };
-    println!("{mark} {from} → {to}: {body}");
+    let id = m.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
+    // Requests and replies are the interesting traffic, so label them.
+    let tag = match (
+        m.get("expects_reply").and_then(|x| x.as_bool()).unwrap_or(false),
+        m.get("reply_to").and_then(|x| x.as_u64()),
+    ) {
+        (_, Some(n)) => format!("re #{n} "),
+        (true, None) => format!("ask #{id} "),
+        _ => String::new(),
+    };
+    println!("{mark} {tag}{from} → {to}: {body}");
 }
 
 #[cfg(test)]
