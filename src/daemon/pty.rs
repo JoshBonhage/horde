@@ -60,6 +60,42 @@ impl Master {
         }
     }
 
+    /// Whether the master will accept a write right now, waiting up to `timeout_ms`.
+    ///
+    /// A pty master is a blocking fd, and a write to one whose slave has stopped draining does
+    /// **not** return short — it blocks. Since writes are issued from the single-threaded
+    /// engine, one hung agent would otherwise freeze every pane, the UI, and all RPCs. Asking
+    /// first turns that into a queued message, which the bus already knows how to handle.
+    pub fn writable(&self, timeout_ms: i32) -> bool {
+        let Some(fd) = self.raw_fd() else { return false };
+        let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one initialised pollfd, count matches, fd is a live pty master.
+        let rc = unsafe { libc::poll(&mut p, 1, timeout_ms) };
+        rc > 0 && p.revents & libc::POLLOUT != 0
+    }
+
+    /// True when the terminal's line discipline is in canonical mode.
+    ///
+    /// This matters because a canonical tty caps one input line at `MAX_CANON` (1024 bytes on
+    /// macOS) and **silently discards the remainder** — no error, no short write. Agent TUIs
+    /// put the terminal in raw mode, where a long write is simply delivered in buffer-sized
+    /// pieces and nothing is lost; a plain shell, or an agent that has not finished starting,
+    /// is canonical and would mangle a long message.
+    ///
+    /// `tcgetattr` on the master returns the slave's settings, so this reads the state of
+    /// whatever is running in the pane without needing to ask it.
+    pub fn input_is_canonical(&self) -> Option<bool> {
+        let fd = self.raw_fd()?;
+        // SAFETY: `fd` is a live pty master; `t` is fully initialised by the call before use.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut t) != 0 {
+                return None;
+            }
+            Some(t.c_lflag & libc::ICANON != 0)
+        }
+    }
+
     /// Foreground process group of the terminal, used to identify what is running.
     pub fn foreground_pgid(&self) -> Option<i32> {
         match self {

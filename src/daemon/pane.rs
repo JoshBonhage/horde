@@ -617,6 +617,30 @@ impl Pane {
         self.deferred.push((Instant::now() + delay, bytes));
     }
 
+    /// Whether the pty will take a write now. See [`Master::writable`].
+    ///
+    /// The timeout is deliberately tiny: this runs on the engine thread once per delivery, and
+    /// a target that cannot take input within a few milliseconds is better queued than waited
+    /// on. It flushes on a later pass at no cost.
+    pub fn accepts_input(&self) -> bool {
+        self.master.writable(5)
+    }
+
+    /// Longest text this pane can accept in one line without the tty discarding the tail.
+    ///
+    /// `None` means unlimited: a raw-mode terminal has no line limit, and `write_all` loops
+    /// over the buffer-sized pieces the master accepts. Canonical mode caps a line at
+    /// `MAX_CANON` and drops the rest silently, so a long message has to be refused rather
+    /// than half-delivered.
+    pub fn max_input_line(&self) -> Option<usize> {
+        match self.master.input_is_canonical() {
+            // A little headroom under MAX_CANON (1024): the limit counts the whole line, and
+            // anything already typed at that prompt counts against it too.
+            Some(true) => Some(900),
+            _ => None,
+        }
+    }
+
     /// True while a deferred write is still pending. Anything about to type into this pane
     /// must wait, or its text would land in front of a submit that has not happened yet.
     pub fn has_deferred(&self) -> bool {

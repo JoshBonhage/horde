@@ -19,6 +19,23 @@
 //!
 //! A pane with no agent at all gets the text without a submitting newline, so a stray
 //! message can never execute as a shell command.
+//!
+//! # Why delivery is also gated on the terminal itself
+//!
+//! Two properties of a pty, both measured rather than assumed, decide whether a write can
+//! succeed at all — and neither reports failure if you ignore it:
+//!
+//! - **A canonical tty discards a line past `MAX_CANON`** (1024 bytes on macOS). A 4000-byte
+//!   message written to a shell pane arrives as 993 bytes with no error. Agent TUIs run in
+//!   raw mode, which has no such limit, so this only bites a pane with no agent or one whose
+//!   agent is still starting — which is exactly why the answer is to hold, not to truncate.
+//! - **A pty master is a blocking fd.** It does not return short writes; it blocks until the
+//!   slave drains. Writes are issued from the single-threaded engine, so one agent that has
+//!   stopped reading would freeze every pane, the UI, and all RPCs. Asking `poll` first turns
+//!   that into a queued message.
+//!
+//! Neither is overridable by `--now`: forcing a write the terminal cannot take does not
+//! deliver the message, it loses it quietly or hangs the daemon.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -132,12 +149,27 @@ impl Bus {
         }
     }
 
-    fn gate(session: &Session, pane: PaneId, force: bool) -> Gate {
+    fn gate(session: &Session, pane: PaneId, force: bool, len: usize) -> Gate {
         let Some(p) = session.panes.get(&pane) else { return Gate::Hold("pane is gone") };
         // A submit is still pending for this pane. Typing now would land in front of an
         // Enter that has not fired yet, merging two messages into one prompt.
         if p.has_deferred() {
             return Gate::Hold("previous message is still being submitted");
+        }
+        // A canonical tty discards everything past MAX_CANON without telling anyone, so a
+        // long message would arrive cut in half with no indication. Holding is the right
+        // answer even under `force`: an agent that is still starting up is canonical for a
+        // second or two and raw after that, so the message goes out intact on a later pass.
+        // A pane with no agent has nowhere to queue, so this becomes a visible drop instead
+        // of a mangled line.
+        if p.max_input_line().is_some_and(|max| len > max) {
+            return Gate::Hold("message is longer than the target's terminal accepts right now");
+        }
+        // The pty is a blocking fd. If the target has stopped draining its input, writing
+        // would stall the engine — and with it every other pane. Queue instead; this is the
+        // same answer the bus gives for every other "not right now".
+        if !p.accepts_input() {
+            return Gate::Hold("target's terminal is not accepting input");
         }
         let Some(agent) = p.agent.as_ref() else { return Gate::TextOnly };
         if force {
@@ -186,7 +218,10 @@ impl Bus {
         self.next_id += 1;
 
         let force = force || cfg.force_inject;
-        match Self::gate(session, target, force) {
+        // Measure what will actually be typed, not the raw body: the `[horde] request …`
+        // envelope is part of the line the tty has to accept.
+        let len = format_for(&msg).len();
+        match Self::gate(session, target, force, len) {
             Gate::Submit => self.deliver(session, target, &mut msg, true),
             Gate::TextOnly => self.deliver(session, target, &mut msg, false),
             Gate::Hold(reason) => {
@@ -275,7 +310,16 @@ impl Bus {
 
         let mut events = Vec::new();
         for pane in candidates {
-            if !matches!(Self::gate(session, pane, cfg.force_inject), Gate::Submit) {
+            // Length is measured against the head of the queue, since that is what would go
+            // out on this pass.
+            let head_len = session
+                .panes
+                .get(&pane)
+                .and_then(|p| p.agent.as_ref())
+                .and_then(|a| a.queued.first())
+                .map(|m| format_for(m).len())
+                .unwrap_or(0);
+            if !matches!(Self::gate(session, pane, cfg.force_inject, head_len), Gate::Submit) {
                 continue;
             }
             // One message per pass. Each delivered message submits a prompt, so sending the
@@ -527,13 +571,13 @@ mod tests {
         let pane = *session.panes.keys().next().unwrap();
         give_agent(&mut session, pane, AgentState::Idle);
 
-        assert!(matches!(Bus::gate(&session, pane, false), Gate::Submit));
+        assert!(matches!(Bus::gate(&session, pane, false, 80), Gate::Submit));
         session
             .panes
             .get_mut(&pane)
             .unwrap()
             .write_later(vec![b'\r'], std::time::Duration::from_secs(5));
-        assert!(matches!(Bus::gate(&session, pane, false), Gate::Hold(_)));
+        assert!(matches!(Bus::gate(&session, pane, false, 80), Gate::Hold(_)));
 
         for p in session.panes.values_mut() {
             p.kill();
@@ -636,5 +680,148 @@ mod tests {
         assert_eq!(bus.messages.len(), RING);
         assert_eq!(bus.messages.back().unwrap().id, (RING + 49) as u64);
         assert_eq!(bus.recent(3).len(), 3);
+    }
+
+
+    /// A raw-mode pane standing in for an agent TUI, so a long write can be measured.
+    fn session_with_raw_sink() -> (Config, Session) {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/raw_sink.py");
+        let mut cfg = Config::default();
+        cfg.shell = format!("python3 {script}");
+        let mut session = Session::new(&cfg);
+        session.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        (cfg, session)
+    }
+
+    /// Long messages must arrive whole.
+    ///
+    /// Measured, not assumed: the far end reports a running byte count, and this asserts the
+    /// whole formatted message got there. 60KB is far past every buffer in the path — the tty
+    /// input queue is about a kilobyte, so this only passes because a draining reader lets the
+    /// blocking write through in pieces.
+    ///
+    /// Note what this does *not* prove: swapping `write_all` for a single `write` still passes,
+    /// because a pty master is a blocking fd and does not return short. Truncation is prevented
+    /// by that blocking behaviour; the risk it creates is covered by the next test.
+    #[test]
+    fn a_long_message_reaches_a_raw_mode_agent_whole() {
+        let (cfg, mut session) = session_with_raw_sink();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Idle);
+        session.panes.get_mut(&pane).unwrap().resize(200, 60).unwrap();
+        // Let python get the tty into raw mode before measuring anything.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        let body = "x".repeat(60_000);
+        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-long.jsonl"));
+        let mut m = msg(1, &body);
+        let expected = format_for(&m).len();
+        assert!(expected > 60_000, "the envelope should make this longer still");
+        bus.deliver(&mut session, pane, &mut m, true);
+        assert_eq!(m.delivery, Delivery::Delivered);
+
+        let theme = cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut best = 0usize;
+        while std::time::Instant::now() < deadline && best < expected {
+            session.panes.get_mut(&pane).unwrap().pump(&theme);
+            let flat = session.panes[&pane].visible_text().join("");
+            // The sink reports a running total; the largest one is what has arrived.
+            for part in flat.split("GOT=").skip(1) {
+                let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+                best = best.max(digits.parse::<usize>().unwrap_or(0));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+        assert!(
+            best >= expected,
+            "message was truncated: {best} of {expected} bytes arrived"
+        );
+    }
+
+    /// The other half of the same problem: a canonical tty caps a line at MAX_CANON and
+    /// discards the rest without erroring. A shell pane is canonical, so a long message must
+    /// be held rather than typed in half.
+    #[test]
+    fn a_canonical_pane_holds_a_long_message_instead_of_cutting_it() {
+        let (cfg, mut session) = session_with_cat();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Idle);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let max = session.panes[&pane].max_input_line();
+        assert_eq!(max, Some(900), "a `cat` pane is canonical: {max:?}");
+
+        // Short messages are unaffected.
+        assert!(matches!(Bus::gate(&session, pane, false, 80), Gate::Submit));
+        // Long ones are held, and `force` does not override this one — forcing would not
+        // make the tty accept the bytes, it would only lose them louder.
+        assert!(matches!(Bus::gate(&session, pane, false, 4000), Gate::Hold(_)));
+        assert!(matches!(Bus::gate(&session, pane, true, 4000), Gate::Hold(_)));
+
+        // And it queues rather than being reported as delivered.
+        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-canon.jsonl"));
+        let m = bus
+            .send(&mut session, &cfg, None, "target", &"y".repeat(4000), true, false, None)
+            .unwrap();
+        assert_eq!(m.delivery, Delivery::Queued, "a doomed write must not read as delivered");
+
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    /// A hung agent must not be able to freeze the daemon.
+    ///
+    /// Writes go out from the single-threaded engine onto a blocking pty. A slave that has
+    /// stopped draining makes that write block, which would stall every pane, the UI, and all
+    /// RPCs — one wedged agent taking down the whole session. So the bus asks whether the pty
+    /// will take a write before issuing one, and queues if not.
+    #[test]
+    fn a_target_that_stopped_reading_queues_instead_of_hanging() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/deaf_sink.py");
+        let mut cfg = Config::default();
+        cfg.shell = format!("python3 {script}");
+        let mut session = Session::new(&cfg);
+        session.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Idle);
+        std::thread::sleep(std::time::Duration::from_millis(700));
+
+        // Fill the tty input queue, which nothing is draining. One byte at a time: POLLOUT
+        // promises *some* space, not a bufferful, so a larger write could block right here
+        // and hang the test the same way it would hang the daemon.
+        let mut filled = 0;
+        while filled < 65_536 && session.panes[&pane].accepts_input() {
+            if session.panes.get_mut(&pane).unwrap().write(b"z").is_err() {
+                break;
+            }
+            filled += 1;
+        }
+        assert!(filled > 0, "should have written something before the queue filled");
+        assert!(
+            !session.panes[&pane].accepts_input(),
+            "the queue should be full after {filled} bytes with nothing draining"
+        );
+
+        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-deaf.jsonl"));
+        let started = std::time::Instant::now();
+        let m = bus
+            .send(&mut session, &cfg, None, "target", "are you there?", false, false, None)
+            .unwrap();
+        let took = started.elapsed();
+
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+
+        assert_eq!(m.delivery, Delivery::Queued, "a wedged target must queue, not report sent");
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "send blocked for {took:?} — the engine would have been frozen for that long"
+        );
     }
 }
