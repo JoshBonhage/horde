@@ -11,7 +11,7 @@ use crate::client::menu::Act;
 use crate::client::settings::{self, Kind};
 use crate::client::{App, Mode, PickKind};
 use crate::config::{Action, Trigger};
-use crate::proto::NoticeLevel;
+use crate::proto::{AgentLine, AgentState, Delivery, Digest, NoticeLevel, Rgb};
 use crate::theme::Theme;
 
 /// A bordered panel with a title, used by every overlay so they read as one family.
@@ -117,6 +117,9 @@ fn describe_action(name: &str, action: &Action) -> String {
         Action::RenamePane => "rename the focused pane".into(),
         Action::Settings => "settings".into(),
         Action::SendPrefix => "send the prefix key to the pane".into(),
+        // The generic name-to-words fallback would render this as bare "digest", which does
+        // not say what it does.
+        Action::Cmd(crate::proto::Cmd::RequestDigest) => "what happened while you were away".into(),
         Action::Cmd(_) => name.replace('_', " "),
     }
 }
@@ -550,6 +553,229 @@ pub fn settings(f: &mut Frame, area: TRect, app: &mut App) {
 }
 
 /// Toasts stack down the top-right corner.
+
+/// The catch-up report: what happened while you were detached.
+///
+/// Built as a flat list of styled lines and then windowed, rather than laid out section by
+/// section, so scrolling is one offset instead of per-section arithmetic.
+pub fn digest(f: &mut Frame, area: TRect, app: &App) {
+    let theme = app.cfg.theme.clone();
+    let Some(d) = app.digest.as_ref() else { return };
+    let scroll = match app.mode {
+        Mode::Digest { scroll } => scroll,
+        _ => 0,
+    };
+
+    let w = (area.width.saturating_sub(6)).min(84).max(34);
+    // Measure the content first so the panel is the size of the report rather than the size
+    // of the screen: a three-line digest in a full-height frame looks broken.
+    // The two borders and the footer are what the content does not occupy.
+    let lines = digest_lines(d, w.saturating_sub(2) as usize, &theme);
+    let wanted = lines.len() as u16 + 3;
+    let h = wanted.min(area.height.saturating_sub(4)).max(6);
+    let outer = centered(area, w, h);
+    let title = format!("while you were away · {}", ago(d.now.saturating_sub(d.since)));
+    let inner = panel(f, outer, &title, &theme);
+    let bottom = inner.y + inner.height;
+    // Reserve the last row for the footer, which has to stay visible at any scroll offset.
+    let view_h = inner.height.saturating_sub(1) as usize;
+    let max_scroll = lines.len().saturating_sub(view_h);
+    let scroll = scroll.min(max_scroll);
+
+    let mut y = inner.y;
+    for line in lines.iter().skip(scroll).take(view_h) {
+        if y + 1 >= bottom {
+            break;
+        }
+        put_line(f.buffer_mut(), inner.x, y, inner.width, line.clone());
+        y += 1;
+    }
+
+    let hint = if max_scroll > 0 {
+        format!("esc closes · ↑↓ scrolls · {}/{}", scroll + 1, max_scroll + 1)
+    } else {
+        "esc closes".to_string()
+    };
+    put_line(
+        f.buffer_mut(),
+        inner.x,
+        bottom.saturating_sub(1),
+        inner.width,
+        Line::from(vec![Span::styled(
+            hint,
+            Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.panel_bg)),
+        )]),
+    );
+}
+
+/// `42m`, `3h`, `2d` — how long ago, at the coarsest unit that is still true.
+fn ago(millis: u64) -> String {
+    let secs = millis / 1000;
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// Every digest section flattened into one styled list, in the order you would want to be
+/// told: what is stuck, what finished, the board, then the traffic.
+fn digest_lines(d: &Digest, w: usize, t: &Theme) -> Vec<Line<'static>> {
+    let panel = Style::default().bg(color(t.ui.panel_bg));
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    let heading = |out: &mut Vec<Line<'static>>, text: &str| {
+        if !out.is_empty() {
+            out.push(Line::from(vec![Span::styled(String::new(), panel)]));
+        }
+        out.push(Line::from(vec![Span::styled(
+            text.to_string(),
+            panel.fg(color(t.ui.text_dim)).add_modifier(Modifier::BOLD),
+        )]));
+    };
+
+    let agent_rows = |out: &mut Vec<Line<'static>>, rows: &[AgentLine], detail: Rgb| {
+        for a in rows {
+            out.push(Line::from(vec![
+                Span::styled("  ".to_string(), panel),
+                Span::styled(
+                    format!("{} ", a.state.glyph()),
+                    panel.fg(color(state_color(a.state, t))),
+                ),
+                Span::styled(
+                    format!("{:<14} ", truncate(&a.name, 14)),
+                    panel.fg(color(t.ui.text)),
+                ),
+                Span::styled(format!("{:<6} ", ago(a.elapsed * 1000)), panel.fg(color(t.ui.text_dim))),
+                Span::styled(
+                    a.activity.clone().unwrap_or_else(|| a.reason.clone()),
+                    panel.fg(color(detail)),
+                ),
+            ]));
+        }
+    };
+
+    if !d.needs_you.is_empty() {
+        heading(&mut out, "needs you");
+        agent_rows(&mut out, &d.needs_you, t.ui.warn);
+    }
+    if !d.finished.is_empty() {
+        heading(&mut out, "finished");
+        agent_rows(&mut out, &d.finished, t.ui.text_dim);
+    }
+    if !d.working.is_empty() {
+        heading(&mut out, "still working");
+        agent_rows(&mut out, &d.working, t.ui.text_dim);
+    }
+
+    if !d.tasks_done.is_empty() || d.tasks_added > 0 || d.tasks_open + d.tasks_claimed > 0 {
+        heading(&mut out, "board");
+        for task in &d.tasks_done {
+            let (glyph, gc) =
+                if task.dropped { ("✕", t.ui.error) } else { ("●", t.ui.ok) };
+            out.push(Line::from(vec![
+                Span::styled("  ".to_string(), panel),
+                Span::styled(format!("{glyph} "), panel.fg(color(gc))),
+                Span::styled(format!("#{:<3} ", task.id), panel.fg(color(t.ui.text_faint))),
+                Span::styled(
+                    truncate(&task.text, w.saturating_sub(22)),
+                    panel.fg(color(t.ui.text)),
+                ),
+                Span::styled(
+                    task.owner.as_ref().map(|o| format!("  [{o}]")).unwrap_or_default(),
+                    panel.fg(color(t.ui.text_faint)),
+                ),
+            ]));
+            if let Some(r) = &task.result {
+                for line in wrap_text(r, w.saturating_sub(10)) {
+                    out.push(Line::from(vec![
+                        Span::styled("       → ".to_string(), panel.fg(color(t.ui.text_faint))),
+                        Span::styled(line, panel.fg(color(t.ui.ok))),
+                    ]));
+                }
+            }
+        }
+        let mut standing = Vec::new();
+        if d.tasks_added > 0 {
+            standing.push(format!("{} added", d.tasks_added));
+        }
+        if d.tasks_open > 0 {
+            standing.push(format!("{} open", d.tasks_open));
+        }
+        if d.tasks_claimed > 0 {
+            standing.push(format!("{} claimed", d.tasks_claimed));
+        }
+        if !standing.is_empty() {
+            out.push(Line::from(vec![
+                Span::styled("  ".to_string(), panel),
+                Span::styled(standing.join(", "), panel.fg(color(t.ui.text_dim))),
+            ]));
+        }
+    }
+
+    if !d.messages.is_empty() {
+        let n = d.messages.len();
+        heading(&mut out, &if n == 1 { "bus · 1 message".into() } else { format!("bus · {n} messages") });
+        for m in &d.messages {
+            let (mark, mc) = match m.delivery {
+                Delivery::Delivered => ("✓", t.ui.ok),
+                Delivery::Queued => ("⧗", t.ui.warn),
+                Delivery::Dropped => ("✕", t.ui.error),
+            };
+            let route = match (m.expects_reply, m.reply_to, m.broadcast) {
+                (_, Some(n), _) => format!("re #{n} {} → {}", m.from, m.to),
+                (true, None, _) => format!("ask #{} {} → {}", m.id, m.from, m.to),
+                (_, _, true) => format!("{} → all", m.from),
+                _ => format!("{} → {}", m.from, m.to),
+            };
+            out.push(Line::from(vec![
+                Span::styled("  ".to_string(), panel),
+                Span::styled(format!("{mark} "), panel.fg(color(mc))),
+                Span::styled(format!("{route}: "), panel.fg(color(t.ui.accent_alt))),
+                Span::styled(
+                    truncate(&m.body.split_whitespace().collect::<Vec<_>>().join(" "),
+                             w.saturating_sub(route.chars().count() + 8)),
+                    panel.fg(color(t.ui.text)),
+                ),
+            ]));
+        }
+    }
+
+    if !d.gone.is_empty() {
+        heading(&mut out, "exited");
+        for name in &d.gone {
+            out.push(Line::from(vec![
+                Span::styled("  ".to_string(), panel),
+                Span::styled("✕ ".to_string(), panel.fg(color(t.ui.error))),
+                Span::styled(name.clone(), panel.fg(color(t.ui.text))),
+            ]));
+        }
+    }
+    if !d.warnings.is_empty() {
+        heading(&mut out, "warnings");
+        for warn in &d.warnings {
+            for line in wrap_text(warn, w.saturating_sub(4)) {
+                out.push(Line::from(vec![
+                    Span::styled("  ! ".to_string(), panel.fg(color(t.ui.warn))),
+                    Span::styled(line, panel.fg(color(t.ui.text))),
+                ]));
+            }
+        }
+    }
+
+    out
+}
+
+fn state_color(s: AgentState, t: &Theme) -> Rgb {
+    match s {
+        AgentState::Blocked => t.ui.warn,
+        AgentState::Working => t.ui.accent,
+        AgentState::Done => t.ui.ok,
+        _ => t.ui.text_dim,
+    }
+}
+
 pub fn toasts(f: &mut Frame, area: TRect, app: &App) {
     let theme = app.cfg.theme.clone();
     if app.toasts.is_empty() {
@@ -607,6 +833,7 @@ pub struct Item {
 mod tests {
     use super::*;
     use crate::config::Keymap;
+    use crate::proto::TaskLine;
 
     #[test]
     fn every_binding_gets_a_non_empty_description() {
@@ -625,5 +852,115 @@ mod tests {
             describe_action("split_right", &Action::Cmd(crate::proto::Cmd::SplitRight)),
             "split right"
         );
+    }
+
+    fn sample_digest() -> Digest {
+        Digest {
+            since: 0,
+            now: 2_520_000, // 42m
+            fresh: false,
+            needs_you: vec![AgentLine {
+                name: "reviewer".into(),
+                state: AgentState::Blocked,
+                elapsed: 720,
+                activity: None,
+                reason: "approval prompt".into(),
+            }],
+            finished: vec![AgentLine {
+                name: "builder".into(),
+                state: AgentState::Done,
+                elapsed: 240,
+                activity: Some("22 tools · 6 files".into()),
+                reason: "hook".into(),
+            }],
+            working: vec![],
+            gone: vec!["worker3".into()],
+            warnings: vec![],
+            tasks_done: vec![TaskLine {
+                id: 4,
+                text: "write the bus tests".into(),
+                owner: Some("builder".into()),
+                result: Some("18 tests added, all passing".into()),
+                dropped: false,
+            }],
+            tasks_added: 3,
+            tasks_open: 2,
+            tasks_claimed: 1,
+            messages: vec![],
+            turns: 2,
+        }
+    }
+
+    fn digest_text(d: &Digest, w: usize) -> String {
+        let t = Theme::horde();
+        digest_lines(d, w, &t)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_overlay_leads_with_what_needs_a_human() {
+        let out = digest_text(&sample_digest(), 70);
+        let needs = out.find("needs you").expect("a blocked agent must be reported");
+        let board = out.find("board").expect("the board section should be present");
+        assert!(needs < board, "stuck work comes before finished work:\n{out}");
+        assert!(out.contains("reviewer"), "{out}");
+        assert!(out.contains("approval prompt"), "{out}");
+    }
+
+    #[test]
+    fn task_results_are_shown_not_just_task_names() {
+        // The result is the whole point of asking what happened.
+        let out = digest_text(&sample_digest(), 70);
+        assert!(out.contains("write the bus tests"), "{out}");
+        assert!(out.contains("18 tests added, all passing"), "{out}");
+        assert!(out.contains("3 added, 2 open, 1 claimed"), "{out}");
+    }
+
+    #[test]
+    fn hook_activity_is_preferred_over_the_detection_reason() {
+        let out = digest_text(&sample_digest(), 70);
+        assert!(out.contains("22 tools · 6 files"), "{out}");
+        assert!(!out.contains("hook"), "the reason should give way to real activity:\n{out}");
+    }
+
+    #[test]
+    fn empty_sections_take_no_space() {
+        let mut d = sample_digest();
+        d.gone.clear();
+        let out = digest_text(&d, 70);
+        assert!(!out.contains("exited"), "{out}");
+        assert!(!out.contains("warnings"), "{out}");
+        // Match the heading, not the substring: a task called "write the bus tests" would
+        // otherwise look like a bus section.
+        assert!(
+            !out.lines().any(|l| l.starts_with("bus ")),
+            "no messages means no bus section:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_panel_still_produces_lines_and_never_panics() {
+        for w in [20usize, 30, 46, 70, 120] {
+            let out = digest_text(&sample_digest(), w);
+            assert!(out.contains("needs you"), "width {w}: {out}");
+        }
+    }
+
+    #[test]
+    fn ago_reads_at_the_coarsest_true_unit() {
+        assert_eq!(ago(0), "0s");
+        assert_eq!(ago(59_000), "59s");
+        assert_eq!(ago(2_520_000), "42m");
+        assert_eq!(ago(7_200_000), "2h");
+        assert_eq!(ago(180_000_000), "2d");
+    }
+
+    #[test]
+    fn the_digest_binding_is_described_in_prose() {
+        let d = describe_action("digest", &Action::Cmd(crate::proto::Cmd::RequestDigest));
+        assert!(d.contains("while you were away"), "{d}");
     }
 }

@@ -244,6 +244,7 @@ pub fn build(target: Target, snap: &Snapshot, prefix: &str) -> Level {
                 Item::new("Toggle sidebar", &k("e"), Act::Cmd(Cmd::ToggleSidebar)),
                 Item::new("Toggle bus drawer", &k("b"), Act::Cmd(Cmd::ToggleBus)),
                 Item::new("Next agent needing you", &k("a"), Act::Cmd(Cmd::JumpAttention)),
+                Item::new("What happened while away", &k("D"), Act::Cmd(Cmd::RequestDigest)),
                 Item::separator(),
                 Item::new("Settings…", &k("."), Act::Settings),
                 Item::new("Keys", &k("?"), Act::Help),

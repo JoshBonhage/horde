@@ -87,6 +87,9 @@ while you were away · 42m
 Reading it advances the window, so the next digest picks up where this one stopped. Use
 `--since 2h` to look further back and `--keep` to look without moving the window.
 
+Inside horde, `ctrl+b D` shows the same report in a scrollable panel — and on reattach a toast
+names the headline, so you know whether it is worth opening.
+
 ## Worth doing once
 
 ```sh

@@ -31,8 +31,8 @@ use crate::config::{Action, Chord, Config, Notify, Trigger};
 use crate::client::menu::{Act, Level, Prompt, Target};
 use crate::framing;
 use crate::proto::{
-    ClientFrame, Cmd, CursorPos, Message, NoticeLevel, PaneId, Row, ServerFrame, Snapshot, SpaceId,
-    TabId, PROTOCOL_VERSION,
+    ClientFrame, Cmd, CursorPos, Digest, Message, NoticeLevel, PaneId, Row, ServerFrame, Snapshot,
+    SpaceId, TabId, PROTOCOL_VERSION,
 };
 use ui::overlays::Item;
 use ui::sidebar::Hit;
@@ -59,6 +59,8 @@ pub enum Mode {
     Settings { cat: usize, sel: usize, capture: Option<String> },
     /// A context menu. The stack grows when a submenu opens so `esc` steps back out.
     Menu { stack: Vec<Level>, at: (u16, u16) },
+    /// The catch-up report. Scrollable, because a long absence produces a long digest.
+    Digest { scroll: usize },
 }
 
 /// What selecting a picker row does.
@@ -81,6 +83,8 @@ pub struct App {
     pub rows: HashMap<PaneId, Vec<Row>>,
     pub cursors: HashMap<PaneId, CursorPos>,
     pub bus: Vec<Message>,
+    /// The last digest the daemon sent, held while its overlay is open.
+    pub digest: Option<Digest>,
     pub mode: Mode,
     pub toasts: VecDeque<Toast>,
     pub tick: usize,
@@ -112,6 +116,7 @@ impl App {
             rows: HashMap::new(),
             cursors: HashMap::new(),
             bus: Vec::new(),
+            digest: None,
             mode: Mode::Terminal,
             toasts: VecDeque::new(),
             tick: 0,
@@ -414,6 +419,19 @@ async fn run_loop(
 /// Apply one server frame. Returns a reason string when the session must end.
 fn apply_frame(app: &mut App, frame: ServerFrame) -> Option<String> {
     match frame {
+        ServerFrame::Digest(d) => {
+            // Nothing to report is worth saying out loud rather than opening an empty panel.
+            if d.is_empty() {
+                let quiet = match d.working.len() {
+                    0 => "nothing has happened since you last looked".to_string(),
+                    n => format!("nothing new — {n} still working"),
+                };
+                app.toast(NoticeLevel::Info, quiet);
+            } else {
+                app.digest = Some(*d);
+                app.mode = Mode::Digest { scroll: 0 };
+            }
+        }
         ServerFrame::Snapshot(snap) => {
             // A daemon left over from an older build serves stale behaviour while looking
             // perfectly healthy, so say so loudly the first time we see it.
@@ -520,6 +538,31 @@ fn handle_key(
         Mode::Help => {
             // Any key closes help; there is nothing else to do in it.
             app.mode = Mode::Terminal;
+            return Ok(());
+        }
+        // Unlike help, the digest can be longer than the panel, so navigation keys have to
+        // scroll rather than dismiss.
+        Mode::Digest { scroll } => {
+            let page = 10;
+            match k.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.mode = Mode::Digest { scroll: scroll + 1 }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.mode = Mode::Digest { scroll: scroll.saturating_sub(1) }
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    app.mode = Mode::Digest { scroll: scroll + page }
+                }
+                KeyCode::PageUp => {
+                    app.mode = Mode::Digest { scroll: scroll.saturating_sub(page) }
+                }
+                KeyCode::Home => app.mode = Mode::Digest { scroll: 0 },
+                _ => {
+                    app.mode = Mode::Terminal;
+                    app.digest = None;
+                }
+            }
             return Ok(());
         }
         Mode::Palette { query, sel } => {
@@ -1004,6 +1047,7 @@ fn command_for(name: &str) -> Option<Cmd> {
         "toggle-sidebar" => Cmd::ToggleSidebar,
         "toggle-bus" => Cmd::ToggleBus,
         "jump-attention" => Cmd::JumpAttention,
+        "digest" => Cmd::RequestDigest,
         _ => return None,
     })
 }

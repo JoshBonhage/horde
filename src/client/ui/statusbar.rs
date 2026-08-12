@@ -156,6 +156,7 @@ impl Widget for StatusBar<'_> {
             Mode::Prompt { .. } => left.push(chip(" INPUT ", t.ui.accent_alt, t)),
             Mode::Menu { .. } => left.push(chip(" MENU ", t.ui.accent_alt, t)),
             Mode::Settings { .. } => left.push(chip(" SETTINGS ", t.ui.accent_alt, t)),
+            Mode::Digest { .. } => left.push(chip(" DIGEST ", t.ui.accent_alt, t)),
             Mode::Terminal => left.push(Span::styled(
                 format!(" {} ", self.prefix),
                 panel.fg(color(t.ui.text_faint)),

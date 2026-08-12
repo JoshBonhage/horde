@@ -287,6 +287,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             dim_area(f.buffer_mut(), area, &theme, 0.6);
             overlays::settings(f, area, app);
         }
+        Mode::Digest { .. } => {
+            dim_area(f.buffer_mut(), area, &theme, 0.6);
+            overlays::digest(f, area, app);
+        }
         Mode::Menu { .. } => {
             // A menu is a light touch on top of the session, not a modal takeover.
             dim_area(f.buffer_mut(), area, &theme, 0.25);
