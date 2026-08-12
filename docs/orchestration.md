@@ -139,13 +139,24 @@ delivered to reviewer
 queued for reviewer — it is busy or at a prompt; horde will deliver when it is free
 ```
 
-**Queued is not a failure.** horde refuses to type into a pane that is not sitting at its
-prompt, for two reasons:
+**Queued is not a failure.** horde refuses to type into a pane that cannot take the message
+cleanly right now:
 
 - If the target is `working`, typing would race whatever it is printing.
 - If the target is `blocked`, it is waiting on a **permission decision**. Your text plus a
   newline would *answer that prompt* — potentially approving a file write or a shell command
   nobody agreed to. horde will not do that.
+- If the target's terminal **is not accepting input** — its input queue is full because the
+  agent has stopped reading — the write would block. Since one thread serves every pane,
+  waiting on a wedged agent would freeze the whole session, so the message queues instead.
+- If the message is **longer than the target's terminal can take in one line**. A terminal in
+  canonical mode (a plain shell, or an agent that has not finished starting) caps a line at
+  about a kilobyte and silently discards the rest. Rather than deliver half a message and
+  report success, horde holds it — an agent that is still booting will be in raw mode a
+  moment later, and it goes out whole.
+
+Long messages are otherwise fine. Once an agent is running, its terminal is in raw mode,
+which has no line limit — verified at 60KB in one message, arriving byte for byte.
 
 Queued messages flush automatically the moment the target reaches its prompt, **one per
 pass** — each delivered message submits a prompt, so releasing the whole queue at once would
@@ -168,6 +179,10 @@ horde send reviewer "..." --now      # bypasses the gate
 This types into the pane regardless of state. Against a `blocked` agent it will answer the
 open permission prompt. Only use it when you know the target is at a prompt and horde's
 detection is wrong about it.
+
+`--now` overrides the *state* checks only. It cannot override the two physical limits above —
+forcing a write the terminal cannot accept would not deliver the message, it would lose it
+quietly or hang the daemon.
 
 ### A pane with no agent
 
