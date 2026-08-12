@@ -150,3 +150,23 @@ Two things help:
 
 A plain shell is a different case and not a bug: output already on screen was written for the old
 width and stays as it was drawn. The next prompt uses the new width.
+
+## `zsh: killed` on every horde command after a rebuild
+
+The install overwrote the binary the running daemon was executing. On macOS that leaves the file
+no longer matching its own code signature, and the kernel then refuses to exec it — `killed`, with
+exit status 137, and no other explanation.
+
+Reinstall onto a fresh inode:
+
+```bash
+rm -f ~/.local/bin/horde && cp target/release/horde ~/.local/bin/
+horde --version          # should print, not die
+```
+
+`rm` first is the whole fix: it unlinks the old file so the copy lands on a new inode, leaving the
+running daemon's mapped image untouched. `cp` alone writes into the inode that process is executing
+from, which corrupts both.
+
+Your session usually survives this — the daemon keeps running from pages it already has mapped.
+Check with `horde status`, and if it answers, `horde upgrade` still works once the binary does.
