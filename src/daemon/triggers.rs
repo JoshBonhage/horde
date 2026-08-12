@@ -6,7 +6,7 @@
 //! pulls when the room is empty.
 //!
 //! Which is a much larger promise than it sounds, so almost all of this file is about *not*
-//! firing. The mechanism is a timestamp comparison; the engineering is six guards:
+//! firing. The mechanism is a timestamp comparison; the engineering is the guards:
 //!
 //! - **A master switch, off by default.** A fresh install never acts on its own.
 //! - **One piece of work in flight per trigger.** A daily task still sitting on the board is
@@ -14,6 +14,11 @@
 //! - **A floor on the interval**, so `every 1s` cannot be asked for.
 //! - **A ceiling on firings per hour**, across all triggers — because agents can create these,
 //!   so the failure mode is not one bad rule but fifty.
+//! - **A cap on agents horde started**, counted live so a finished one frees its slot. This is
+//!   the number of full-permission agents that can be working with nobody present.
+//! - **No rule-making by machine-started agents** (enforced in [`super::rpc`], where the calling
+//!   pane is known). Agents creating rules is useful; rules creating agents that create rules has
+//!   no human anywhere in it.
 //! - **A failed action still counts as a firing**, or a broken trigger retries every tick
 //!   forever.
 //! - **Everything is journaled**, because a machine that acts while you are away is only
@@ -55,9 +60,28 @@ pub enum When {
     /// Every `secs` seconds, counted from the last firing rather than from a fixed grid, so a
     /// slow action cannot cause the next one to be due the moment it finishes.
     Every { secs: u64 },
-    /// Daily, at a local wall-clock time.
-    At { hour: u32, min: u32 },
+    /// At a local wall-clock time, on the days named by `days`.
+    ///
+    /// `days` is a bitmask, bit 0 Sunday through bit 6 Saturday, matching `tm_wday` so the
+    /// check is a shift rather than a table. Defaulted to every day, so rules written before
+    /// this field existed replay unchanged.
+    At {
+        hour: u32,
+        min: u32,
+        #[serde(default = "every_day")]
+        days: u8,
+    },
 }
+
+/// All seven bits set — what `--at` means without `--days`.
+pub const EVERY_DAY: u8 = 0b0111_1111;
+
+fn every_day() -> u8 {
+    EVERY_DAY
+}
+
+/// Sunday first, to match `tm_wday`.
+const DAY_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
 /// What a trigger does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,15 +92,45 @@ pub enum What {
     /// Push a line at one named agent. Bypasses the board, so it also bypasses everything the
     /// board guarantees — worth it only when the work belongs to a specific agent.
     Send { to: String, body: String },
+    /// Start an agent.
+    ///
+    /// The one action that changes what horde is rather than what it does: an agent started
+    /// with nobody present runs its tool calls with nobody to approve them. horde does not
+    /// choose the posture — `cmd` is yours, flags and all — it only bounds how many of these
+    /// can exist at once and records which ones it started.
+    ///
+    /// Usually paired with a board task rather than used alone: a spawned agent sitting at a
+    /// prompt does nothing until the nudge tells it there is work waiting.
+    Spawn { cmd: String, name: Option<String> },
 }
 
 impl When {
     pub fn describe(&self) -> String {
         match self {
             When::Every { secs } => format!("every {}", secs_words(*secs)),
-            When::At { hour, min } => format!("at {hour:02}:{min:02}"),
+            When::At { hour, min, days } => match describe_days(*days) {
+                Some(d) => format!("at {hour:02}:{min:02} {d}"),
+                None => format!("at {hour:02}:{min:02}"),
+            },
         }
     }
+}
+
+/// `mon–fri`, `sat,sun`, or `None` for every day — which needs no saying.
+fn describe_days(days: u8) -> Option<String> {
+    if days & EVERY_DAY == EVERY_DAY {
+        return None;
+    }
+    let set: Vec<usize> = (0..7).filter(|i| days & (1 << i) != 0).collect();
+    if set.is_empty() {
+        return Some("never".to_string());
+    }
+    // Contiguous runs read as a range, which is how they were almost certainly written.
+    let contiguous = set.windows(2).all(|w| w[1] == w[0] + 1);
+    if contiguous && set.len() > 2 {
+        return Some(format!("{}–{}", DAY_NAMES[set[0]], DAY_NAMES[set[set.len() - 1]]));
+    }
+    Some(set.iter().map(|i| DAY_NAMES[*i]).collect::<Vec<_>>().join(","))
 }
 
 impl What {
@@ -84,6 +138,10 @@ impl What {
         match self {
             What::Task { text } => format!("board: {text}"),
             What::Send { to, body } => format!("send {to}: {body}"),
+            What::Spawn { cmd, name } => match name {
+                Some(n) => format!("spawn {cmd} as {n}"),
+                None => format!("spawn {cmd}"),
+            },
         }
     }
 }
@@ -123,9 +181,13 @@ impl Trigger {
             // Late rather than skipped: if the daemon was down at nine, a trigger that has not
             // run since before nine still runs when it comes back. Being told at eleven that
             // yesterday's diff wants reviewing beats never being told.
-            When::At { hour, min } => {
+            //
+            // With `days` set, the day filter wins over lateness. A weekday rule that was
+            // missed on Friday does not fire on Saturday — running late is a courtesy, running
+            // on a day you excluded is disobeying the rule.
+            When::At { hour, min, days } => {
                 let occurrence = last_occurrence(now, *hour, *min);
-                self.baseline() < occurrence
+                day_allowed(occurrence, *days) && self.baseline() < occurrence
             }
         }
     }
@@ -401,16 +463,52 @@ fn perform(eng: &mut Engine, t: &Trigger) -> Result<(String, Vec<Event>)> {
             let m = bus.send(session, &cfg, None, to, body, false, false, None)?;
             Ok((format!("sent to {}", m.to), vec![Event::BusMessage(m)]))
         }
+        What::Spawn { cmd, name } => {
+            // The cap counts what horde is *currently* running, not what it has ever run, so a
+            // spawned agent that finishes and exits gives its slot back.
+            let live = live_spawned(eng);
+            let cap = eng.cfg.max_spawned;
+            if live >= cap {
+                return Err(anyhow!(
+                    "already running {live} agent{} horde started, and the cap is {cap} \
+                     (triggers.max_spawned)",
+                    if live == 1 { "" } else { "s" }
+                ));
+            }
+            let cfg = eng.cfg.clone();
+            let pane = eng.session.split(&cfg, None, crate::proto::Dir::Right, Some(cmd))?;
+            if let Some(p) = eng.session.panes.get_mut(&pane) {
+                p.name = name.clone();
+                // Stamped before anything else can look: the cap and the depth guard both read
+                // this, and a pane that exists without it is a pane horde thinks you started.
+                p.spawned_by = Some(t.id);
+            }
+            eng.touch();
+            eng.detect_now();
+            let who = name.clone().unwrap_or_else(|| format!("pane{pane}"));
+            Ok((format!("spawned {who} running {cmd}"), Vec::new()))
+        }
     }
+}
+
+/// Agents horde started that are still running.
+pub fn live_spawned(eng: &Engine) -> usize {
+    eng.session.panes.values().filter(|p| p.spawned_by.is_some() && p.exited.is_none()).count()
 }
 
 // ---------------------------------------------------------------------------
 // Time
 // ---------------------------------------------------------------------------
 
+/// Whether `when` lands on a day the rule allows.
+fn day_allowed(when: u64, days: u8) -> bool {
+    let (_, _, _, wday) = local_parts(when);
+    days & (1 << wday) != 0
+}
+
 /// The most recent time today's — or yesterday's — `hour:min` came round, in unix millis.
 fn last_occurrence(now: u64, hour: u32, min: u32) -> u64 {
-    let (h, m, s) = local_hms(now);
+    let (h, m, s, _) = local_parts(now);
     let since_midnight = (h as u64 * 3600 + m as u64 * 60 + s as u64) * 1000;
     let midnight = now.saturating_sub(since_midnight);
     let target = midnight + (hour as u64 * 3600 + min as u64 * 60) * 1000;
@@ -423,18 +521,21 @@ fn last_occurrence(now: u64, hour: u32, min: u32) -> u64 {
     }
 }
 
-/// Local wall-clock `(hour, minute, second)`. `at 09:00` has to mean nine where you are, and
-/// the log's UTC clock is not good enough for that.
-fn local_hms(ms: u64) -> (u32, u32, u32) {
+/// Local `(hour, minute, second, weekday)`, weekday Sunday-zero.
+///
+/// `at 09:00 mon–fri` has to mean nine where you are, on the days you mean; the log's UTC clock
+/// is not good enough for either half.
+fn local_parts(ms: u64) -> (u32, u32, u32, u32) {
     let t = (ms / 1000) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: `localtime_r` writes only the `tm` we hand it, which is the reentrant form's
     // whole point. On failure it returns null and leaves the zeroed struct, which reads as
-    // midnight — wrong, but bounded, and it cannot fail for a value that came from the clock.
+    // midnight on a Sunday — wrong, but bounded, and it cannot fail for a value that came from
+    // the clock.
     unsafe {
         libc::localtime_r(&t, &mut tm);
     }
-    (tm.tm_hour as u32, tm.tm_min as u32, tm.tm_sec as u32)
+    (tm.tm_hour as u32, tm.tm_min as u32, tm.tm_sec as u32, tm.tm_wday as u32)
 }
 
 /// `30m`, `2h`, `1d` — how a schedule reads back to the person who set it.
@@ -463,6 +564,43 @@ pub fn parse_every(spec: &str) -> Result<When> {
     Ok(When::Every { secs })
 }
 
+/// `mon-fri`, `mon,wed,fri`, `sat`, `daily`. Returns the day bitmask.
+pub fn parse_days(spec: &str) -> Result<u8> {
+    let spec = spec.trim().to_lowercase();
+    if spec.is_empty() || spec == "daily" || spec == "all" {
+        return Ok(EVERY_DAY);
+    }
+    let day = |name: &str| -> Result<usize> {
+        // Three letters is the whole vocabulary, but accept longer forms by their prefix so
+        // `monday` and `mon` mean the same thing.
+        let n = name.trim();
+        DAY_NAMES
+            .iter()
+            .position(|d| n == *d || (n.len() > 3 && n.starts_with(*d)))
+            .ok_or_else(|| anyhow!("cannot read {n:?} as a day — try mon-fri, or sat,sun"))
+    };
+
+    let mut mask = 0u8;
+    for part in spec.split(',') {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (from, to) = (day(a)?, day(b)?);
+                // Wrapping ranges are what `fri-mon` has to mean; walking forward modulo seven
+                // handles both directions without a special case.
+                let span = (to + 7 - from) % 7;
+                for i in 0..=span {
+                    mask |= 1 << ((from + i) % 7);
+                }
+            }
+            None => mask |= 1 << day(part)?,
+        }
+    }
+    if mask == 0 {
+        return Err(anyhow!("{spec:?} names no days"));
+    }
+    Ok(mask)
+}
+
 /// `9:00`, `09:00`, `21:30`. Local time.
 pub fn parse_at(spec: &str) -> Result<When> {
     let spec = spec.trim();
@@ -480,7 +618,7 @@ pub fn parse_at(spec: &str) -> Result<When> {
     if hour > 23 || min > 59 {
         return Err(anyhow!("{spec:?} is not a time of day — hours are 0–23, minutes 0–59"));
     }
-    Ok(When::At { hour, min })
+    Ok(When::At { hour, min, days: EVERY_DAY })
 }
 
 #[cfg(test)]
@@ -525,6 +663,13 @@ mod tests {
         });
     }
 
+    /// Stop every pane, so a test that spawned one leaves no process behind.
+    fn kill_panes(e: &mut Engine) {
+        for p in e.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
     /// Whether any event is a warning mentioning `word`.
     fn warned_about(events: &[Event], word: &str) -> bool {
         events
@@ -546,7 +691,8 @@ mod tests {
     fn triggers_are_numbered_and_enabled_when_added() {
         let mut s = store("add");
         let a = s.add(When::Every { secs: 1800 }, task_what(), "user").unwrap();
-        let b = s.add(When::At { hour: 9, min: 0 }, task_what(), "builder").unwrap();
+        let at9 = When::At { hour: 9, min: 0, days: EVERY_DAY };
+        let b = s.add(at9, task_what(), "builder").unwrap();
         assert_eq!((a.id, b.id), (1, 2));
         assert!(a.enabled);
         assert_eq!(b.by, "builder");
@@ -590,13 +736,13 @@ mod tests {
         {
             let mut s = Store::new(p.clone());
             s.add(When::Every { secs: 1800 }, task_what(), "user").unwrap();
-            s.add(When::At { hour: 9, min: 30 }, task_what(), "user").unwrap();
+            s.add(When::At { hour: 9, min: 30, days: EVERY_DAY }, task_what(), "user").unwrap();
             s.set_enabled(1, false).unwrap();
         }
         let mut s = Store::new(p.clone());
         assert_eq!(s.count(), 2);
         assert!(!s.get(1).unwrap().enabled, "off has to survive too, or a restart re-arms it");
-        assert_eq!(s.get(2).unwrap().when, When::At { hour: 9, min: 30 });
+        assert_eq!(s.get(2).unwrap().when, When::At { hour: 9, min: 30, days: EVERY_DAY });
         // Ids do not restart, so a replayed log cannot collide with a new rule.
         assert_eq!(s.add(When::Every { secs: 60 }, task_what(), "user").unwrap().id, 3);
         let _ = std::fs::remove_file(&p);
@@ -629,12 +775,12 @@ mod tests {
     #[test]
     fn a_new_daily_trigger_does_not_fire_for_a_time_already_past() {
         let now = super::super::now_millis();
-        let (h, _, _) = local_hms(now);
+        let (h, _, _, _) = local_parts(now);
         // An hour that has already come round today, whatever time the test runs.
         let past = if h == 0 { 0 } else { h - 1 };
         let t = Trigger {
             id: 1,
-            when: When::At { hour: past, min: 0 },
+            when: When::At { hour: past, min: 0, days: EVERY_DAY },
             what: task_what(),
             enabled: true,
             created: now,
@@ -654,11 +800,11 @@ mod tests {
     #[test]
     fn a_daily_trigger_fires_once_per_day() {
         let now = super::super::now_millis();
-        let (h, _, _) = local_hms(now);
+        let (h, _, _, _) = local_parts(now);
         let past = if h == 0 { 0 } else { h - 1 };
         let mut t = Trigger {
             id: 1,
-            when: When::At { hour: past, min: 0 },
+            when: When::At { hour: past, min: 0, days: EVERY_DAY },
             what: task_what(),
             enabled: true,
             created: now - 86_400_000,
@@ -674,9 +820,72 @@ mod tests {
     }
 
     #[test]
+    fn days_parse_as_lists_ranges_and_wrapping_ranges() {
+        let bit = |i: u32| 1u8 << i;
+        assert_eq!(parse_days("mon-fri").unwrap(), bit(1) | bit(2) | bit(3) | bit(4) | bit(5));
+        assert_eq!(parse_days("sat,sun").unwrap(), bit(6) | bit(0));
+        assert_eq!(parse_days("mon,wed,fri").unwrap(), bit(1) | bit(3) | bit(5));
+        assert_eq!(parse_days("daily").unwrap(), EVERY_DAY);
+        assert_eq!(parse_days("monday").unwrap(), bit(1), "longer forms match by prefix");
+        // `fri-mon` has to mean the weekend, not nothing.
+        assert_eq!(parse_days("fri-mon").unwrap(), bit(5) | bit(6) | bit(0) | bit(1));
+        assert!(parse_days("funday").is_err());
+    }
+
+    /// A weekday rule must not fire at the weekend, which is the whole point of asking.
+    #[test]
+    fn a_day_filter_keeps_a_rule_off_the_days_it_excludes() {
+        let now = super::super::now_millis();
+        let (h, _, _, wday) = local_parts(now);
+        let past = if h == 0 { 0 } else { h - 1 };
+        let today = 1u8 << wday;
+
+        let base = Trigger {
+            id: 1,
+            when: When::At { hour: past, min: 0, days: today },
+            what: task_what(),
+            enabled: true,
+            created: now - 86_400_000,
+            by: "user".into(),
+            last_fired: None,
+            fire_count: 0,
+            deleted: false,
+        };
+        assert!(base.is_due(now), "today is allowed, and the hour has passed");
+
+        // Every day except today.
+        let t = Trigger {
+            when: When::At { hour: past, min: 0, days: EVERY_DAY & !today },
+            ..base.clone()
+        };
+        assert!(!t.is_due(now), "the excluded day wins over the elapsed hour");
+    }
+
+    #[test]
+    fn a_day_filter_reads_back_the_way_it_was_written() {
+        let days = parse_days("mon-fri").unwrap();
+        assert_eq!(When::At { hour: 9, min: 0, days }.describe(), "at 09:00 mon–fri");
+        let days = parse_days("sat,sun").unwrap();
+        assert_eq!(When::At { hour: 9, min: 0, days }.describe(), "at 09:00 sun,sat");
+        // Every day needs no saying.
+        assert_eq!(When::At { hour: 9, min: 0, days: EVERY_DAY }.describe(), "at 09:00");
+    }
+
+    /// Rules written before the day filter existed have to keep working.
+    #[test]
+    fn a_daily_rule_from_before_days_existed_replays_as_every_day() {
+        let line = r#"{"id":1,"when":{"kind":"at","hour":9,"min":0},
+            "what":{"kind":"task","text":"x"},"enabled":true,"created":0,"by":"user",
+            "last_fired":null,"fire_count":0}"#
+            .replace('\n', "");
+        let t: Trigger = serde_json::from_str(&line).expect("an old entry must still parse");
+        assert_eq!(t.when, When::At { hour: 9, min: 0, days: EVERY_DAY });
+    }
+
+    #[test]
     fn a_time_of_day_is_read_in_local_time() {
-        assert_eq!(parse_at("09:00").unwrap(), When::At { hour: 9, min: 0 });
-        assert_eq!(parse_at(" 21:30 ").unwrap(), When::At { hour: 21, min: 30 });
+        assert_eq!(parse_at("09:00").unwrap(), When::At { hour: 9, min: 0, days: EVERY_DAY });
+        assert_eq!(parse_at(" 21:30 ").unwrap(), When::At { hour: 21, min: 30, days: EVERY_DAY });
         assert!(parse_at("9am").is_err());
         assert!(parse_at("25:00").is_err());
         assert!(parse_at("09:71").is_err());
@@ -684,7 +893,7 @@ mod tests {
         // The occurrence lands on the requested local hour, which is the whole point of not
         // using the UTC clock the log lines use.
         let now = super::super::now_millis();
-        let (h, m, _) = local_hms(last_occurrence(now, 9, 0));
+        let (h, m, _, _) = local_parts(last_occurrence(now, 9, 0));
         assert_eq!((h, m), (9, 0));
     }
 
@@ -843,13 +1052,92 @@ mod tests {
         assert!(sent, "{events:?}");
     }
 
+    // -- spawning -------------------------------------------------------
+    // The action that changes what horde is rather than what it does, so what is pinned here is
+    // the bound on it and the record of it.
+
+    fn spawn_what() -> What {
+        // A shell, not a real agent: this exercises the pane and the provenance, and starting
+        // `claude` in a unit test would be neither fast nor polite.
+        What::Spawn { cmd: "cat".into(), name: Some("nightly".into()) }
+    }
+
+    #[test]
+    fn a_spawn_trigger_starts_an_agent_and_stamps_where_it_came_from() {
+        let mut e = eng("spawn");
+        let before = e.session.panes.len();
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user").unwrap();
+        wind_back(&mut e, 1, 120_000);
+        fire_due(&mut e);
+
+        assert_eq!(e.session.panes.len(), before + 1, "a pane should have appeared");
+        let spawned: Vec<_> =
+            e.session.panes.values().filter(|p| p.spawned_by == Some(1)).collect();
+        assert_eq!(spawned.len(), 1, "and it must carry the trigger that started it");
+        assert_eq!(spawned[0].name.as_deref(), Some("nightly"));
+        assert_eq!(live_spawned(&e), 1);
+        assert!(fired(&e)[0].contains("spawned nightly"), "{:?}", fired(&e));
+        kill_panes(&mut e);
+    }
+
+    /// The bound on how many full-permission agents can be working with nobody present.
+    #[test]
+    fn the_spawn_cap_refuses_loudly_rather_than_quietly() {
+        let mut e = eng("cap");
+        e.cfg.max_spawned = 1;
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user").unwrap();
+
+        wind_back(&mut e, 1, 120_000);
+        fire_due(&mut e);
+        assert_eq!(live_spawned(&e), 1);
+
+        // Due again, cap full: a warning, and no second agent.
+        wind_back(&mut e, 1, 120_000);
+        let events = fire_due(&mut e);
+        assert_eq!(live_spawned(&e), 1, "the cap holds");
+        assert!(warned_about(&events, "cap is 1"), "{events:?}");
+        // Spent, so it warns once per interval rather than once per tick.
+        assert_eq!(e.triggers.get(1).unwrap().fire_count, 2);
+        kill_panes(&mut e);
+    }
+
+    /// A spawned agent that finishes gives its slot back — the cap counts what is running, not
+    /// what has ever run.
+    #[test]
+    fn a_departed_agent_frees_its_slot() {
+        let mut e = eng("slot");
+        e.cfg.max_spawned = 1;
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user").unwrap();
+        wind_back(&mut e, 1, 120_000);
+        fire_due(&mut e);
+        assert_eq!(live_spawned(&e), 1);
+
+        // Marked exited rather than removed from the map: dropping a pane without touching the
+        // layout tree leaves the tree pointing at it, and the next split has no valid target.
+        // This is also the state a real exit passes through before it is reaped.
+        let id = *e
+            .session
+            .panes
+            .iter()
+            .find(|(_, p)| p.spawned_by.is_some())
+            .map(|(id, _)| id)
+            .unwrap();
+        e.session.panes.get_mut(&id).unwrap().exited = Some(0);
+        assert_eq!(live_spawned(&e), 0, "a finished agent holds no slot");
+
+        wind_back(&mut e, 1, 120_000);
+        fire_due(&mut e);
+        assert_eq!(live_spawned(&e), 1, "the schedule resumes once a slot is free");
+        kill_panes(&mut e);
+    }
+
     #[test]
     fn descriptions_read_back_the_way_they_were_written() {
         assert_eq!(When::Every { secs: 1800 }.describe(), "every 30m");
         assert_eq!(When::Every { secs: 7200 }.describe(), "every 2h");
         assert_eq!(When::Every { secs: 86_400 }.describe(), "every 1d");
         assert_eq!(When::Every { secs: 90 }.describe(), "every 90s");
-        assert_eq!(When::At { hour: 9, min: 0 }.describe(), "at 09:00");
+        assert_eq!(When::At { hour: 9, min: 0, days: EVERY_DAY }.describe(), "at 09:00");
         assert_eq!(task_what().describe(), "board: review yesterday's diff");
     }
 }

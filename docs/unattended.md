@@ -39,8 +39,9 @@ to remember rather than see.
 
 ```bash
 horde trigger add --every 30m --task "run the tests, report anything failing"
-horde trigger add --at 09:00 --task "review yesterday's diff for anything broken"
+horde trigger add --at 09:00 --days mon-fri --task "review yesterday's diff"
 horde trigger add --every 2h  --to reviewer --body "anything outstanding?"
+horde trigger add --at 02:00 --spawn claude --name nightly
 
 horde trigger list           # every rule, when it last fired, what it does
 horde trigger fire 1         # run one now, whatever its schedule says
@@ -56,6 +57,48 @@ agents adds throughput with no change to the rule.
 
 `--to` pushes a line at one named agent instead. It bypasses the board, so it also bypasses
 everything the board guarantees; worth it only when the work genuinely belongs to that agent.
+
+`--spawn` starts an agent — see [spawning](#spawning), which is a bigger decision than the other
+two put together.
+
+### Days
+
+`--days` takes lists, ranges, and wrapping ranges: `mon-fri`, `sat,sun`, `mon,wed,fri`,
+`fri-mon`. Without it, `--at` means every day.
+
+The day filter beats lateness. A weekday rule missed on Friday does **not** fire on Saturday:
+running late is a courtesy, running on a day you excluded is disobeying the rule.
+
+### Spawning
+
+```bash
+horde trigger add --at 02:00 --spawn claude --name nightly
+```
+
+This is the action that changes what horde *is* rather than what it does. An agent started with
+nobody present runs its tool calls with nobody to approve them.
+
+horde does not choose the posture for you — `--spawn` takes your command, flags and all, so
+whether that agent can write to disk is your decision and not horde's. What horde does instead:
+
+- **Bounds how many.** `triggers.max_spawned` (default 2, clamped to 16) limits agents horde is
+  *currently* running. One that finishes and exits gives its slot back. Hitting the cap is a
+  warning, not a silent no-op.
+- **Records which ones.** Every spawned pane carries the trigger that started it, and
+  `horde roster` says so: `nightly  idle  4m  [by trigger #3]`. That survives a daemon restart
+  and a `horde upgrade`, because provenance you can launder is not provenance.
+- **Refuses the loop.** A machine-started agent cannot create triggers. Agents creating rules is
+  useful; rules creating agents that create rules has no human anywhere in it.
+
+**Spawn alone does nothing useful.** A fresh agent sits at a prompt. Pair it with work:
+
+```bash
+horde trigger add --at 02:00 --task  "run the full suite and fix what fails"
+horde trigger add --at 02:01 --spawn claude --name nightly
+```
+
+The task lands on the board; the spawned agent gets nudged about it a moment later and claims it.
+That ordering is the whole pattern — the rule never has to know who is free.
 
 ### `horde trigger fire`
 
@@ -76,6 +119,8 @@ The mechanism is a timestamp comparison. The engineering is the guards:
 | One piece of work in flight per rule | Yesterday's task still on the board is the reason not to add today's. A skip does **not** spend the interval, so the next one goes as soon as the board clears. |
 | 60s floor on `--every` | Anything faster is a busy-wait with extra steps. |
 | 12 firings per rolling hour, across all rules | Agents can create triggers, so the failure mode is not one bad rule but fifty. Hitting it warns once an hour rather than silently doing nothing. |
+| `max_spawned` agents horde started | The number of full-permission agents that can work with nobody present. Counted live, so a finished one frees its slot. |
+| No rule-making by machine-started agents | Rules creating agents that create rules has no human anywhere in it. |
 | A failed action still counts as a firing | A rule pointing at an agent that no longer exists would otherwise retry every 150ms for as long as you are away. |
 
 ### Reading back what it did

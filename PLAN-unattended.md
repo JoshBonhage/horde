@@ -192,7 +192,41 @@ what it produced, what it was refused by. This section is the feature, not the c
 there too — that the machine is *allowed to act on its own* should never be something you have
 to remember rather than see.
 
-## Phase 3 — spawning
+## Phase 3 — spawning — **shipped**
+
+`What::Spawn { cmd, name }`, `triggers.max_spawned` (default 2, clamped 0–16), `spawned_by` on the
+pane, and the depth guard in `rpc.rs` where the calling pane is known.
+
+Also shipped, out of order because it was twenty lines and cron users expect it: `--days` on
+`--at`, taking lists, ranges and wrapping ranges (`mon-fri`, `sat,sun`, `fri-mon`) as a bitmask
+matching `tm_wday`, defaulted so rules written before the field existed replay unchanged. The day
+filter beats lateness — a weekday rule missed on Friday does not fire on Saturday, because running
+late is a courtesy and running on an excluded day is disobeying the rule.
+
+**Provenance turned out to be the whole job.** `spawned_by` has to survive three separate paths or
+both guards that read it quietly stop working:
+
+- `persist.rs` — `restore = true` would otherwise bring a machine-started agent back as one horde
+  thinks you started, freeing a cap slot *and* re-granting it the right to create triggers.
+- `handoff.rs` — `horde upgrade` would launder it the same way, mid-session.
+- `PaneInfo` — so `horde roster` can say `[by trigger #3]`.
+
+Provenance you can launder is not provenance, and two of those three paths are ones you'd only
+notice were wrong weeks later.
+
+The cap counts *live* spawned panes, so a finished agent frees its slot. Hitting it is a warning
+that still spends the interval — the alternative retries every 150ms and warns every time.
+
+Verified end-to-end: rules parse and read back (`at 09:00 mon–fri · board: …`), a fired spawn
+carries `spawned_by`, the cap refuses loudly at 1, the depth guard refuses `trigger.add` from the
+spawned pane by name, and provenance survived a full daemon restart.
+
+One bug the end-to-end run caught that no test would have: a Rust line-continuation backslash
+eaten by the shell heredoc that generated the edit, leaving twenty spaces inside an error message.
+Tests assert on `contains`, so they were all perfectly happy. Reading the actual output is not
+optional.
+
+## Phase 3 as planned
 
 - `What::Spawn { cmd, name }`, with `max_triggered_agents` as a hard global cap.
 - **Pane provenance.** `spawned_by: Option<TriggerId>` on the pane, which the cap counts and the

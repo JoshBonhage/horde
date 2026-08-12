@@ -132,6 +132,12 @@ pub struct Pane {
     pub exited: Option<i32>,
     /// Set once detection identifies an agent running here.
     pub agent: Option<super::state::AgentRuntime>,
+    /// The trigger that started this pane, when horde started it rather than you.
+    ///
+    /// Two things read it, and both stop working without it: the cap on how many agents horde
+    /// may run unattended, and the refusal to let a machine-started agent create more triggers.
+    /// Distinguishing the fleet you built from the fleet the machine built is not cosmetic.
+    pub spawned_by: Option<u64>,
 
     term: Term<EventProxy>,
     parser: Processor,
@@ -227,6 +233,7 @@ impl Pane {
             rows,
             exited: None,
             agent: None,
+            spawned_by: None,
             term,
             parser: Processor::new(),
             master,
@@ -577,6 +584,7 @@ impl Pane {
                     session_id: a.session_id.clone(),
                     queued: a.queued.clone(),
                 }),
+                spawned_by: self.spawned_by,
                 screen: self.mirror.clone(),
                 pending,
                 cursor_x: cursor.x,
@@ -622,6 +630,7 @@ impl Pane {
             cols: saved.cols,
             rows: saved.rows,
             exited: None,
+            spawned_by: saved.spawned_by,
             agent: saved.agent.as_ref().map(|a| super::state::AgentRuntime {
                 kind: a.kind.clone(),
                 name: a.name.clone(),

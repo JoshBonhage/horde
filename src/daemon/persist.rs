@@ -71,6 +71,11 @@ pub struct SavedPane {
     /// Agent kind detected when the state was saved, used to pick a resume command.
     pub agent_kind: Option<String>,
     pub agent_session: Option<String>,
+    /// The trigger that started this pane. Restored, or `restore = true` would bring a
+    /// machine-started agent back as one horde thinks you started — freeing a slot under the
+    /// unattended cap and re-granting it the right to create triggers.
+    #[serde(default)]
+    pub spawned_by: Option<u64>,
 }
 
 pub fn save(eng: &Engine, path: &Path) -> Result<()> {
@@ -129,6 +134,7 @@ fn save_node(eng: &Engine, n: &Node) -> SavedNode {
                 name: p.and_then(|p| p.name.clone()),
                 agent_kind: p.and_then(|p| p.agent.as_ref().map(|a| a.kind.clone())),
                 agent_session: p.and_then(|p| p.agent.as_ref().and_then(|a| a.session_id.clone())),
+                spawned_by: p.and_then(|p| p.spawned_by),
             })
         }
         Node::Split { axis, ratio, a, b, .. } => SavedNode::Split {
@@ -191,8 +197,9 @@ pub fn restore(eng: &mut Engine, saved: SavedState) -> Result<()> {
                     }
                 };
                 let id = eng.session.spawn_pane_public(&cfg, space_id, tab_id, &cmd, &leaf_cwd)?;
-                if let (Some(n), Some(p)) = (leaf.name.clone(), eng.session.panes.get_mut(&id)) {
-                    p.name = Some(n);
+                if let Some(p) = eng.session.panes.get_mut(&id) {
+                    p.name = leaf.name.clone();
+                    p.spawned_by = leaf.spawned_by;
                 }
                 ids.push(id);
             }
@@ -358,6 +365,7 @@ mod tests {
                 name: None,
                 agent_kind: None,
                 agent_session: None,
+                spawned_by: None,
             })),
             b: Box::new(SavedNode::Split {
                 horizontal: false,
@@ -368,6 +376,7 @@ mod tests {
                     name: None,
                     agent_kind: None,
                     agent_session: None,
+                    spawned_by: None,
                 })),
                 b: Box::new(SavedNode::Leaf(SavedPane {
                     cmd: "zsh".into(),
@@ -375,6 +384,7 @@ mod tests {
                     name: None,
                     agent_kind: None,
                     agent_session: None,
+                    spawned_by: None,
                 })),
             }),
         };
@@ -407,6 +417,7 @@ mod tests {
             name: None,
             agent_kind: Some("claude".into()),
             agent_session: Some("abc123".into()),
+            spawned_by: None,
         };
         assert_eq!(restore_command(&cfg, &with_session), "claude --resume abc123");
 
@@ -421,6 +432,7 @@ mod tests {
             name: None,
             agent_kind: Some("someagent".into()),
             agent_session: Some("abc123".into()),
+            spawned_by: None,
         };
         assert_eq!(restore_command(&cfg, &unknown_agent), "/bin/zsh");
 
@@ -433,6 +445,7 @@ mod tests {
             name: None,
             agent_kind: Some("claude".into()),
             agent_session: Some("abc123".into()),
+            spawned_by: None,
         };
         assert_eq!(restore_command(&cfg, &with_session), "/bin/zsh");
 
@@ -443,6 +456,7 @@ mod tests {
             name: None,
             agent_kind: None,
             agent_session: None,
+            spawned_by: None,
         };
         assert_eq!(restore_command(&cfg, &shell), "zsh");
     }
