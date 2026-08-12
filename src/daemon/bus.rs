@@ -40,7 +40,6 @@
 //! deliver the message, it loses it quietly or hangs the daemon.
 
 use std::collections::VecDeque;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -63,7 +62,7 @@ const RING: usize = 500;
 pub const SUBMIT_DELAY: Duration = Duration::from_millis(120);
 
 pub struct Bus {
-    log_path: PathBuf,
+    log: super::logfile::AppendLog,
     messages: VecDeque<Message>,
     next_id: u64,
     /// Messages that were still queued when the last daemon stopped.
@@ -100,7 +99,7 @@ impl Bus {
                 orphaned.len()
             ));
         }
-        Bus { log_path, messages, next_id, orphaned }
+        Bus { log: super::logfile::AppendLog::new(log_path), messages, next_id, orphaned }
     }
 
     /// How many recovered messages are still waiting for their target to come back.
@@ -454,15 +453,15 @@ impl Bus {
         }
     }
 
-    fn append_log(&self, msg: &Message) {
-        if let Some(p) = self.log_path.parent() {
-            let _ = std::fs::create_dir_all(p);
+    fn append_log(&mut self, msg: &Message) {
+        if let Ok(line) = serde_json::to_string(msg) {
+            self.log.append_line(&line);
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.log_path)
-        {
-            if let Ok(line) = serde_json::to_string(msg) {
-                let _ = writeln!(f, "{line}");
-            }
+        // The ring is the live set: replaying it rebuilds the drawer and the orphan list.
+        if self.log.rotation_due() {
+            let carry: Vec<String> =
+                self.messages.iter().filter_map(|m| serde_json::to_string(m).ok()).collect();
+            self.log.rotate(&carry);
         }
     }
 }
@@ -770,7 +769,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(700));
 
         let body = "x".repeat(60_000);
-        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-long.jsonl"));
+        let bus = Bus::new(std::env::temp_dir().join("horde-test-long.jsonl"));
         let mut m = msg(1, &body);
         let expected = format_for(&m).len();
         assert!(expected > 60_000, "the envelope should make this longer still");
@@ -1084,5 +1083,54 @@ mod tests {
         }
         assert!(refused, "the cap should have been reached and reported");
         assert!(took < std::time::Duration::from_secs(2), "writes blocked for {took:?}");
+    }
+
+    /// A queued message must survive log rotation as well as a restart.
+    ///
+    /// The orphan list is rebuilt from the log, so if rotation dropped the tail then a bounded
+    /// log would quietly become a way to lose undelivered messages.
+    #[test]
+    fn rotating_the_log_keeps_undelivered_messages_recoverable() {
+        let p = std::env::temp_dir().join("horde-bus-rotate.jsonl");
+        let archive = std::env::temp_dir().join("horde-bus-rotate.jsonl.1");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&archive);
+
+        {
+            let mut bus = Bus::new(p.clone());
+            bus.log = crate::daemon::logfile::AppendLog::with_max(p.clone(), 1);
+            bus.record(Message {
+                id: 1,
+                ts: 1,
+                from: "builder".into(),
+                to: "reviewer".into(),
+                body: "held across a rotation".into(),
+                delivery: Delivery::Queued,
+                broadcast: false,
+                expects_reply: false,
+                reply_to: None,
+            });
+            for i in 2..320u64 {
+                bus.record(Message {
+                    id: i,
+                    ts: 1,
+                    from: "a".into(),
+                    to: "b".into(),
+                    body: "chatter".into(),
+                    delivery: Delivery::Delivered,
+                    broadcast: false,
+                    expects_reply: false,
+                    reply_to: None,
+                });
+            }
+        }
+        assert!(archive.exists(), "history should have been archived");
+
+        let bus = Bus::new(p.clone());
+        assert_eq!(bus.orphan_count(), 1, "the undelivered message must still be found");
+        assert_eq!(bus.orphaned[0].body, "held across a rotation");
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&archive);
     }
 }

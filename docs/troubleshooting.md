@@ -108,6 +108,26 @@ horde status                      # versions, counts, and every path
 | `~/.config/horde/config.toml` | configuration |
 | `~/.config/horde/horde.sock` | the control socket |
 | `~/.config/horde/state.json` | saved session shape |
-| `~/.config/horde/bus.jsonl` | every routed message |
+| `~/.config/horde/bus.jsonl` | routed messages |
+| `~/.config/horde/tasks.jsonl` | the task board |
+| `~/.config/horde/events.jsonl` | agent state changes and pane exits, for `horde digest` |
 | `~/.config/horde/horde.log` | daemon log — start here when the daemon misbehaves |
 | `~/.config/horde/agents/` | your detection manifest overrides |
+
+### Log sizes
+
+Each log rotates once it passes 4MB: the current file is renamed to `<name>.1`, replacing any
+previous archive, and a fresh one starts. Disk use is therefore bounded at roughly twice the
+limit per log, and one generation of history is kept.
+
+The three `.jsonl` files are *replayed* to rebuild live state — the board reconstructs open
+tasks, the bus recovers messages that were never delivered — so rotation carries the live set
+forward into the new file rather than starting empty. An open task or a queued message cannot
+be lost to rotation.
+
+Trimming them by hand is safe at any time, including while the daemon is running, because each
+log is opened per write rather than held:
+
+```sh
+tail -n 2000 ~/.config/horde/bus.jsonl > /tmp/b && mv /tmp/b ~/.config/horde/bus.jsonl
+```

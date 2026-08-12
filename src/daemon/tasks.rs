@@ -9,7 +9,6 @@
 //! task would duplicate work silently, so a claim is a compare-and-set: it succeeds only from
 //! `Open`, and the daemon's single-threaded engine serialises the attempts.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
@@ -78,7 +77,7 @@ impl Task {
 }
 
 pub struct Board {
-    path: PathBuf,
+    log: super::logfile::AppendLog,
     tasks: Vec<Task>,
     next_id: u64,
 }
@@ -87,7 +86,7 @@ impl Board {
     pub fn new(path: PathBuf) -> Board {
         let tasks = read_log(&path);
         let next_id = tasks.iter().map(|t| t.id).max().unwrap_or(0) + 1;
-        Board { path, tasks, next_id }
+        Board { log: super::logfile::AppendLog::new(path), tasks, next_id }
     }
 
     pub fn all(&self) -> &[Task] {
@@ -257,13 +256,15 @@ impl Board {
     }
 
     fn append(&mut self, task: &Task) {
-        if let Some(p) = self.path.parent() {
-            let _ = std::fs::create_dir_all(p);
+        if let Ok(line) = serde_json::to_string(task) {
+            self.log.append_line(&line);
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
-            if let Ok(line) = serde_json::to_string(task) {
-                let _ = writeln!(f, "{line}");
-            }
+        // Carry every task still in memory, not just the open ones: `task list --all` reads
+        // finished work and its results, and losing that on rotation would be a surprise.
+        if self.log.rotation_due() {
+            let carry: Vec<String> =
+                self.tasks.iter().filter_map(|t| serde_json::to_string(t).ok()).collect();
+            self.log.rotate(&carry);
         }
     }
 }
@@ -427,5 +428,47 @@ mod tests {
         std::fs::write(&p, "not json\n{\"partial\":true}\n").unwrap();
         assert!(Board::new(p.clone()).all().is_empty());
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Rotation must not cost the board its state.
+    ///
+    /// This is the trap in bounding a log that gets replayed: the ordinary "rename and start
+    /// empty" would drop every open task on the floor. The live set is carried into the new
+    /// file, so a restart after rotation rebuilds the same board.
+    #[test]
+    fn rotating_the_log_keeps_open_tasks_and_finished_results() {
+        let p = std::env::temp_dir().join("horde-tasks-rotate.jsonl");
+        let archive = std::env::temp_dir().join("horde-tasks-rotate.jsonl.1");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&archive);
+
+        {
+            let mut b = Board::new(p.clone());
+            // A tiny limit, so the next size check rotates.
+            b.log = crate::daemon::logfile::AppendLog::with_max(p.clone(), 1);
+            b.add("still open", "user").unwrap();
+            b.add("will finish", "user").unwrap();
+            b.claim("worker", Some(2)).unwrap();
+            b.done("worker", Some(2), Some("all green")).unwrap();
+            // Enough appends to trigger the periodic check.
+            for i in 0..300 {
+                b.add(&format!("filler {i}"), "user").unwrap();
+            }
+        }
+        assert!(archive.exists(), "history should have been archived");
+
+        // Reopen: the board must look exactly as it did.
+        let b = Board::new(p.clone());
+        let open = b.get(1).expect("the open task survived rotation");
+        assert!(open.is_open());
+        assert_eq!(open.text, "still open");
+        let done = b.get(2).expect("the finished task survived rotation");
+        assert_eq!(done.state, TaskState::Done);
+        assert_eq!(done.result.as_deref(), Some("all green"), "its result too");
+        // And ids do not restart, which would collide with the archived history.
+        assert!(b.next_id > 300);
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&archive);
     }
 }

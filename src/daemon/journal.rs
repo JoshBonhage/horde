@@ -9,7 +9,6 @@
 //! digest is telling you about the hour you were not watching, and a restart is exactly the
 //! kind of thing that happens during that hour.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -46,7 +45,7 @@ pub struct Entry {
 }
 
 pub struct Journal {
-    path: PathBuf,
+    log: super::logfile::AppendLog,
     entries: Vec<Entry>,
 }
 
@@ -57,7 +56,7 @@ impl Journal {
         if entries.len() > CAP {
             entries.drain(..entries.len() - CAP);
         }
-        Journal { path, entries }
+        Journal { log: super::logfile::AppendLog::new(path), entries }
     }
 
     pub fn since(&self, ts: u64) -> impl Iterator<Item = &Entry> {
@@ -102,13 +101,14 @@ impl Journal {
         }
     }
 
-    fn append(&self, e: &Entry) {
-        let Ok(line) = serde_json::to_string(e) else { return };
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    fn append(&mut self, e: &Entry) {
+        if let Ok(line) = serde_json::to_string(e) {
+            self.log.append_line(&line);
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
-            let _ = writeln!(f, "{line}");
+        if self.log.rotation_due() {
+            let carry: Vec<String> =
+                self.entries.iter().filter_map(|x| serde_json::to_string(x).ok()).collect();
+            self.log.rotate(&carry);
         }
     }
 }
