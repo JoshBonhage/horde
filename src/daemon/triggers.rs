@@ -19,6 +19,7 @@
 //! - **No rule-making by machine-started agents** (enforced in [`super::rpc`], where the calling
 //!   pane is known). Agents creating rules is useful; rules creating agents that create rules has
 //!   no human anywhere in it.
+//! - **An unmet `--when` condition spends the interval**, or the probe re-runs every tick.
 //! - **A failed action still counts as a firing**, or a broken trigger retries every tick
 //!   forever.
 //! - **Everything is journaled**, because a machine that acts while you are away is only
@@ -28,7 +29,10 @@
 //! already exists find a free agent, which means a trigger never has to know who is idle and the
 //! exclusivity guarantee stays where it already is — in `Board::claim`'s compare-and-set.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -158,6 +162,23 @@ pub struct Trigger {
     pub by: String,
     pub last_fired: Option<u64>,
     pub fire_count: u64,
+    /// Shell condition. The rule acts only when this exits 0.
+    ///
+    /// A gate on the schedule rather than a source of its own, which is why there is no file
+    /// watcher here: "has anything changed" is a command (`git diff --quiet`), "are the tests
+    /// broken" is a command, and one gate composes with both `every` and `at` instead of adding
+    /// a variant per question.
+    #[serde(default)]
+    pub only_if: Option<String>,
+    /// When the schedule last came round, whether or not it fired.
+    ///
+    /// Distinct from `last_fired`, which stays the record of what actually happened. A condition
+    /// that comes back false has to spend the interval — otherwise a rule with a `--when` re-runs
+    /// its probe on every tick, which for `cargo test` is a fork bomb with good intentions.
+    /// Falls back to `last_fired` when absent, so rules written before this field replay
+    /// unchanged rather than all coming due at once.
+    #[serde(default)]
+    pub last_eval: Option<u64>,
     /// Removed. Kept in the log so the record of what once fired here survives, and hidden
     /// from every listing.
     #[serde(default)]
@@ -165,6 +186,14 @@ pub struct Trigger {
 }
 
 impl Trigger {
+    /// The whole rule on one line: schedule, condition, action.
+    pub fn describe(&self) -> String {
+        match &self.only_if {
+            Some(c) => format!("{} if `{c}` · {}", self.when.describe(), self.what.describe()),
+            None => format!("{} · {}", self.when.describe(), self.what.describe()),
+        }
+    }
+
     /// What the next firing is measured from: the last one, or creation for a trigger that has
     /// never fired.
     ///
@@ -172,7 +201,7 @@ impl Trigger {
     /// firing the instant you add it — and adding `at 09:00` in the afternoon waits for
     /// tomorrow rather than deciding it is nine hours late.
     fn baseline(&self) -> u64 {
-        self.last_fired.unwrap_or(self.created)
+        self.last_eval.or(self.last_fired).unwrap_or(self.created)
     }
 
     fn is_due(&self, now: u64) -> bool {
@@ -200,7 +229,27 @@ pub struct Store {
     /// When the hourly ceiling was last complained about, so a capped hour produces one
     /// warning rather than one per tick.
     capped_notice_at: u64,
+    /// Conditions currently being evaluated, by trigger id. Runtime only — an in-flight probe
+    /// is not worth persisting, and a daemon restart simply re-asks.
+    probes: HashMap<u64, Probe>,
 }
+
+/// A `--when` condition running on its own thread.
+///
+/// On a thread because the engine is single-threaded and drives every pane: waiting here for
+/// `cargo test` would freeze every agent's output for the duration. The result arrives on a later
+/// tick, which is why a condition costs a tick or two rather than being decided inline.
+struct Probe {
+    started: u64,
+    rx: std::sync::mpsc::Receiver<bool>,
+}
+
+/// How long a condition may take before it is abandoned.
+///
+/// A hung probe holds its trigger's slot forever otherwise. The thread is left to finish on its
+/// own — one stuck child per rule is a bounded leak, and killing a shell pipeline from another
+/// thread costs more machinery than the problem is worth.
+const PROBE_TIMEOUT: u64 = 60_000;
 
 impl Store {
     pub fn new(path: PathBuf) -> Store {
@@ -211,6 +260,7 @@ impl Store {
             triggers,
             next_id,
             capped_notice_at: 0,
+            probes: HashMap::new(),
         }
     }
 
@@ -233,7 +283,13 @@ impl Store {
         self.all().filter(|t| t.enabled).count()
     }
 
-    pub fn add(&mut self, when: When, what: What, by: &str) -> Result<Trigger> {
+    pub fn add(
+        &mut self,
+        when: When,
+        what: What,
+        by: &str,
+        only_if: Option<String>,
+    ) -> Result<Trigger> {
         if let When::Every { secs } = when {
             if secs < MIN_INTERVAL_SECS {
                 return Err(anyhow!(
@@ -256,6 +312,8 @@ impl Store {
             by: by.to_string(),
             last_fired: None,
             fire_count: 0,
+            only_if: only_if.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+            last_eval: None,
             deleted: false,
         };
         self.next_id += 1;
@@ -290,8 +348,15 @@ impl Store {
     fn mark_fired(&mut self, id: u64, now: u64) {
         let _ = self.mutate(id, |t| {
             t.last_fired = Some(now);
+            t.last_eval = Some(now);
             t.fire_count += 1;
         });
+    }
+
+    /// The schedule came round and the answer was no. Spends the interval without claiming a
+    /// firing, so the condition is asked again next interval rather than next tick.
+    fn mark_checked(&mut self, id: u64, now: u64) {
+        let _ = self.mutate(id, |t| t.last_eval = Some(now));
     }
 
     fn mutate(&mut self, id: u64, f: impl FnOnce(&mut Trigger)) -> Result<Trigger> {
@@ -391,6 +456,29 @@ pub fn fire_due(eng: &mut Engine) -> Vec<Event> {
 
     for id in due.into_iter().take(budget) {
         let Some(t) = eng.triggers.get(id).cloned() else { continue };
+
+        // A condition is answered on a thread, so a due rule with a `--when` takes a tick or two
+        // to decide. `Waiting` means come back next tick; `No` spends the interval so the probe
+        // runs once per interval rather than once per tick.
+        if t.only_if.is_some() {
+            match check_condition(eng, &t, now) {
+                Condition::Waiting => continue,
+                Condition::No => {
+                    eng.triggers.mark_checked(id, now);
+                    continue;
+                }
+                Condition::Failed(why) => {
+                    eng.triggers.mark_checked(id, now);
+                    events.push(Event::Notice {
+                        level: NoticeLevel::Warn,
+                        text: format!("trigger #{id} condition {why}"),
+                    });
+                    continue;
+                }
+                Condition::Yes => {}
+            }
+        }
+
         match perform(eng, &t) {
             Ok((what, ev)) => {
                 let line = format!("#{id} {what}");
@@ -428,6 +516,82 @@ pub fn fire_now(eng: &mut Engine, id: u64) -> Result<(String, Vec<Event>)> {
     super::log_line(&format!("trigger {line} (by hand)"));
     eng.triggers.mark_fired(id, super::now_millis());
     Ok((what, events))
+}
+
+/// Where a trigger's `--when` condition stands this tick.
+enum Condition {
+    /// Exited 0: go.
+    Yes,
+    /// Exited non-zero: the condition is simply not met, which is ordinary operation.
+    No,
+    /// Still running. Nothing is spent — ask again next tick.
+    Waiting,
+    /// Could not be answered: it never started, or it ran too long. Carries the phrase for the
+    /// warning.
+    Failed(String),
+}
+
+/// Start, poll, or time out a trigger's condition.
+///
+/// One probe in flight per rule, which is what stops a slow condition from being launched again
+/// every tick while the first is still thinking.
+fn check_condition(eng: &mut Engine, t: &Trigger, now: u64) -> Condition {
+    let Some(cmd) = t.only_if.clone() else { return Condition::Yes };
+
+    if let Some(probe) = eng.triggers.probes.get(&t.id) {
+        match probe.rx.try_recv() {
+            Ok(ok) => {
+                eng.triggers.probes.remove(&t.id);
+                super::log_line(&format!(
+                    "trigger #{} condition {}: {cmd}",
+                    t.id,
+                    if ok { "met" } else { "not met" }
+                ));
+                return if ok { Condition::Yes } else { Condition::No };
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if now.saturating_sub(probe.started) < PROBE_TIMEOUT {
+                    return Condition::Waiting;
+                }
+                eng.triggers.probes.remove(&t.id);
+                return Condition::Failed(format!(
+                    "took longer than {}s and was abandoned: {cmd}",
+                    PROBE_TIMEOUT / 1000
+                ));
+            }
+            // The thread died without answering, which a panic in `Command` could do.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                eng.triggers.probes.remove(&t.id);
+                return Condition::Failed(format!("could not be run: {cmd}"));
+            }
+        }
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spec = cmd.clone();
+    // Through `sh -c` for the same reason the notify command is: a condition is usually a
+    // pipeline or a negation (`! cargo test -q`), not a bare path.
+    let started = std::thread::Builder::new().name(format!("horde-probe-{}", t.id)).spawn(
+        move || {
+            let ok = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&spec)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let _ = tx.send(ok);
+        },
+    );
+    match started {
+        Ok(_) => {
+            eng.triggers.probes.insert(t.id, Probe { started: now, rx });
+            Condition::Waiting
+        }
+        Err(e) => Condition::Failed(format!("could not start: {e}")),
+    }
 }
 
 /// Whether this trigger's own last piece of work is still open or claimed.
@@ -654,12 +818,17 @@ mod tests {
         e
     }
 
-    /// Pretend a trigger last fired `ms_ago` milliseconds ago.
+    /// Pretend a trigger's last activity was `ms_ago` milliseconds ago.
+    ///
+    /// Has to move every marker `baseline()` consults, not just the obvious one — `last_eval`
+    /// was added later and winding only `last_fired` leaves the rule permanently not-due, which
+    /// looks exactly like a broken guard.
     fn wind_back(e: &mut Engine, id: u64, ms_ago: u64) {
-        let now = super::super::now_millis();
+        let then = super::super::now_millis().saturating_sub(ms_ago);
         let _ = e.triggers.mutate(id, |t| {
-            t.created = now.saturating_sub(ms_ago);
-            t.last_fired = t.last_fired.map(|_| now.saturating_sub(ms_ago));
+            t.created = then;
+            t.last_fired = t.last_fired.map(|_| then);
+            t.last_eval = t.last_eval.map(|_| then);
         });
     }
 
@@ -690,9 +859,9 @@ mod tests {
     #[test]
     fn triggers_are_numbered_and_enabled_when_added() {
         let mut s = store("add");
-        let a = s.add(When::Every { secs: 1800 }, task_what(), "user").unwrap();
+        let a = s.add(When::Every { secs: 1800 }, task_what(), "user", None).unwrap();
         let at9 = When::At { hour: 9, min: 0, days: EVERY_DAY };
-        let b = s.add(at9, task_what(), "builder").unwrap();
+        let b = s.add(at9, task_what(), "builder", None).unwrap();
         assert_eq!((a.id, b.id), (1, 2));
         assert!(a.enabled);
         assert_eq!(b.by, "builder");
@@ -702,7 +871,8 @@ mod tests {
     #[test]
     fn an_interval_below_the_floor_is_refused() {
         let mut s = store("floor");
-        let err = s.add(When::Every { secs: 1 }, task_what(), "user").unwrap_err().to_string();
+        let err =
+            s.add(When::Every { secs: 1 }, task_what(), "user", None).unwrap_err().to_string();
         assert!(err.contains("shortest interval"), "{err}");
         assert!(parse_every("5s").is_err(), "and at the parsing boundary too");
         assert!(parse_every("60s").is_ok());
@@ -711,7 +881,7 @@ mod tests {
     #[test]
     fn removing_a_trigger_hides_it_without_losing_the_record() {
         let mut s = store("rm");
-        s.add(When::Every { secs: 3600 }, task_what(), "user").unwrap();
+        s.add(When::Every { secs: 3600 }, task_what(), "user", None).unwrap();
         s.remove(1).unwrap();
         assert_eq!(s.count(), 0);
         assert!(s.get(1).is_none());
@@ -721,8 +891,8 @@ mod tests {
     #[test]
     fn everything_can_be_turned_off_at_once() {
         let mut s = store("offall");
-        s.add(When::Every { secs: 3600 }, task_what(), "user").unwrap();
-        s.add(When::Every { secs: 7200 }, task_what(), "user").unwrap();
+        s.add(When::Every { secs: 3600 }, task_what(), "user", None).unwrap();
+        s.add(When::Every { secs: 7200 }, task_what(), "user", None).unwrap();
         assert_eq!(s.armed_count(), 2);
         assert_eq!(s.disable_all().len(), 2);
         assert_eq!(s.armed_count(), 0);
@@ -735,8 +905,9 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         {
             let mut s = Store::new(p.clone());
-            s.add(When::Every { secs: 1800 }, task_what(), "user").unwrap();
-            s.add(When::At { hour: 9, min: 30, days: EVERY_DAY }, task_what(), "user").unwrap();
+            s.add(When::Every { secs: 1800 }, task_what(), "user", None).unwrap();
+            s.add(When::At { hour: 9, min: 30, days: EVERY_DAY }, task_what(), "user", None)
+                .unwrap();
             s.set_enabled(1, false).unwrap();
         }
         let mut s = Store::new(p.clone());
@@ -744,7 +915,7 @@ mod tests {
         assert!(!s.get(1).unwrap().enabled, "off has to survive too, or a restart re-arms it");
         assert_eq!(s.get(2).unwrap().when, When::At { hour: 9, min: 30, days: EVERY_DAY });
         // Ids do not restart, so a replayed log cannot collide with a new rule.
-        assert_eq!(s.add(When::Every { secs: 60 }, task_what(), "user").unwrap().id, 3);
+        assert_eq!(s.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap().id, 3);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -763,6 +934,8 @@ mod tests {
             by: "user".into(),
             last_fired: None,
             fire_count: 0,
+            only_if: None,
+            last_eval: None,
             deleted: false,
         };
         let now = super::super::now_millis();
@@ -787,6 +960,8 @@ mod tests {
             by: "user".into(),
             last_fired: None,
             fire_count: 0,
+            only_if: None,
+            last_eval: None,
             deleted: false,
         };
         assert!(!t.is_due(now), "created after today's occurrence, so it waits for tomorrow");
@@ -811,6 +986,8 @@ mod tests {
             by: "user".into(),
             last_fired: None,
             fire_count: 0,
+            only_if: None,
+            last_eval: None,
             deleted: false,
         };
         assert!(t.is_due(now));
@@ -849,6 +1026,8 @@ mod tests {
             by: "user".into(),
             last_fired: None,
             fire_count: 0,
+            only_if: None,
+            last_eval: None,
             deleted: false,
         };
         assert!(base.is_due(now), "today is allowed, and the hour has passed");
@@ -903,7 +1082,7 @@ mod tests {
     fn nothing_fires_until_unattended_is_turned_on() {
         let mut e = eng("switch");
         e.cfg.unattended = false;
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user").unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
         wind_back(&mut e, 1, 120_000);
         assert!(fire_due(&mut e).is_empty());
         assert!(fired(&e).is_empty());
@@ -913,7 +1092,7 @@ mod tests {
     #[test]
     fn a_due_trigger_puts_its_work_on_the_board() {
         let mut e = eng("board");
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user").unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
 
@@ -932,7 +1111,7 @@ mod tests {
     #[test]
     fn a_trigger_does_not_stack_work_it_has_already_queued() {
         let mut e = eng("stack");
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user").unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
         assert_eq!(e.board.open_count(), 1);
@@ -959,7 +1138,7 @@ mod tests {
     #[test]
     fn work_still_outstanding_delays_a_firing_without_consuming_it() {
         let mut e = eng("nospend");
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user").unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
 
@@ -980,7 +1159,7 @@ mod tests {
     #[test]
     fn a_disabled_trigger_stays_quiet() {
         let mut e = eng("disabled");
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user").unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
         e.triggers.set_enabled(1, false).unwrap();
         wind_back(&mut e, 1, 120_000);
         assert!(fire_due(&mut e).is_empty());
@@ -994,7 +1173,12 @@ mod tests {
         let mut e = eng("ceiling");
         for i in 0..MAX_PER_HOUR + 3 {
             e.triggers
-                .add(When::Every { secs: 60 }, What::Task { text: format!("job {i}") }, "user")
+                .add(
+                    When::Every { secs: 60 },
+                    What::Task { text: format!("job {i}") },
+                    "user",
+                    None,
+                )
                 .unwrap();
             wind_back(&mut e, i as u64 + 1, 120_000);
         }
@@ -1026,6 +1210,7 @@ mod tests {
                 When::Every { secs: 60 },
                 What::Send { to: "nobody".into(), body: "hello".into() },
                 "user",
+                None,
             )
             .unwrap();
         wind_back(&mut e, 1, 120_000);
@@ -1042,6 +1227,7 @@ mod tests {
                 When::Every { secs: 60 },
                 What::Send { to: "worker0".into(), body: "status?".into() },
                 "user",
+                None,
             )
             .unwrap();
         wind_back(&mut e, 1, 120_000);
@@ -1066,7 +1252,7 @@ mod tests {
     fn a_spawn_trigger_starts_an_agent_and_stamps_where_it_came_from() {
         let mut e = eng("spawn");
         let before = e.session.panes.len();
-        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user").unwrap();
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
 
@@ -1085,7 +1271,7 @@ mod tests {
     fn the_spawn_cap_refuses_loudly_rather_than_quietly() {
         let mut e = eng("cap");
         e.cfg.max_spawned = 1;
-        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user").unwrap();
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None).unwrap();
 
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
@@ -1107,7 +1293,7 @@ mod tests {
     fn a_departed_agent_frees_its_slot() {
         let mut e = eng("slot");
         e.cfg.max_spawned = 1;
-        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user").unwrap();
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
         assert_eq!(live_spawned(&e), 1);
@@ -1129,6 +1315,114 @@ mod tests {
         fire_due(&mut e);
         assert_eq!(live_spawned(&e), 1, "the schedule resumes once a slot is free");
         kill_panes(&mut e);
+    }
+
+    // -- conditions -----------------------------------------------------
+
+    /// Drive `fire_due` until the trigger's probe has been answered, or give up.
+    ///
+    /// A condition is answered on a thread, so the decision lands a tick or two after the rule
+    /// comes due. Polling is what the real tick loop does; this just does it faster.
+    fn settle(e: &mut Engine) -> Vec<Event> {
+        for _ in 0..200 {
+            let events = fire_due(e);
+            if e.triggers.probes.is_empty() {
+                return events;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the condition never came back");
+    }
+
+    #[test]
+    fn a_met_condition_lets_the_rule_act() {
+        let mut e = eng("cond-yes");
+        e.triggers
+            .add(When::Every { secs: 60 }, task_what(), "user", Some("true".into()))
+            .unwrap();
+        wind_back(&mut e, 1, 120_000);
+        settle(&mut e);
+        assert_eq!(e.board.open_count(), 1, "the condition held, so the work went up");
+        assert_eq!(e.triggers.get(1).unwrap().fire_count, 1);
+    }
+
+    /// The important half: an unmet condition spends the interval. Without that the probe re-runs
+    /// on every tick, which for a real command is a fork bomb with good intentions.
+    #[test]
+    fn an_unmet_condition_holds_the_rule_and_spends_the_interval() {
+        let mut e = eng("cond-no");
+        e.triggers
+            .add(When::Every { secs: 60 }, task_what(), "user", Some("false".into()))
+            .unwrap();
+        wind_back(&mut e, 1, 120_000);
+        settle(&mut e);
+
+        assert_eq!(e.board.open_count(), 0, "the condition said no");
+        assert_eq!(e.triggers.get(1).unwrap().fire_count, 0, "and that is not a firing");
+        let evaluated = e.triggers.get(1).unwrap().last_eval;
+        assert!(evaluated.is_some(), "but the interval was spent");
+
+        // So the next pass does not immediately probe again.
+        fire_due(&mut e);
+        assert!(e.triggers.probes.is_empty(), "no second probe until the interval comes round");
+        assert_eq!(e.triggers.get(1).unwrap().last_eval, evaluated);
+    }
+
+    /// One probe per rule at a time, or a slow condition is launched again every 150ms.
+    #[test]
+    fn a_condition_still_running_is_not_launched_again() {
+        let mut e = eng("cond-once");
+        e.triggers
+            .add(When::Every { secs: 60 }, task_what(), "user", Some("sleep 5".into()))
+            .unwrap();
+        wind_back(&mut e, 1, 120_000);
+
+        for _ in 0..5 {
+            fire_due(&mut e);
+        }
+        assert_eq!(e.triggers.probes.len(), 1, "five passes, one probe");
+        assert_eq!(e.board.open_count(), 0, "and nothing acted while it was thinking");
+
+        // Abandon it rather than waiting five seconds for the test.
+        e.triggers.probes.clear();
+    }
+
+    /// A condition that hangs must not hold its rule forever.
+    #[test]
+    fn a_condition_that_never_answers_is_abandoned_with_a_warning() {
+        let mut e = eng("cond-hang");
+        e.triggers
+            .add(When::Every { secs: 60 }, task_what(), "user", Some("sleep 60".into()))
+            .unwrap();
+        wind_back(&mut e, 1, 120_000);
+        fire_due(&mut e);
+        assert_eq!(e.triggers.probes.len(), 1);
+
+        // Backdate the probe past the timeout rather than waiting a minute for it.
+        if let Some(p) = e.triggers.probes.get_mut(&1) {
+            p.started = super::super::now_millis().saturating_sub(PROBE_TIMEOUT + 1);
+        }
+        let events = fire_due(&mut e);
+        assert!(warned_about(&events, "abandoned"), "{events:?}");
+        assert!(e.triggers.probes.is_empty(), "and the slot is free again");
+        assert_eq!(e.board.open_count(), 0);
+    }
+
+    /// Rules written before conditions existed have to keep their schedule, not all come due at
+    /// once because a new field defaulted to None.
+    #[test]
+    fn a_rule_from_before_conditions_existed_keeps_its_place_in_the_schedule() {
+        let fired_at = super::super::now_millis() - 1000;
+        let line = format!(
+            r#"{{"id":1,"when":{{"kind":"every","secs":3600}},"what":{{"kind":"task","text":"x"}},
+               "enabled":true,"created":0,"by":"user","last_fired":{fired_at},"fire_count":4}}"#
+        )
+        .replace('\n', "");
+        let t: Trigger = serde_json::from_str(&line).expect("an old entry must still parse");
+        assert!(t.only_if.is_none());
+        assert!(t.last_eval.is_none());
+        // Falls back to `last_fired`, so it is one second into its hour rather than overdue.
+        assert!(!t.is_due(super::super::now_millis()));
     }
 
     #[test]

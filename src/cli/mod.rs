@@ -203,6 +203,10 @@ pub enum TriggerCmd {
         /// Which days, with --at: mon-fri, sat,sun, mon,wed,fri. Every day if omitted.
         #[arg(long)]
         days: Option<String>,
+        /// Only act when this shell command exits 0, checked when the schedule comes round.
+        /// e.g. "! cargo test -q" to act when the tests fail.
+        #[arg(long = "when")]
+        when: Option<String>,
         /// Work to put on the board.
         #[arg(long, conflicts_with = "to")]
         task: Option<String>,
@@ -689,11 +693,11 @@ pub fn run(cmd: Command) -> Result<()> {
         },
 
         Command::Trigger { cmd } => match cmd {
-            TriggerCmd::Add { every, at, days, task, to, body, spawn, name } => {
+            TriggerCmd::Add { every, at, days, when, task, to, body, spawn, name } => {
                 let v = call(
                     "trigger.add",
                     json!({
-                        "every": every, "at": at, "days": days,
+                        "every": every, "at": at, "days": days, "when": when,
                         "task": task, "to": to, "body": body,
                         "spawn": spawn, "name": name,
                         "from": self_pane(),
@@ -701,7 +705,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 )?;
                 let armed = v.get("armed").and_then(|x| x.as_bool()).unwrap_or(false);
                 let t: Trigger = serde_json::from_value(v["trigger"].clone())?;
-                println!("#{} added — {} · {}", t.id, t.when.describe(), t.what.describe());
+                println!("#{} added — {}", t.id, t.describe());
                 if !armed {
                     // Adding a rule that cannot fire is the one mistake worth interrupting
                     // for: everything looks right, and nothing ever happens.
@@ -737,11 +741,10 @@ pub fn run(cmd: Command) -> Result<()> {
                         None => "never fired".to_string(),
                     };
                     println!(
-                        "{} #{:<4} {} · {}",
+                        "{} #{:<4} {}",
                         if t.enabled { "○" } else { "✕" },
                         t.id,
-                        t.when.describe(),
-                        t.what.describe()
+                        t.describe()
                     );
                     println!("       {last}, {} so far, by {}", t.fire_count, t.by);
                 }
@@ -754,20 +757,22 @@ pub fn run(cmd: Command) -> Result<()> {
                 call("trigger.enable", json!({ "trigger": trigger, "on": true }))?;
                 println!("#{trigger} on");
             }
-            TriggerCmd::Off { trigger, all } => {
-                if all || trigger.is_none() {
-                    if !all {
-                        return Err(anyhow!("name a trigger, or pass --all to turn every one off"));
-                    }
-                    let v = call("trigger.enable", json!({ "on": false }))?;
-                    let n = v.get("disabled").and_then(|x| x.as_u64()).unwrap_or(0);
-                    println!("{n} turned off");
-                } else {
-                    let id = trigger.unwrap();
+            TriggerCmd::Off { trigger, all } => match (trigger, all) {
+                (Some(id), _) => {
                     call("trigger.enable", json!({ "trigger": id, "on": false }))?;
                     println!("#{id} off");
                 }
-            }
+                (None, true) => {
+                    let v = call("trigger.enable", json!({ "on": false }))?;
+                    let n = v.get("disabled").and_then(|x| x.as_u64()).unwrap_or(0);
+                    println!("{n} turned off");
+                }
+                // Bare `trigger off` is ambiguous between one rule and all of them, and
+                // guessing "all" would be the expensive guess.
+                (None, false) => {
+                    return Err(anyhow!("name a trigger, or pass --all to turn every one off"))
+                }
+            },
             TriggerCmd::Fire { trigger } => {
                 let v = call("trigger.fire", json!({ "trigger": trigger }))?;
                 println!("{}", v.get("did").and_then(|x| x.as_str()).unwrap_or("fired"));

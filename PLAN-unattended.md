@@ -235,7 +235,43 @@ optional.
 - Hitting the cap is a notification, not a silent no-op. A trigger that quietly stopped working
   is worse than one that failed loudly.
 
-## Phase 4 — reactive sources
+## Phase 4 — reactive sources — **shipped, as a condition rather than sources**
+
+The plan wanted three new `When` variants: `path <glob> changed`, `command exits nonzero`, and
+`agent stuck <dur>`. What shipped is one field, `Trigger.only_if`, and it covers more:
+
+```bash
+--every 30m --when "! cargo test -q"                       # tests are broken
+--at 09:00  --when "! git diff --quiet"                    # uncommitted work
+--every 15m --when "find src -newer target/debug/horde -name '*.rs' | grep -q ."   # files changed
+```
+
+A gate on the schedule rather than a source of its own, because "has anything changed" *is* a
+command. That composes with both `every` and `at` instead of needing a variant per question — and
+it means no file-watching dependency in a tool that has deliberately few.
+
+`agent stuck` was dropped rather than deferred. The notifier already tells a human about a blocked
+agent, and a rule that responds to "this needs a human" by doing something automated is usually
+the wrong answer.
+
+Three things the implementation had to get right:
+
+- **Off-thread.** The engine drives every pane; waiting for `cargo test` inline freezes every
+  agent's output. So a condition costs a tick or two to decide, and `Condition::Waiting` spends
+  nothing.
+- **An unmet condition spends the interval.** Not a firing — `fire_count` stays put, nothing is
+  journaled — but the interval is consumed. This is the one that matters: without it the probe
+  re-runs every tick, which for a real command is a fork bomb with good intentions. Verified live:
+  one probe in 70 seconds, not the ~460 a per-tick bug would have produced.
+- **`last_eval` falls back to `last_fired`.** A new field defaulting to `None` would have made
+  every existing rule come due at once on upgrade.
+
+The end-to-end run also caught a documentation bug in my own example: `!` inverts *any* non-zero
+exit, so `! git -C /bad/path diff --quiet` succeeds because git failed, not because anything
+changed. A negated condition fires on "could not run" as readily as on "found something". Now
+documented, with the explicit form for when that distinction matters.
+
+## Phase 4 as planned
 
 `path <glob> changed` (debounced), `command exits nonzero` (periodic probe, e.g. `cargo test`),
 `agent stuck <dur>`. Deferred because they're the sources most likely to fire in bursts, and
