@@ -929,6 +929,9 @@ impl Session {
             bus: self.chrome.bus,
             status: self.chrome.status,
             tabbar: self.chrome.tabbar,
+            // Filled in by the engine, which owns the board.
+            tasks_open: 0,
+            tasks_claimed: 0,
         }
     }
 }

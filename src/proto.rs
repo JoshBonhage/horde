@@ -321,6 +321,11 @@ pub struct Snapshot {
     pub bus: Rect,
     pub status: Rect,
     pub tabbar: Rect,
+    /// Open and claimed task counts, so the sidebar can show the board without another call.
+    #[serde(default)]
+    pub tasks_open: usize,
+    #[serde(default)]
+    pub tasks_claimed: usize,
 }
 
 /// Panel visibility. Lives in the daemon so geometry has exactly one owner.

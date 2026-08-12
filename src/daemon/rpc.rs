@@ -447,6 +447,55 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             serde_json::to_value(eng.bus.recent(n)).map_err(|e| failed(e.to_string()))
         }
 
+        // -- tasks -------------------------------------------------------
+        // A board agents pull from, rather than a queue you push to. See daemon/tasks.rs.
+        "task.add" => {
+            let text = str_arg(req, "text").ok_or_else(|| bad("text required"))?;
+            let by = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
+            let t = eng.board.add(text, &by).map_err(|e| failed(e.to_string()))?;
+            eng.touch();
+            serde_json::to_value(t).map_err(|e| failed(e.to_string()))
+        }
+        "task.claim" => {
+            let owner = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
+            let id = req.params.get("task").and_then(|v| v.as_u64());
+            match eng.board.claim(&owner, id).map_err(|e| failed(e.to_string()))? {
+                Some(t) => {
+                    eng.touch();
+                    serde_json::to_value(t).map_err(|e| failed(e.to_string()))
+                }
+                // Nothing to do is a result, not a failure: an agent looping on the board
+                // has to be able to tell the difference.
+                None => Ok(Value::Null),
+            }
+        }
+        "task.done" => {
+            let owner = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
+            let id = req.params.get("task").and_then(|v| v.as_u64());
+            let t = eng
+                .board
+                .done(&owner, id, str_arg(req, "result"))
+                .map_err(|e| failed(e.to_string()))?;
+            eng.touch();
+            serde_json::to_value(t).map_err(|e| failed(e.to_string()))
+        }
+        "task.release" => {
+            let id = req
+                .params
+                .get("task")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| bad("task id required"))?;
+            let t = eng
+                .board
+                .release(id, bool_arg(req, "drop"))
+                .map_err(|e| failed(e.to_string()))?;
+            eng.touch();
+            serde_json::to_value(t).map_err(|e| failed(e.to_string()))
+        }
+        "task.list" => {
+            serde_json::to_value(eng.board.all()).map_err(|e| failed(e.to_string()))
+        }
+
         // -- commands ----------------------------------------------------
         // Everything a keybinding can do is also reachable by name, which is what makes
         // the command palette and scripting share one implementation.

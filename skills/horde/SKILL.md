@@ -62,6 +62,29 @@ horde broadcast "pausing for a deploy, hold off on migrations"
 Phrase these as instructions, not chat — they land as a prompt in the recipient's session, so
 "please review src/db/" works and "hey what do you think" wastes a turn.
 
+## Shared work: the board
+
+Work can also sit on a board for whoever is free, instead of being addressed to you:
+
+```bash
+horde task list                 # what is outstanding
+work=$(horde task claim)        # take the oldest one — exclusive, no two agents get the same task
+horde task done --result "18 tests added, all passing"
+horde task release <id>         # hand it back if you cannot do it
+```
+
+`claim` prints `nothing on the board` and exits 0 when there is no work, so a loop can tell
+empty from broken:
+
+```bash
+while work=$(horde task claim); [ -n "$work" ]; do  # do $work, then:
+  horde task done --result "<what happened>"
+done
+```
+
+Claim one at a time — claiming a batch starves the other agents. If your pane dies holding a
+task, horde returns it to the board for you.
+
 ## Seeing who else is here
 
 ```bash

@@ -28,6 +28,8 @@ const MIN_SPACE_ROWS: u16 = 2;
 
 pub struct Sidebar<'a> {
     pub snap: &'a Snapshot,
+    /// Open and claimed counts from the task board, when there is any work on it.
+    pub board: Option<(usize, usize)>,
     pub theme: &'a Theme,
     pub tick: usize,
     pub animate: bool,
@@ -58,7 +60,17 @@ impl Widget for Sidebar<'_> {
 
         let inner_w = area.width.saturating_sub(2);
         let agents = collect_agents(self.snap);
-        let summary = summary_lines(self.snap);
+        let mut summary = summary_lines(self.snap);
+        // The board belongs with the other standing counts: it is the same question, "is
+        // there anything outstanding". Unclaimed work is the number that matters — once
+        // everything is claimed there is nothing for you to hand out, so say so instead.
+        if let Some((open, claimed)) = self.board {
+            match (open, claimed) {
+                (0, 0) => {}
+                (0, c) => summary.push(("◇", c, "tasks claimed", AgentState::Unknown)),
+                (o, _) => summary.push(("◇", o, "tasks open", AgentState::Unknown)),
+            }
+        }
 
         // -- vertical budget, allocated from the bottom up -----------------
         // Footer and the agent list earn their space first; spaces get the remainder,
@@ -533,15 +545,26 @@ mod tests {
             bus: Rect::default(),
             status: Rect::default(),
             tabbar: Rect::default(),
+            tasks_open: 0,
+            tasks_claimed: 0,
         }
     }
 
     fn render(s: &Snapshot, w: u16, h: u16) -> (String, Vec<(u16, Hit)>) {
+        render_board(s, w, h, None)
+    }
+
+    fn render_board(
+        s: &Snapshot,
+        w: u16,
+        h: u16,
+        board: Option<(usize, usize)>,
+    ) -> (String, Vec<(u16, Hit)>) {
         let area = TRect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
         let theme = Theme::horde();
         let mut hits = Vec::new();
-        Sidebar { snap: s, theme: &theme, tick: 0, animate: false, hits: &mut hits }
+        Sidebar { snap: s, theme: &theme, tick: 0, animate: false, hits: &mut hits, board }
             .render(area, &mut buf);
         let text = (0..h)
             .map(|y| (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect::<String>())
@@ -713,5 +736,27 @@ mod tests {
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert_eq!(lines[0].2, "needs you");
         assert_eq!(lines[1].2, "working");
+    }
+
+    #[test]
+    fn outstanding_board_work_appears_in_the_footer() {
+        let (out, _) = render_board(&snap(), 26, 22, Some((3, 1)));
+        assert!(out.contains("3 tasks open"), "unclaimed work is the headline:\n{out}");
+    }
+
+    #[test]
+    fn a_fully_claimed_board_says_claimed_rather_than_zero_open() {
+        // "0 tasks open" would read as an empty board when three agents are mid-task.
+        let (out, _) = render_board(&snap(), 26, 22, Some((0, 3)));
+        assert!(out.contains("3 tasks claimed"), "{out}");
+        assert!(!out.contains("0 tasks"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_board_costs_no_footer_line() {
+        let (with, _) = render_board(&snap(), 26, 22, Some((0, 0)));
+        let (without, _) = render_board(&snap(), 26, 22, None);
+        assert_eq!(with, without);
+        assert!(!with.contains("task"), "{with}");
     }
 }
