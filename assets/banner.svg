@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320" role="img" aria-label="horde — a terminal multiplexer for coding agents">
+  <title>horde</title>
+
+  <defs>
+    <!-- Dark Jade ground, the brand's primary dark surface, lifted at the top-left so the
+         wordmark sits in light rather than on a flat slab. -->
+    <linearGradient id="ground" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%"   stop-color="#1f4444"/>
+      <stop offset="55%"  stop-color="#1a3b3b"/>
+      <stop offset="100%" stop-color="#123030"/>
+    </linearGradient>
+
+    <!-- Mint, earned once: it carries the wordmark and nothing else competes with it. -->
+    <linearGradient id="mint" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#4ab292"/>
+      <stop offset="50%"  stop-color="#2ea986"/>
+      <stop offset="100%" stop-color="#086c69"/>
+    </linearGradient>
+
+    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#2ea986" stop-opacity="0"/>
+      <stop offset="18%"  stop-color="#2ea986" stop-opacity=".55"/>
+      <stop offset="82%"  stop-color="#2ea986" stop-opacity=".55"/>
+      <stop offset="100%" stop-color="#2ea986" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- One glyph per agent state, so the strip below the wordmark is the product's own
+         vocabulary rather than decoration. -->
+    <g id="pane">
+      <rect width="150" height="86" rx="7" fill="none" stroke="#2a5555" stroke-width="1.5"/>
+    </g>
+  </defs>
+
+  <rect width="1200" height="320" rx="16" fill="url(#ground)"/>
+
+  <!-- Faint pane tiling: the thing horde actually is, at 6% so it reads as texture. -->
+  <g opacity=".06">
+    <use href="#pane" x="60"  y="196"/>
+    <use href="#pane" x="222" y="196"/>
+    <use href="#pane" x="384" y="196"/>
+    <use href="#pane" x="546" y="196"/>
+    <use href="#pane" x="708" y="196"/>
+    <use href="#pane" x="870" y="196"/>
+    <use href="#pane" x="1032" y="196"/>
+  </g>
+
+  <!-- HORDE, in the same block letterforms the app draws in its own sidebar. Each glyph is
+       a 5x6 cell grid at 15px, so the shapes match `src/client/ui/logo.rs` exactly. -->
+  <g fill="url(#mint)" transform="translate(387 78)">
+    <!-- H -->
+    <rect x="0"   y="0"  width="15" height="90"/>
+    <rect x="45"  y="0"  width="15" height="90"/>
+    <rect x="15"  y="38" width="30" height="15"/>
+    <!-- O -->
+    <rect x="90"  y="0"  width="60" height="15"/>
+    <rect x="90"  y="75" width="60" height="15"/>
+    <rect x="90"  y="15" width="15" height="60"/>
+    <rect x="135" y="15" width="15" height="60"/>
+    <!-- R: bowl on top, straight leg dropping from the bowl's right edge. -->
+    <rect x="180" y="0"  width="15" height="90"/>
+    <rect x="195" y="0"  width="45" height="15"/>
+    <rect x="225" y="15" width="15" height="23"/>
+    <rect x="195" y="38" width="45" height="15"/>
+    <rect x="225" y="53" width="15" height="37"/>
+    <!-- D -->
+    <rect x="270" y="0"  width="45" height="15"/>
+    <rect x="270" y="0"  width="15" height="90"/>
+    <rect x="270" y="75" width="45" height="15"/>
+    <rect x="315" y="15" width="15" height="60"/>
+    <!-- E -->
+    <rect x="360" y="0"  width="15" height="90"/>
+    <rect x="375" y="0"  width="51" height="15"/>
+    <rect x="375" y="38" width="41" height="15"/>
+    <rect x="375" y="75" width="51" height="15"/>
+  </g>
+
+  <!-- Eyebrow: Poppins 600, 0.18em, uppercase, mint — the brand's `.overline`. -->
+  <text x="600" y="52" text-anchor="middle"
+        font-family="Poppins, 'Helvetica Neue', Arial, sans-serif"
+        font-size="13" font-weight="600" letter-spacing="2.4" fill="#2ea986">
+    THE AMAZON WHISPERER
+  </text>
+
+  <line x1="180" y1="196" x2="1020" y2="196" stroke="url(#rule)" stroke-width="1"/>
+
+  <text x="600" y="232" text-anchor="middle"
+        font-family="Poppins, 'Helvetica Neue', Arial, sans-serif"
+        font-size="21" font-weight="400" fill="#e8f2ef">
+    A terminal multiplexer for coding agents.
+  </text>
+  <text x="600" y="262" text-anchor="middle"
+        font-family="Poppins, 'Helvetica Neue', Arial, sans-serif"
+        font-size="15" font-weight="400" fill="#8fb0a8">
+    The daemon owns your PTYs, so agents keep working when you close the terminal.
+  </text>
+
+  <!-- The five states, in the app's own glyphs and colours. `working` pulses, because that
+       is the one that means something is happening right now. -->
+  <g font-family="'SF Mono', Menlo, Consolas, monospace" font-size="15" text-anchor="middle">
+    <text x="470" y="296" fill="#f0c674">
+      ◐<animate attributeName="opacity" values="1;.35;1" dur="1.6s" repeatCount="indefinite"/>
+    </text>
+    <text x="510" y="296" fill="#8fb0a8" font-size="12">working</text>
+
+    <text x="588" y="296" fill="#d2712b">◍</text>
+    <text x="637" y="296" fill="#8fb0a8" font-size="12">needs you</text>
+
+    <text x="712" y="296" fill="#2ea986">●</text>
+    <text x="742" y="296" fill="#8fb0a8" font-size="12">done</text>
+
+    <text x="790" y="296" fill="#5b7d76">○</text>
+    <text x="815" y="296" fill="#8fb0a8" font-size="12">idle</text>
+  </g>
+</svg>
