@@ -8,11 +8,58 @@
 //! Claiming is the only operation that has to be exactly right. Two agents claiming the same
 //! task would duplicate work silently, so a claim is a compare-and-set: it succeeds only from
 //! `Open`, and the daemon's single-threaded engine serialises the attempts.
+//!
+//! The whole board is paused for now — see [`ENABLED`] and [`AUTONOMOUS`].
 
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+
+/// Master switch for the board itself. Off: the board is paused.
+///
+/// Every method that moves a task — add, claim, done, release — is refused at the socket while
+/// this is off, so no agent can take work off the board however it was told to. `task.list` is
+/// deliberately still allowed: reading the record changes nothing, and what is stranded on it is
+/// exactly what you want to see. The log on disk is left alone, so pausing costs no history.
+///
+/// TODO(task-queue): turning this back on restores the board by hand. [`AUTONOMOUS`] is a second
+/// switch, so the pull-based half can be tried on its own before the machinery that acts unasked
+/// comes back with it.
+#[cfg(not(test))]
+pub const ENABLED: bool = false;
+
+/// Whether the board also works itself, on top of being usable by hand:
+///
+/// - the idle-agent nudge ([`super::Engine::nudge_for_tasks`]),
+/// - the tick's sweep that hands a departed agent's tasks back ([`Board::reclaim_absent`]),
+/// - the `--task` trigger action ([`super::triggers::What::Task`]), refused both when a rule is
+///   created and if a persisted one comes due.
+///
+/// This is the half that was buggy enough to mislead. It means nothing without [`ENABLED`] —
+/// read it through [`autonomous`] rather than on its own.
+///
+/// TODO(task-queue): re-arm by flipping this to `true` and putting the `agents.task_nudge`
+/// default back to `true` in [`crate::config`]. Every gate is an early return in front of code
+/// left intact, so there is nothing else to put back.
+#[cfg(not(test))]
+pub const AUTONOMOUS: bool = false;
+
+/// Both switches are on under `cfg(test)`, so the paused machinery goes on being exercised
+/// instead of rotting while it waits. What the gates add is a single early return each; what the
+/// suites are worth running for is everything behind them.
+#[cfg(test)]
+pub const ENABLED: bool = true;
+#[cfg(test)]
+pub const AUTONOMOUS: bool = true;
+
+/// Whether the board may act on its own.
+///
+/// Autonomy over a paused board would be a contradiction — the nudge would send agents at a
+/// `claim` the socket refuses — so the two switches are only ever read together.
+pub const fn autonomous() -> bool {
+    ENABLED && AUTONOMOUS
+}
 
 /// Tasks kept in memory. Beyond this the oldest done ones are forgotten.
 const CAP: usize = 2000;

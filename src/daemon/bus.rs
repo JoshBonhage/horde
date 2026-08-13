@@ -38,6 +38,8 @@
 //!
 //! Neither is overridable by `--now`: forcing a write the terminal cannot take does not
 //! deliver the message, it loses it quietly or hangs the daemon.
+//!
+//! The whole bus is paused for now — see [`ENABLED`].
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -49,6 +51,28 @@ use crate::config::Config;
 use crate::proto::{AgentState, Delivery, Event, Message, MsgKind, PaneId, SpaceId};
 
 use super::state::Session;
+
+/// Master switch for the bus itself. Off: agent-to-agent messaging is paused.
+///
+/// Every method that moves a message — send, reply, broadcast — is refused at the socket while
+/// this is off, so nothing can be injected into a pane however it was asked for: not by hand,
+/// not by a trigger, not by the idle nudge. `bus.tail` and `bus.reply_for` are deliberately
+/// still allowed, because reading the record delivers nothing. The log on disk is left alone,
+/// so pausing costs no history.
+///
+/// Paired with [`super::tasks::ENABLED`] rather than independent of it: the board's nudge was
+/// the thing injecting messages nobody asked for, and half a pause would have left the other
+/// half free to surprise you the same way.
+///
+/// TODO(bus-pause): turning this back on restores the bus by hand. Every gate is an early
+/// return in front of code left intact, so there is nothing else to put back.
+#[cfg(not(test))]
+pub const ENABLED: bool = false;
+
+/// On under `cfg(test)`, so the paused machinery goes on being exercised instead of rotting
+/// while it waits — exactly as the board's switches are.
+#[cfg(test)]
+pub const ENABLED: bool = true;
 
 /// Messages kept in memory for the bus drawer.
 const RING: usize = 500;

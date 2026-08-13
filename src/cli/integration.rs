@@ -352,20 +352,38 @@ mod tests {
             "name: horde",
             "description:",
             "HORDE_PANE",
-            "horde reply",
-            "horde ask",
-            "horde send",
             "horde roster",
             "horde wait",
             "horde spawn",
-            "[horde] request",
+            "horde pane read",
+            "horde digest",
         ] {
             assert!(SKILL.contains(needed), "the skill never mentions {needed}");
         }
-        // The point of the skill is that `reply` is run, not researched.
+    }
+
+    /// The skill is how an agent learns what horde offers, so it has to track what horde
+    /// actually answers. While the bus and the board are paused (`daemon::bus::ENABLED`,
+    /// `daemon::tasks::ENABLED`) a skill that still reads as "message the reviewer" spends the
+    /// agent's turn on a command the daemon refuses — and, worse, invites it to go looking for
+    /// the bug. Both halves are pinned: that the pause is stated, and that the refused commands
+    /// are not presented as things to run.
+    #[test]
+    fn the_skill_says_the_bus_and_the_board_are_paused() {
+        let lower = SKILL.to_lowercase();
+        assert!(lower.contains("paused"), "the skill must say the bus and board are off");
+        // In the frontmatter too: the description is all that is read when deciding whether
+        // the skill is even relevant, so the pause has to survive that trim.
+        let front = SKILL.split("---").nth(1).expect("frontmatter");
         assert!(
-            SKILL.contains("Do not investigate"),
-            "the skill must tell the agent to run horde reply directly"
+            front.to_lowercase().contains("paused"),
+            "the description must carry the pause, or the skill loads for delegating work"
+        );
+        // The old skill's instruction to answer a request. Nothing can send one now, so an
+        // agent told to watch for them is watching for something that cannot arrive.
+        assert!(
+            !SKILL.contains("[horde] request"),
+            "no request can be delivered while the bus is paused"
         );
     }
 

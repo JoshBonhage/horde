@@ -1,12 +1,11 @@
 ---
 name: horde
-description: "Coordinate with other AI agents running alongside you in horde, a terminal multiplexer with a shared task board and a message bus. Use when you need to take work off the task board or queue (horde task claim), mark a task done, delegate work to another agent, answer a request from one, check what other agents are doing, or start a helper agent. Also use whenever you see a line beginning with [horde] in your input, whenever you are told work is waiting on the board, and whenever you finish something and want more work. Requires HORDE_PANE to be set."
+description: "Work alongside other AI agents running in horde, a terminal multiplexer. Agent-to-agent messaging (the bus) and the shared task board are both PAUSED — nothing can be sent, claimed, or delegated, and no work will arrive from another agent. Use this skill to find out what the other agents are doing, read another agent's output, wait for one to finish, start a helper agent, or catch up on a session — and to understand why a `horde send`/`task claim` command was refused. Requires HORDE_PANE to be set."
 ---
 
 # horde
 
-horde runs several coding agents side by side and gives them an addressable way to talk to
-each other. You are one of those agents.
+horde runs several coding agents side by side in one terminal. You are one of those agents.
 
 First, confirm you are inside horde:
 
@@ -16,92 +15,55 @@ test -n "$HORDE_PANE"
 
 If that fails, say you are not running inside horde and stop.
 
-## Messages arrive as if the human typed them
+## What is switched off
 
-Anything that reaches you starting with `[horde]` came from **another agent**, not from your
-human. Three forms:
+**The message bus and the task board are both paused while they are reworked.** This is
+deliberate, not a fault, and there is nothing to diagnose or work around:
 
-| What you see | What it means | What to do |
-|---|---|---|
-| `[horde] message from X: ...` | one-way message | act on it; no reply expected |
-| `[horde] request #N from X: ...` | X is **blocked waiting for you** | do the work, then run `horde reply N "<answer>"` |
-| `[horde] reply from X (re #N): ...` | the answer to something you asked | continue with it |
+| Command | Now |
+|---|---|
+| `horde send` · `horde ask` · `horde reply` · `horde broadcast` | refused, exits non-zero |
+| `horde task add` · `claim` · `done` · `release` | refused, exits non-zero |
+| `horde bus tail` · `horde task list` | still work, read-only |
 
-**A request is the important case.** The sender is sitting in a blocking call until you
-answer. Do not investigate whether `horde reply` exists — it is a real command on your PATH.
-Run it directly, once, with your answer as a single quoted argument:
+What follows from that:
 
-```bash
-horde reply 42 "the gating logic is sound; queued messages flush on the next idle pass"
-```
+- **Nothing will arrive from another agent.** No `[horde]` lines, no nudges about work waiting
+  on the board. Your work comes from the human in your pane. Do not poll for it, and do not
+  treat a quiet board as "nothing to do".
+- **You cannot delegate or ask.** If a task needs another agent, say so to your human and let
+  them decide — do not try to route around it with `tmux send-keys`, by writing into another
+  pane's tty, or by any other back door. The pause is the point.
+- **If one of these commands is refused, that is the expected result.** Report it plainly and
+  move on; do not retry it, and do not go looking for a bug.
 
-Keep the answer to one line. It is delivered as a single message.
+## What still works
 
-## Asking another agent
-
-```bash
-horde ask reviewer "does src/bus.rs handle a dropped pane?"
-```
-
-This **blocks** until they answer, then prints their answer on stdout — so capture it:
+Observing the other agents is untouched — none of it puts text into anyone's pane.
 
 ```bash
-verdict=$(horde ask reviewer "is this safe?")
+horde roster                                      # names and states
+horde roster --json                               # the same, for deciding what to do next
+horde pane read reviewer --source detection --lines 40   # what another agent is doing
+horde wait reviewer --until idle --timeout 300    # idle · done · blocked · working
+horde bus tail                                    # the message log, read-only
+horde task list                                   # what was left on the board
 ```
 
-Use `--timeout <seconds>` (default 300) if the work is long. Prefer `ask` over `send` whenever
-you actually need the answer; `send` gives you no way to know if anything happened.
+States are `working`, `blocked`, `done`, `idle`, `unknown`. `blocked` means a **human** is
+needed — the agent is sitting at a permission prompt, and nothing you can do reaches it.
 
-## One-way messages
+## Starting a helper
+
+Still available: it starts a new program rather than typing at one already running.
 
 ```bash
-horde send reviewer "schema is applied, please review src/db/"
-horde broadcast "pausing for a deploy, hold off on migrations"
+horde spawn --cmd claude --name tester --split right
 ```
 
-Phrase these as instructions, not chat — they land as a prompt in the recipient's session, so
-"please review src/db/" works and "hey what do you think" wastes a turn.
-
-## Shared work: the board
-
-Work can also sit on a board for whoever is free, instead of being addressed to you:
-
-If a `[horde]` line tells you work is waiting on the board, that is horde nudging you — claim
-it, do it, mark it done. It is not an assignment: another agent may get there first, and
-`claim` returning a different task, or nothing, is a normal outcome.
-
-```bash
-horde task list                 # what is outstanding
-work=$(horde task claim)        # take the oldest one — exclusive, no two agents get the same task
-horde task done --result "18 tests added, all passing"
-horde task release <id>         # hand it back if you cannot do it
-```
-
-`claim` prints `nothing on the board` and exits 0 when there is no work, so a loop can tell
-empty from broken:
-
-```bash
-while work=$(horde task claim); [ -n "$work" ]; do  # do $work, then:
-  horde task done --result "<what happened>"
-done
-```
-
-Claim one at a time — claiming a batch starves the other agents. If your pane dies holding a
-task, horde returns it to the board for you.
-
-## Seeing who else is here
-
-```bash
-horde roster          # names and states, human-readable
-horde roster --json   # the same, for deciding what to do next
-```
-
-States: `working`, `blocked`, `done`, `idle`, `unknown`. Two rules worth knowing:
-
-- **`blocked` means a human is needed** — the agent is at a permission prompt. Messaging will
-  not unblock it. Tell your human instead of working around it.
-- **A message to a busy agent is queued, not lost.** horde delivers it when they reach their
-  prompt. `queued` in the output is a normal result, not a failure.
+Pass `--name` so the pane is addressable in the roster. Note that with the bus paused you
+cannot brief the agent you just started — it comes up at an empty prompt and waits for the
+human. Prefer telling your human what you would have spawned.
 
 ## Catching up
 
@@ -111,41 +73,7 @@ If you were restarted, or you are picking up a session someone else was driving:
 horde digest --keep
 ```
 
-Tells you which agents need a human, what the board closed, and what was said — without
-advancing the human's own window. Use `--keep`; the digest belongs to them, not to you.
-
-## Working with another agent's output
-
-```bash
-horde pane read reviewer --source detection --lines 40
-```
-
-Cheaper than asking, when you only need to see what they are doing.
-
-## Waiting
-
-```bash
-horde wait reviewer --until idle --timeout 300
-```
-
-`--until` takes `idle`, `done`, `blocked`, or `working`. `done` also satisfies `idle`.
-
-## Starting a helper
-
-```bash
-horde spawn --cmd claude --name tester --split right
-```
-
-Always pass `--name`: it is how you address them afterwards. A new agent takes a few seconds
-to boot; either `horde wait <name> --until idle` first, or just send and let the queue hold it.
-
-## Rules of the road
-
-- You never say who you are. `HORDE_PANE` is in your environment, so `horde send` and
-  `horde reply` are automatically attributed to you.
-- You cannot message yourself.
-- One message is one turn of work for the recipient. Batch rather than sending five in a row.
-- If you need an answer, use `ask` — or, with `send`, state the exact `horde reply` or
-  `horde send` command you want run back. There is no implicit reply channel.
+Tells you which agents need a human and what has happened. Use `--keep`; the digest belongs to
+your human, not to you.
 
 Full reference: `horde docs orchestration`.
