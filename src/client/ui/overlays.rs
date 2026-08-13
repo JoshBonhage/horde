@@ -6,11 +6,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use ratatui::Frame;
 
+use super::pane_widget::fmt_elapsed;
+use super::statusbar::shorten_home;
 use super::{centered, color, fill, put_line, truncate, wrap_text};
 use crate::client::menu::Act;
 use crate::client::settings::{self, Kind};
 use crate::client::{App, Mode, PickKind};
 use crate::config::{Action, Trigger};
+use crate::proto::Snapshot;
 use crate::proto::{AgentLine, AgentState, Delivery, Digest, NoticeLevel, Rgb};
 use crate::theme::Theme;
 
@@ -117,6 +120,10 @@ fn describe_action(name: &str, action: &Action) -> String {
         Action::RenamePane => "rename the focused pane".into(),
         Action::Settings => "settings".into(),
         Action::SendPrefix => "send the prefix key to the pane".into(),
+        Action::SidebarFocus => "walk the sidebar with j/k".into(),
+        Action::TogglePin => "pin this agent to the top of the sidebar".into(),
+        Action::Roster => "every project and agent, full screen".into(),
+        Action::CycleLens => "filter the agent list".into(),
         // The generic name-to-words fallback would render this as bare "digest", which does
         // not say what it does.
         Action::Cmd(crate::proto::Cmd::RequestDigest) => "what happened while you were away".into(),
@@ -301,10 +308,12 @@ pub fn menu(f: &mut Frame, area: TRect, app: &mut App) {
             .width
             .saturating_sub(2 + label.chars().count() as u16 + hint.chars().count() as u16 + 1);
 
-        let mut label_style = row_bg.fg(color(if selected {
-            theme.ui.text
-        } else {
-            theme.ui.text_dim
+        let mut label_style = row_bg.fg(color(match item.color {
+            // An entry whose colour is its content keeps that colour whether selected or
+            // not — dimming a swatch would misreport the colour it is offering.
+            Some(c) => c,
+            None if selected => theme.ui.text,
+            None => theme.ui.text_dim,
         }));
         if selected {
             label_style = label_style.add_modifier(Modifier::BOLD);
@@ -992,4 +1001,241 @@ mod tests {
         let d = describe_action("digest", &Action::Cmd(crate::proto::Cmd::RequestDigest));
         assert!(d.contains("while you were away"), "{d}");
     }
+
+    // -- roster ------------------------------------------------------------
+
+    fn roster_text(cards: &[Card]) -> String {
+        cards.iter().flat_map(|c| c.lines.iter().cloned()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_roster_shows_every_space_with_its_agents_and_cwd() {
+        let cards = roster_cards(&crate::client::roster::tests::snap(), 40);
+        let out = roster_text(&cards);
+        println!("\n{out}\n");
+        for want in ["api-refactor", "docs", "builder", "reviewer", "writer", "/tmp"] {
+            assert!(out.contains(want), "{want} missing from:\n{out}");
+        }
+        assert_eq!(cards.len(), 2, "one card per space");
+    }
+
+    /// Prose where the sidebar has to use glyphs — the whole reason a full-screen view earns
+    /// its place is that it can afford to spell things out.
+    #[test]
+    fn the_roster_card_uses_prose_where_the_sidebar_uses_glyphs() {
+        let cards = roster_cards(&crate::client::roster::tests::snap(), 40);
+        let out = roster_text(&cards);
+        assert!(out.contains("1 needs you"), "{out}");
+        assert!(out.contains("1 working"), "{out}");
+    }
+
+    /// A project with nothing running is a fact worth showing, not a card worth skipping —
+    /// "which of my six repos has nothing on it" is exactly what this view is for.
+    #[test]
+    fn a_space_with_no_agents_still_gets_a_card_saying_so() {
+        let mut s = crate::client::roster::tests::snap();
+        s.panes.retain(|p| p.space != 2);
+        let cards = roster_cards(&s, 40);
+        assert_eq!(cards.len(), 2, "the empty space keeps its card");
+        let docs = cards
+            .iter()
+            .find(|c| c.focuses[0].1 == crate::client::roster::Focus::Group(2))
+            .unwrap();
+        assert!(docs.lines.iter().any(|l| l.contains("no agents")), "{:?}", docs.lines);
+    }
+
+    #[test]
+    fn a_roster_card_carries_the_role_and_who_started_the_pane() {
+        let mut s = crate::client::roster::tests::snap();
+        let p = s.panes.iter_mut().find(|p| p.id == 1).unwrap();
+        p.role = Some("reviewer".into());
+        p.spawned_by = Some(3);
+        let out = roster_text(&roster_cards(&s, 48));
+        assert!(out.contains("[reviewer]"), "{out}");
+        assert!(out.contains("horde"), "a machine-started pane says so: {out}");
+    }
+
+    /// Every agent line has to be landable, or the cursor could not reach it from this view.
+    #[test]
+    fn every_agent_line_is_something_the_cursor_can_land_on() {
+        use crate::client::roster::Focus;
+        let cards = roster_cards(&crate::client::roster::tests::snap(), 40);
+        let agents: Vec<Focus> = cards
+            .iter()
+            .flat_map(|c| c.focuses.iter().map(|(_, f)| *f))
+            .filter(|f| matches!(f, Focus::Agent(_)))
+            .collect();
+        assert_eq!(agents.len(), 3, "{agents:?}");
+        for c in &cards {
+            for (i, _) in &c.focuses {
+                assert!(*i < c.lines.len(), "focus past the end of the card");
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_card_truncates_rather_than_overflowing() {
+        let cards = roster_cards(&crate::client::roster::tests::snap(), 12);
+        for c in &cards {
+            for l in &c.lines {
+                assert!(super::super::width(l) <= 12, "{l:?}");
+            }
+        }
+    }
+
+}
+
+/// One project's card in the roster.
+#[derive(Debug, Clone)]
+pub struct Card {
+    pub lines: Vec<String>,
+    /// Which line each landable row is on, so the overlay can mark the cursor and act on it.
+    /// The first is always the card's own space, which is what identifies the card.
+    pub focuses: Vec<(usize, crate::client::roster::Focus)>,
+}
+
+/// The roster as data.
+///
+/// Pure, and separate from drawing it, for the same reason `digest_lines` is: it is what
+/// makes the content assertable without standing up a terminal.
+pub fn roster_cards(snap: &Snapshot, width: usize) -> Vec<Card> {
+    use crate::client::roster::{collect_agents, Focus, Roll};
+    let agents = collect_agents(snap);
+    let mut out = Vec::new();
+    for space in &snap.spaces {
+        let mine: Vec<_> = agents.iter().filter(|a| a.space == space.id).collect();
+        let mut roll = Roll::default();
+        for a in &mine {
+            roll.add(a.state);
+        }
+
+        let mut lines = vec![truncate(&space.name, width)];
+        let mut focuses = vec![(0usize, Focus::Group(space.id))];
+        lines.push(truncate(&roll.prose(), width));
+        lines.push(truncate(&shorten_home(&space.cwd), width));
+
+        for a in &mine {
+            let Some(p) = snap.panes.iter().find(|p| p.id == a.pane) else { continue };
+            let Some(info) = p.agent.as_ref() else { continue };
+            let detail = match info.state {
+                AgentState::Working => fmt_elapsed(info.elapsed),
+                _ => info.state.label().to_string(),
+            };
+            let role = p.role.as_deref().map(|r| format!(" [{r}]")).unwrap_or_default();
+            // `horde` marks a pane horde started rather than you — the same fact `agent.list`
+            // exposes and nothing else in the UI has ever shown.
+            let by = if p.spawned_by.is_some() { " · horde" } else { "" };
+            focuses.push((lines.len(), Focus::Agent(a.pane)));
+            lines.push(truncate(
+                &format!("{} {}{role}  {detail}{by}", info.state.glyph(), info.name),
+                width,
+            ));
+            // Only while it is actually doing something — a finished turn's counts are stale
+            // trivia, the same reason the sidebar gates this.
+            if info.state == AgentState::Working {
+                if let Some(act) = info.activity.summary() {
+                    lines.push(truncate(&format!("    {act}"), width));
+                }
+            }
+        }
+        // A blank line between cards, so a column reads as several cards rather than one list.
+        lines.push(String::new());
+        out.push(Card { lines, focuses });
+    }
+    out
+}
+
+/// The full-screen roster: every project, every agent, at a size that can afford detail.
+pub fn roster(f: &mut Frame, area: TRect, app: &mut App) {
+    let theme = app.cfg.theme.clone();
+    let Some(snap) = app.snapshot.clone() else { return };
+    let scroll = match app.mode {
+        Mode::Roster { scroll } => scroll,
+        _ => 0,
+    };
+
+    let outer = centered(area, area.width.saturating_sub(4), area.height.saturating_sub(2));
+    let inner = panel(f, outer, "roster", &theme);
+    if inner.width < 20 || inner.height < 4 {
+        return;
+    }
+    let bottom = inner.y + inner.height;
+    // Reserve the last row for the hint, which has to stay put at any scroll offset.
+    let view_h = inner.height.saturating_sub(1) as usize;
+
+    // Three columns at most: past that a card is too narrow to say anything the sidebar could
+    // not. Below eighty columns, one.
+    const CARD: u16 = 34;
+    let cols = (inner.width / CARD).clamp(1, 3) as usize;
+    let col_w = (inner.width as usize / cols).saturating_sub(1);
+    let cards = roster_cards(&snap, col_w);
+
+    // Fill the shortest column each time, so a session with one busy project and five quiet
+    // ones does not leave two columns empty.
+    let mut columns: Vec<Vec<(String, Option<crate::client::roster::Focus>)>> =
+        vec![Vec::new(); cols];
+    for card in &cards {
+        let target = columns
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, c)| (c.len(), *i))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        for (i, line) in card.lines.iter().enumerate() {
+            let focus = card.focuses.iter().find(|(li, _)| *li == i).map(|(_, f)| *f);
+            columns[target].push((line.clone(), focus));
+        }
+    }
+
+    let longest = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+    let scroll = scroll.min(longest.saturating_sub(view_h));
+    app.roster_hits.clear();
+
+    for (ci, column) in columns.iter().enumerate() {
+        let x = inner.x + (ci * (col_w + 1)) as u16;
+        let mut y = inner.y;
+        for (line, focus) in column.iter().skip(scroll).take(view_h) {
+            if y >= bottom.saturating_sub(1) {
+                break;
+            }
+            let on_cursor = focus.is_some() && *focus == app.sidebar.cursor;
+            let bg = if on_cursor { theme.ui.title_bg } else { theme.ui.panel_bg };
+            let fg = match focus {
+                // A card's title carries its project's colour, the same one the tab bar and
+                // that project's pane borders use — so a card is identifiable before it is read.
+                Some(crate::client::roster::Focus::Group(sp)) => theme.space_accent(
+                    snap.spaces.iter().find(|s| s.id == *sp).map(|s| s.accent).unwrap_or(0),
+                ),
+                Some(_) => theme.ui.text_dim,
+                None => theme.ui.text_faint,
+            };
+            let mut style = Style::default().fg(color(fg)).bg(color(bg));
+            if matches!(focus, Some(crate::client::roster::Focus::Group(_))) {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            put_line(
+                f.buffer_mut(),
+                x,
+                y,
+                col_w as u16,
+                Line::from(vec![Span::styled(format!("{line:<col_w$}"), style)]),
+            );
+            if let Some(fc) = focus {
+                app.roster_hits.push((y, x, col_w as u16, *fc));
+            }
+            y += 1;
+        }
+    }
+
+    let hint = "enter jumps · j/k move · p pin · esc closes";
+    put_line(
+        f.buffer_mut(),
+        inner.x,
+        bottom - 1,
+        inner.width,
+        Line::from(vec![Span::styled(
+            hint.to_string(),
+            Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.panel_bg)),
+        )]),
+    );
 }

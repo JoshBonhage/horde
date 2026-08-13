@@ -21,8 +21,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::proto::{AgentState, Message, Row, ViewState};
 
-/// Bumped when the manifest shape changes. A successor that disagrees refuses the handoff,
-/// and the outgoing daemon simply carries on.
+/// Bumped when the manifest shape changes *incompatibly*. A successor that disagrees refuses
+/// the handoff, and the outgoing daemon simply carries on.
+///
+/// Adding a `#[serde(default)]` field is not such a change, and deliberately does not bump
+/// this — the manifest is JSON, so a missing key genuinely defaults, unlike `PROTOCOL_VERSION`
+/// where postcard's positional encoding leaves no such room. Bumping would refuse every
+/// handoff *out of* an already-running older daemon, which is the exact operation this version
+/// exists to protect: you would have to `horde stop` and lose every live agent conversation
+/// just to get onto the new build. The cost of a defaulted field is that a downgrade drops it,
+/// and a downgrade drops it regardless.
 pub const HANDOFF_VERSION: u32 = 1;
 
 /// Descriptors per `sendmsg`. Well under the kernel's per-message limit, so a session with
@@ -55,6 +63,13 @@ pub struct HSpace {
     pub cwd: String,
     pub tabs: Vec<HTab>,
     pub focused_tab: Option<usize>,
+    /// Project accent slot. `None` from a daemon that predates accents, which the successor
+    /// answers by picking one — inheriting slot 0 for every space would look like a bug
+    /// rather than like the absence it is.
+    #[serde(default)]
+    pub accent: Option<u8>,
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,6 +101,13 @@ pub struct HPane {
     /// one horde thinks you started — quietly freeing a slot under the unattended cap.
     #[serde(default)]
     pub spawned_by: Option<u64>,
+    /// Carried across the swap for the same reason `spawned_by` is: metadata left out of the
+    /// manifest is not degraded, it is gone — on every upgrade, silently, and you would not
+    /// find out until you next looked for it.
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
     /// The pane's visible grid, replayed into the successor's emulator so the screen does
     /// not go blank. Programs that own the alternate screen (`nvim`, `htop`) come back
     /// looking approximate until they next redraw — their processes are untouched either way.
@@ -318,6 +340,8 @@ mod tests {
                     rows: 24,
                     agent: None,
                     spawned_by: None,
+                    role: None,
+                    pinned: false,
                     screen: vec![],
                     pending: vec![],
                     cursor_x: 0,
@@ -498,5 +522,62 @@ mod tests {
         // And the cursor lands where it was.
         assert_eq!(term.grid().cursor.point.line, Line(1));
         assert_eq!(term.grid().cursor.point.column, Column(3));
+    }
+
+    /// Metadata left out of the manifest is not degraded, it is *gone* — on every
+    /// `horde upgrade`, silently. This is the guard for that.
+    #[test]
+    fn roles_and_accents_survive_the_manifest_round_trip() {
+        let mut m = manifest(2);
+        m.panes[0].role = Some("reviewer".into());
+        m.panes[0].pinned = true;
+        m.spaces.push(HSpace {
+            name: "api".into(),
+            cwd: "/tmp".into(),
+            tabs: vec![],
+            focused_tab: None,
+            accent: Some(6),
+            collapsed: true,
+        });
+
+        let json = serde_json::to_string(&m).unwrap();
+        let back: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.panes[0].role.as_deref(), Some("reviewer"));
+        assert!(back.panes[0].pinned);
+        assert_eq!(back.panes[1].role, None, "an unlabelled pane stays unlabelled");
+        assert_eq!(back.spaces[0].accent, Some(6));
+        assert!(back.spaces[0].collapsed);
+    }
+
+    /// The test that earns `HANDOFF_VERSION` staying at 1. A manifest from a daemon built
+    /// before roles existed carries none of these keys, and must still be adopted — bumping
+    /// the version instead would refuse every handoff *out of* an already-running older
+    /// daemon, forcing a `horde stop` and the loss of every live agent conversation just to
+    /// reach the new build.
+    #[test]
+    fn a_manifest_from_a_daemon_without_roles_is_still_adopted() {
+        let doc = serde_json::json!({
+            "version": 1,
+            "from_version": "old",
+            "spaces": [{ "name": "api", "cwd": "/tmp", "tabs": [], "focused_tab": null }],
+            "focused_space": null,
+            "view": { "sidebar_open": true, "bus_open": false,
+                      "sidebar_width": 24, "bus_width": 30, "zoom": null },
+            "client_cols": 120,
+            "client_rows": 40,
+            "panes": [{
+                "pid": 1, "cmd": "zsh", "cwd": "/tmp", "name": null, "osc_title": "",
+                "cols": 80, "rows": 24, "agent": null, "screen": [], "pending": [],
+                "cursor_x": 0, "cursor_y": 0,
+            }],
+            "bus": [],
+        });
+        let m: Manifest = serde_json::from_value(doc).expect("an older manifest must parse");
+        assert_eq!(m.version, HANDOFF_VERSION, "and not be refused");
+        assert_eq!(m.panes[0].role, None);
+        assert!(!m.panes[0].pinned);
+        // `None` rather than `Some(0)`: the successor answers this by picking a slot, and it
+        // can only tell "no accent" from "slot zero" if the absence is modelled.
+        assert_eq!(m.spaces[0].accent, None);
     }
 }

@@ -207,6 +207,8 @@ fn build(eng: &mut Engine, order: &[PaneId]) -> Result<(Manifest, Vec<RawFd>)> {
             name: space.name.clone(),
             cwd: space.cwd.to_string_lossy().to_string(),
             tabs,
+            accent: Some(space.accent),
+            collapsed: space.collapsed,
         });
     }
 

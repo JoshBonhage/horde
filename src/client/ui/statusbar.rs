@@ -29,9 +29,12 @@ impl Widget for TabBar<'_> {
         let mut spans: Vec<Span<'static>> = Vec::new();
         if let Some(space) = self.snap.spaces.iter().find(|s| Some(s.id) == self.snap.focused_space)
         {
+            // The focused space's own colour rather than the one shared accent. The tab bar
+            // is always on screen, so this is the cheapest possible answer to "which project
+            // am I looking at" — read before you read, rather than after.
             spans.push(Span::styled(
                 format!(" {} ", truncate(&space.name, 24)),
-                panel.fg(color(t.ui.accent)).add_modifier(Modifier::BOLD),
+                panel.fg(color(t.space_accent(space.accent))).add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled("› ".to_string(), panel.fg(color(t.ui.text_faint))));
 
@@ -155,6 +158,10 @@ impl Widget for StatusBar<'_> {
             Mode::SpaceSwitcher { .. } => left.push(chip(" SPACE ", t.ui.accent_alt, t)),
             Mode::Prompt { .. } => left.push(chip(" INPUT ", t.ui.accent_alt, t)),
             Mode::Menu { .. } => left.push(chip(" MENU ", t.ui.accent_alt, t)),
+            // Without this chip there is nothing telling you why `j` stopped reaching the
+            // pane — which is the worst thing a keyboard-grabbing panel can do.
+            Mode::Sidebar => left.push(chip(" SIDEBAR ", t.ui.accent_alt, t)),
+            Mode::Roster { .. } => left.push(chip(" ROSTER ", t.ui.accent_alt, t)),
             Mode::Settings { .. } => left.push(chip(" SETTINGS ", t.ui.accent_alt, t)),
             Mode::Digest { .. } => left.push(chip(" DIGEST ", t.ui.accent_alt, t)),
             Mode::Terminal => left.push(Span::styled(
@@ -226,7 +233,9 @@ fn chip(text: &str, bg: crate::proto::Rgb, t: &Theme) -> Span<'static> {
     )
 }
 
-fn shorten_home(path: &str) -> String {
+/// `~` for the home prefix. Shared, because more than one view shows a path and two copies
+/// would drift.
+pub fn shorten_home(path: &str) -> String {
     match dirs::home_dir() {
         Some(home) => {
             let h = home.to_string_lossy();
@@ -271,6 +280,8 @@ mod tests {
                 scroll_offset: 0,
                 wants_mouse: false,
                 bracketed_paste: false,
+                role: None,
+                pinned: false,
             })
             .collect();
         let tab_list: Vec<TabInfo> = (1..=tabs)
@@ -293,6 +304,8 @@ mod tests {
                 focused_tab: Some(1),
                 agent_count: panes.iter().filter(|p| p.agent.is_some()).count(),
                 attention_count: 0,
+                accent: 0,
+                collapsed: false,
             }],
             tabs: tab_list,
             panes,

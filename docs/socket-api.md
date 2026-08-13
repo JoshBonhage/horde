@@ -76,6 +76,9 @@ from.
 | `space.create` | `name?`, `cwd?` |
 | `space.focus` | `name` |
 | `space.close` | `name` — kills every process in it |
+| `space.rename` | `name`, `to` — answers with the name it actually got, since a clash is uniquified |
+| `space.accent` | `name?`/`space?`, `slot?` — omit the slot to step to the next colour |
+| `space.collapse` | `name?`/`space?`, `collapsed?` — omit to toggle |
 
 ### Tabs
 
@@ -84,6 +87,23 @@ from.
 | `tab.list` | — |
 | `tab.create` | `name?` |
 | `tab.close` | — closes the focused tab |
+| `tab.rename` | `tab?`, `name` |
+
+### Roles
+
+| Method | Params | Notes |
+|---|---|---|
+| `role.list` | — | every role in use and how many panes wear it, declared or not |
+
+A role is a job you give a pane — `reviewer`, `builder`, `docs` — and is distinct from both
+the pane's name (how you address it) and the agent's kind (which program was detected). Only
+the role recurs across projects, which is what makes `role.list` able to answer "who is
+reviewing, everywhere" in one call.
+
+Names are normalised on the way in: trimmed, lowercased, spaces and underscores folded to
+`-`, capped at 16 characters. So `Code Reviewer` is stored and returned as `code-reviewer`.
+Set a role that is not declared in `config.toml` and it still works — declaring one only
+chooses how it looks.
 
 ### Panes
 
@@ -95,6 +115,8 @@ from.
 | `pane.close` | `pane?` | |
 | `pane.focus` | `pane` | also clears a `done` badge |
 | `pane.rename` | `pane`, `name` | empty name clears it |
+| `pane.role` | `pane?`, `role` | what the pane is *for*; empty clears it. Answers with the **normalised** name |
+| `pane.pin` | `pane?`, `pinned?` | hold it at the top of the sidebar; omit to toggle |
 | `pane.read` | `pane?`, `lines?`, `source?` | source: `visible`/`recent`/`detection` |
 | `pane.send_text` | `pane?`, `text`, `submit?` | raw write; **bypasses the bus and its state gate** |
 | `pane.report_agent` | `pane?`, `state`, `session?` | what lifecycle hooks call |
@@ -122,6 +144,11 @@ Spawns or closes panes to match the preset's pane count.
 
 ### Bus
 
+**Paused.** Every method here except `bus.tail` and `bus.reply_for` currently answers
+`failed: the message bus is paused while it is reworked`. Both exceptions only read the log —
+neither can put text into a pane, which is the thing being paused. The table is what they do
+when it is back on.
+
 | Method | Params | Notes |
 |---|---|---|
 | `bus.send` | `to`, `body`, `from?`, `force?` | returns the `Message`, including its `delivery` |
@@ -134,6 +161,9 @@ Spawns or closes panes to match the preset's pane count.
 [orchestration §4](orchestration.md).
 
 ### Tasks
+
+**Paused.** Every method here except `task.list` currently answers `failed: the task board is
+paused while it is reworked`. The table is what they do when it is back on.
 
 | Method | Params | Notes |
 |---|---|---|

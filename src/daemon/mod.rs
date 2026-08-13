@@ -142,7 +142,16 @@ impl Engine {
         agents.mark_seen(session, pane);
     }
 
+    /// Deliver anything that was waiting for a busy agent to come free.
+    ///
+    /// Parked with the rest of the bus (`bus::ENABLED`). This is the one path that injects into
+    /// a pane without anyone asking *at that moment* — the asking happened earlier — so leaving
+    /// it running would mean a paused bus still typed at agents, which is the whole complaint.
+    /// Anything already queued stays queued, and shows as queued, until the bus is back.
     fn flush_bus(&mut self) -> Vec<Event> {
+        if !bus::ENABLED {
+            return Vec::new();
+        }
         let Engine { bus, session, cfg, .. } = self;
         bus.flush_queued(session, cfg)
     }
@@ -169,7 +178,13 @@ impl Engine {
     /// - **Once per idle period.** Keyed on the agent's `since`, so an agent that ignores the
     ///   nudge is not asked again until it has actually done something. Ten tasks added at
     ///   once produce one nudge, not ten.
+    ///
+    /// Parked for now behind [`tasks::autonomous`]: everything below the gate is intact and
+    /// still under test, but nothing tells an agent about the board until the switch is back on.
     fn nudge_for_tasks(&mut self) -> Vec<Event> {
+        if !tasks::autonomous() {
+            return Vec::new();
+        }
         let open = self.board.open_count();
         if !self.cfg.task_nudge || open == 0 {
             return Vec::new();
@@ -793,6 +808,18 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
                 problems.push((NoticeLevel::Warn, e.to_string()));
             }
         }
+        Cmd::SetSpaceAccent { space, slot } => {
+            eng.session.set_space_accent(space, slot);
+        }
+        Cmd::SetPaneRole { pane, role } => {
+            eng.session.set_pane_role(pane, &role);
+        }
+        Cmd::ToggleSpaceCollapsed(space) => {
+            eng.session.toggle_space_collapsed(space, None);
+        }
+        Cmd::TogglePanePinned(pane) => {
+            eng.session.toggle_pane_pinned(pane, None);
+        }
     }
 
     if let Some(p) = seen {
@@ -832,7 +859,8 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         let mut events = eng.detect();
         // A message held back for a busy agent may now be deliverable.
         events.extend(eng.flush_bus());
-        // Then, if anyone is free and the board is not empty, say so.
+        // Then, if anyone is free and the board is not empty, say so. A no-op while the board's
+        // autonomous half is parked; see `tasks::autonomous()`.
         events.extend(eng.nudge_for_tasks());
         let changed = !events.is_empty();
         for ev in events {
@@ -864,7 +892,12 @@ fn tick(eng: &mut Engine, detect_due: bool) {
     // quietly stalls on work nobody is doing. This runs after reaping, and every tick
     // rather than only on detection passes, because a pane can close without detection
     // having a say.
-    if eng.board.claimed_count() > 0 {
+    //
+    // Parked with the rest of the autonomous half (`tasks::autonomous()`): a task moving state
+    // with nobody asking is the behaviour being reworked. Nothing moves on a paused board
+    // anyway — a claim left behind while it is paused stays claimed, visible in `task list`,
+    // and is sorted out when the board comes back.
+    if tasks::autonomous() && eng.board.claimed_count() > 0 {
         let live: Vec<String> = eng
             .session
             .panes
@@ -1208,7 +1241,7 @@ mod tests {
     use super::*;
 
     /// Build an engine with one real pane, as the daemon would have.
-    fn engine() -> Engine {
+    pub(super) fn engine() -> Engine {
         let cfg = Config::default();
         let session = Session::new(&cfg);
         let agents = agents::Detector::new(&cfg);
@@ -1356,6 +1389,9 @@ mod tests {
         let p = std::env::temp_dir().join(format!("horde-nudge-{tag}-tasks.jsonl"));
         let _ = std::fs::remove_file(&p);
         let mut eng = engine();
+        // On here the way `unattended` is on in the trigger suite: the nudge ships off while the
+        // board's autonomous half is parked, and these tests are what keeps it from rotting.
+        eng.cfg.task_nudge = true;
         eng.board = tasks::Board::new(p);
         eng.bus =
             bus::Bus::new(std::env::temp_dir().join(format!("horde-nudge-{tag}-bus.jsonl")));

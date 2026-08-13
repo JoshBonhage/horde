@@ -55,7 +55,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Send a message to another agent.
+    /// Send a message to another agent. Paused while the bus is reworked.
     Send {
         /// Agent name, pane name, pane id, or space:tab:pane.
         to: String,
@@ -65,7 +65,7 @@ pub enum Command {
         #[arg(long)]
         now: bool,
     },
-    /// Ask another agent something and wait for its answer.
+    /// Ask another agent something and wait for its answer. Paused while the bus is reworked.
     ///
     /// Unlike `send`, this blocks until the agent replies and prints the reply to stdout, so
     /// it can be captured: `answer=$(horde ask reviewer "is this sound?")`. The recipient is
@@ -78,13 +78,13 @@ pub enum Command {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
     },
-    /// Answer a request you were sent. The request number is in the message.
+    /// Answer a request you were sent. Paused while the bus is reworked.
     Reply {
         /// Request number, as printed in `[horde] request #N`.
         request: u64,
         body: Vec<String>,
     },
-    /// Send a message to every agent.
+    /// Send a message to every agent. Paused while the bus is reworked.
     Broadcast {
         body: Vec<String>,
         /// Limit to one space.
@@ -114,7 +114,8 @@ pub enum Command {
     },
     /// Apply a named layout: solo, duo, trio, dev, quad.
     Layout { preset: String },
-    /// The shared task board agents pull work from.
+    /// The shared task board agents pull work from. Paused while it is reworked: `list` still
+    /// reads it, and add/claim/done/release are refused.
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
@@ -149,6 +150,11 @@ pub enum Command {
     Space {
         #[command(subcommand)]
         cmd: SpaceCmd,
+    },
+    /// What your agents are for, across every project.
+    Role {
+        #[command(subcommand)]
+        cmd: RoleCmd,
     },
     /// Tab management.
     Tab {
@@ -189,10 +195,12 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum TriggerCmd {
-    /// Add a rule. Needs one of --every/--at, and one of --task/--to.
+    /// Add a rule. Needs one of --every/--at, and one of --task/--to/--spawn.
     ///
-    /// `--task` is the one to reach for: the work lands on the board and whichever agent is
-    /// free claims it, so the rule never has to know who is idle.
+    /// `--task` and `--to` are both parked while the board and the bus are reworked, and the
+    /// daemon refuses them; `--spawn` is the one left. When the board is back, `--task` is the
+    /// one to reach for: the work lands on it and whichever agent is free claims it, so the
+    /// rule never has to know who is idle.
     Add {
         /// How often, e.g. 30m, 2h, 1d. At least 60s.
         #[arg(long, conflicts_with = "at")]
@@ -308,6 +316,23 @@ pub enum SpaceCmd {
     Close {
         name: String,
     },
+    /// Rename a space. Names address spaces in `horde send`, so a clash is uniquified —
+    /// the name you actually got is printed back.
+    Rename {
+        name: String,
+        to: String,
+    },
+    /// Set or cycle a space's accent colour. Omit the slot to step to the next one.
+    Accent {
+        name: String,
+        slot: Option<u8>,
+    },
+    /// Fold a space's agents away in the sidebar.
+    Collapse {
+        name: String,
+        #[arg(long)]
+        expand: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -315,6 +340,13 @@ pub enum TabCmd {
     List,
     New { name: Option<String> },
     Close,
+    Rename { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum RoleCmd {
+    /// Every role in use, and how many panes wear it.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -345,6 +377,17 @@ pub enum PaneCmd {
     Rename {
         pane: String,
         name: String,
+    },
+    /// Label what a pane is for: reviewer, builder, docs. Omit the role to clear it.
+    Role {
+        pane: Option<String>,
+        role: Option<String>,
+    },
+    /// Hold a pane at the top of the sidebar's agent list.
+    Pin {
+        pane: Option<String>,
+        #[arg(long)]
+        off: bool,
     },
     SendText {
         pane: String,
@@ -677,8 +720,18 @@ pub fn run(cmd: Command) -> Result<()> {
                 let items: Vec<Task> = serde_json::from_value(v)?;
                 let shown: Vec<&Task> =
                     items.iter().filter(|t| all || t.is_open() || t.is_claimed()).collect();
+                // Said before the list, not after: whatever is outstanding here, nobody is
+                // going to pick it up, and reading three open tasks without knowing that
+                // invites waiting for work that will never move.
+                if !crate::daemon::tasks::ENABLED {
+                    println!("the board is paused while it is reworked — nothing can be claimed");
+                }
                 if shown.is_empty() {
-                    println!("board is empty — add work with `horde task add \"...\"`");
+                    if crate::daemon::tasks::ENABLED {
+                        println!("board is empty — add work with `horde task add \"...\"`");
+                    } else {
+                        println!("board is empty");
+                    }
                     return Ok(());
                 }
                 for t in shown {
@@ -820,6 +873,26 @@ pub fn run(cmd: Command) -> Result<()> {
             }
         },
 
+        Command::Role { cmd } => match cmd {
+            RoleCmd::List => {
+                let v = call("role.list", json!({}))?;
+                let rows = v.as_array().cloned().unwrap_or_default();
+                if rows.is_empty() {
+                    // Distinguish "nothing is labelled" from "the call failed", the same way
+                    // an empty board does. Declared-but-unused roles are still worth listing,
+                    // so this is only for a genuinely empty answer.
+                    println!("no roles in use");
+                }
+                for r in rows {
+                    let name = r.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let panes = r.get("panes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let declared = r.get("declared").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let mark = if declared { "" } else { "  (undeclared)" };
+                    println!("{name:<16} {panes} panes{mark}");
+                }
+            }
+        },
+
         Command::Space { cmd } => match cmd {
             SpaceCmd::List => {
                 let v = call("space.list", json!({}))?;
@@ -847,6 +920,21 @@ pub fn run(cmd: Command) -> Result<()> {
                 call("space.close", json!({ "name": name }))?;
                 println!("closed {name}");
             }
+            SpaceCmd::Rename { name, to } => {
+                let v = call("space.rename", json!({ "name": name, "to": to }))?;
+                // The daemon uniquifies a clash silently, so print what it settled on rather
+                // than what was asked for.
+                println!("{}", v.get("name").and_then(|v| v.as_str()).unwrap_or(&to));
+            }
+            SpaceCmd::Accent { name, slot } => {
+                let v = call("space.accent", json!({ "name": name, "slot": slot }))?;
+                println!("{name} is on colour {}", v.get("slot").and_then(|v| v.as_u64()).unwrap_or(0));
+            }
+            SpaceCmd::Collapse { name, expand } => {
+                let v = call("space.collapse", json!({ "name": name, "collapsed": !expand }))?;
+                let now = v.get("collapsed").and_then(|v| v.as_bool()).unwrap_or(false);
+                println!("{name} {}", if now { "collapsed" } else { "expanded" });
+            }
         },
 
         Command::Tab { cmd } => match cmd {
@@ -861,6 +949,10 @@ pub fn run(cmd: Command) -> Result<()> {
             TabCmd::Close => {
                 call("tab.close", json!({}))?;
                 println!("tab closed");
+            }
+            TabCmd::Rename { name } => {
+                call("tab.rename", json!({ "name": name }))?;
+                println!("renamed");
             }
         },
 
@@ -905,6 +997,20 @@ pub fn run(cmd: Command) -> Result<()> {
             PaneCmd::Rename { pane, name } => {
                 call("pane.rename", json!({ "pane": pane, "name": name }))?;
                 println!("renamed");
+            }
+            PaneCmd::Role { pane, role } => {
+                let v =
+                    call("pane.role", json!({ "pane": pane, "role": role.unwrap_or_default() }))?;
+                // The normalised form, so a script that filters on what it just set matches.
+                match v.get("role").and_then(|v| v.as_str()) {
+                    Some(r) => println!("{r}"),
+                    None => println!("role cleared"),
+                }
+            }
+            PaneCmd::Pin { pane, off } => {
+                let v = call("pane.pin", json!({ "pane": pane, "pinned": !off }))?;
+                let now = v.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
+                println!("{}", if now { "pinned" } else { "unpinned" });
             }
             PaneCmd::SendText { pane, text, submit } => {
                 call(

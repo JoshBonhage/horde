@@ -1,9 +1,18 @@
 //! The left panel: two independent sections.
 //!
 //! **SPACES** lists projects only — no nested panes. **AGENTS** lists every agent in the
-//! session, wherever it lives, with its state. Keeping them apart means the agent list is a
-//! single flat thing you can scan rather than something you assemble by reading down a tree,
-//! and an agent in another space stays as visible as one in front of you.
+//! session, wherever it lives, grouped under the project it belongs to.
+//!
+//! The agent list used to be flat, on the argument that a single scannable list beats one you
+//! assemble by reading down a tree. That holds for a handful of agents and stops holding at
+//! the scale horde is for: with six projects running one to three agents each, a flat list of
+//! a dozen names cannot answer "what is running for the API repo" at all — the only thing
+//! separating one project's rows from another's was the dimming on rows outside the focused
+//! space. Grouping restores that answer while keeping every agent visible wherever it lives,
+//! which is the property the flat list was really protecting.
+//!
+//! *What* to show is decided in `client::roster`; this only draws it. That separation is what
+//! lets the renderer and the click handler agree on what row 7 is without computing it twice.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect as TRect;
@@ -11,8 +20,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
-use super::pane_widget::{fmt_elapsed, spinner_frame};
-use super::{color, fill, logo, put_line, truncate};
+use super::pane_widget::fmt_elapsed;
+use super::{color, fill, logo, put_line, state_look, truncate, width};
+use crate::client::roster::{filtered_rows, Density, Roll, RowKind};
 use crate::proto::{AgentState, PaneId, Rgb, Snapshot, SpaceId};
 use crate::theme::Theme;
 
@@ -21,10 +31,19 @@ use crate::theme::Theme;
 pub enum Hit {
     Space(SpaceId),
     Pane(PaneId),
+    /// A group header in the AGENTS section. Distinct from `Space` because clicking it folds
+    /// the group rather than switching to it.
+    Group(SpaceId),
 }
 
 /// Space rows to preserve when vertical room runs short.
 const MIN_SPACE_ROWS: u16 = 2;
+/// Agent rows to preserve before the space list gets any of what it asked for.
+///
+/// The agent list is the thing you actually watch, so it is the one that wins a squeeze.
+const MIN_AGENT_ROWS: u16 = 3;
+/// The rule and the label the AGENTS section costs before any of its rows.
+const AGENT_CHROME: u16 = 2;
 
 pub struct Sidebar<'a> {
     pub snap: &'a Snapshot,
@@ -33,20 +52,14 @@ pub struct Sidebar<'a> {
     pub theme: &'a Theme,
     pub tick: usize,
     pub animate: bool,
+    /// Cursor and scroll. Taken by `&mut` because both are clamped during render — how far
+    /// the list can scroll, and whether the cursor is on screen, depend on a height only the
+    /// renderer knows.
+    pub state: &'a mut crate::client::roster::SidebarState,
+    /// Whether the sidebar currently has the keyboard.
+    pub focused: bool,
     /// Filled in during render so clicks can be resolved without recomputing layout.
     pub hits: &'a mut Vec<(u16, Hit)>,
-}
-
-/// One agent, flattened out of the space/tab tree.
-struct AgentRow {
-    pane: PaneId,
-    name: String,
-    state: AgentState,
-    elapsed: u64,
-    /// False when the agent lives in a space other than the focused one.
-    here: bool,
-    /// What it has been doing this turn, when hooks are installed to tell us.
-    activity: Option<String>,
 }
 
 impl Widget for Sidebar<'_> {
@@ -59,7 +72,10 @@ impl Widget for Sidebar<'_> {
         self.hits.clear();
 
         let inner_w = area.width.saturating_sub(2);
-        let agents = collect_agents(self.snap);
+        let d = Density::of(inner_w);
+        let rows = filtered_rows(self.snap, d, &self.state.lens);
+        let total = rows.iter().filter(|r| matches!(r.kind, RowKind::Agent { .. })).count();
+
         let mut summary = summary_lines(self.snap);
         // The board belongs with the other standing counts: it is the same question, "is
         // there anything outstanding". Unclaimed work is the number that matters — once
@@ -67,6 +83,13 @@ impl Widget for Sidebar<'_> {
         if let Some((open, claimed)) = self.board {
             match (open, claimed) {
                 (0, 0) => {}
+                // A paused board reported as "3 tasks open" reads as work waiting for an agent,
+                // when in fact nothing can be claimed until it comes back. Both numbers together,
+                // because the distinction between open and claimed stops meaning anything the
+                // moment neither can change.
+                (o, c) if !crate::daemon::tasks::ENABLED => {
+                    summary.push(("◇", o + c, "tasks paused", AgentState::Unknown))
+                }
                 (0, c) => summary.push(("◇", c, "tasks claimed", AgentState::Unknown)),
                 (o, _) => summary.push(("◇", o, "tasks open", AgentState::Unknown)),
             }
@@ -78,29 +101,21 @@ impl Widget for Sidebar<'_> {
             summary.push(("◈", self.snap.triggers_armed, "triggers armed", AgentState::Working));
         }
 
-        // -- vertical budget, allocated from the bottom up -----------------
-        // Footer and the agent list earn their space first; spaces get the remainder,
-        // because a project list is short while the agent list is what you actually watch.
+        // -- vertical budget -----------------------------------------------
+        // The footer is reserved from the bottom; the rest is split between the two sections
+        // top-down, with the agent list taking its minimum before spaces take any.
         let bottom = area.y + area.height;
         let footer_h = if summary.is_empty() { 0 } else { summary.len() as u16 + 1 };
         let logo_h = logo::height(area.width, area.height);
         let top = area.y + logo_h + 1; // wordmark + rule
 
         let available = bottom.saturating_sub(top).saturating_sub(footer_h);
-        let space_need = self.snap.spaces.len() as u16 + 1; // label + rows
-        // rule + label + rows, or just rule + label + "none yet" when empty.
-        let agent_rows: u16 =
-            agents.iter().map(|a| 1 + u16::from(a.activity.is_some())).sum();
-        let agent_need = if agents.is_empty() { 3 } else { agent_rows + 2 };
-
-        let (space_h, agent_h) = if space_need + agent_need <= available {
-            (space_need, agent_need)
-        } else {
-            // Squeeze spaces first, but never below a couple of rows.
-            let min_space = (MIN_SPACE_ROWS + 1).min(space_need);
-            let for_agents = available.saturating_sub(min_space).min(agent_need);
-            (available.saturating_sub(for_agents), for_agents)
-        };
+        let body = available.saturating_sub(AGENT_CHROME);
+        let space_want = self.snap.spaces.len() as u16 + 1; // label + rows
+        // Squeeze spaces first, but never below a couple of rows.
+        let min_space = (MIN_SPACE_ROWS + 1).min(space_want);
+        let space_h = space_want.min(body.saturating_sub(MIN_AGENT_ROWS).max(min_space)).min(body);
+        let agent_h = body.saturating_sub(space_h);
 
         // -- header --------------------------------------------------------
         let mut y = area.y;
@@ -111,19 +126,22 @@ impl Widget for Sidebar<'_> {
         // -- SPACES --------------------------------------------------------
         if space_h > 0 {
             let end = y + space_h;
-            section_label(buf, area.x + 1, y, inner_w, "SPACES", t);
+            section_label(buf, area.x + 1, y, inner_w, "SPACES", None, t);
             y += 1;
             for space in &self.snap.spaces {
                 if y >= end {
                     break;
                 }
                 let focused = self.snap.focused_space == Some(space.id);
+                // Urgency outranks identity: a space that needs you says so before it says
+                // which space it is. Otherwise the dot carries the project's own colour,
+                // dimmed when it is not the one you are in.
                 let dot = if space.attention_count > 0 {
                     t.ui.blocked
                 } else if focused {
-                    t.ui.accent
+                    t.space_accent(space.accent)
                 } else {
-                    t.ui.text_faint
+                    crate::theme::mix(t.space_accent(space.accent), t.ui.panel_bg, 0.45)
                 };
                 let badge = if space.agent_count > 0 {
                     space.agent_count.to_string()
@@ -136,14 +154,14 @@ impl Widget for Sidebar<'_> {
                     y,
                     area.width,
                     RowSpec {
-                        marker: focused,
+                        marker: if focused { "▎" } else { " " },
+                        indent: 0,
                         glyph: if space.attention_count > 0 { "●" } else { "○" },
                         glyph_color: dot,
                         label: &space.name,
                         label_color: if focused { t.ui.text } else { t.ui.text_dim },
                         bold: focused,
-                        detail: &badge,
-                        detail_color: t.ui.text_faint,
+                        detail: plain(&badge, t.ui.text_faint),
                         bg: t.ui.panel_bg,
                     },
                     t,
@@ -155,129 +173,180 @@ impl Widget for Sidebar<'_> {
         }
 
         // -- AGENTS --------------------------------------------------------
-        if agent_h > 0 {
+        if available >= AGENT_CHROME {
             rule(buf, area.x, y, area.width, t);
             y += 1;
-            let end = y + agent_h.saturating_sub(1);
-            section_label(buf, area.x + 1, y, inner_w, "AGENTS", t);
+
+            // Window the list. Nothing is dropped without saying so: what does not fit is
+            // still reachable by scrolling, and the label carries how much of it you can see.
+            let room = agent_h as usize;
+            // Keep the cursor on screen. Done here rather than in the key handler because the
+            // handler has no idea how many rows fit — the same reason scroll is clamped here.
+            //
+            // Only once there *is* a cursor: until the panel has been given the keyboard, the
+            // wheel owns the scroll, and a cursor nobody asked for would drag it back to the
+            // top on the next frame.
+            if self.state.cursor.is_some() {
+                if let Some(at) = self.state.resolve(&rows) {
+                    if at < self.state.scroll {
+                        self.state.scroll = at;
+                    } else if room > 0 && at >= self.state.scroll + room {
+                        self.state.scroll = at + 1 - room;
+                    }
+                }
+            }
+            self.state.scroll = self.state.scroll.min(rows.len().saturating_sub(room));
+            let from = self.state.scroll.min(rows.len());
+            let window = &rows[from..(from + room).min(rows.len())];
+            let shown = window.iter().filter(|r| matches!(r.kind, RowKind::Agent { .. })).count();
+            let counter = (d.shows_counter() && shown < total).then(|| format!("{shown}/{total}"));
+            // The lens outranks the counter for the columns available: a list that does not
+            // say it is filtered reads as a broken one, whereas a missing fraction only costs
+            // you knowing how much is off screen.
+            let lens = self.state.lens.label();
+            let note = match (d, lens.is_empty()) {
+                (_, false) if d == Density::Wide => Some(match &counter {
+                    Some(c) => format!("{lens} {c}"),
+                    None => lens.clone(),
+                }),
+                (_, false) => Some(lens.clone()),
+                _ => counter.clone(),
+            };
+
+            section_label(buf, area.x + 1, y, inner_w, "AGENTS", note.as_deref(), t);
             y += 1;
 
-            if agents.is_empty() {
-                // Say how to get one rather than leaving an unexplained empty panel.
-                if y < end + 1 {
-                    put_line(
-                        buf,
-                        area.x + 2,
-                        y,
-                        inner_w,
-                        Line::from(vec![Span::styled(
-                            "none yet",
-                            Style::default()
-                                .fg(color(t.ui.text_faint))
-                                .bg(color(t.ui.panel_bg)),
-                        )]),
-                    );
-                }
-            } else {
-                // Fit as many agents as their rows allow. An agent with an activity line
-                // needs two. The overflow note only costs a line when there is overflow, so
-                // try the whole list first and only then make room for the note.
-                let room = end.saturating_sub(y) as usize;
-                let rows_for = |a: &AgentRow| 1 + usize::from(a.activity.is_some());
-                let total: usize = agents.iter().map(rows_for).sum();
-
-                let (visible, hidden) = if total <= room {
-                    (&agents[..], 0)
-                } else {
-                    let budget = room.saturating_sub(1);
-                    let mut used = 0usize;
-                    let mut fit = 0usize;
-                    for a in &agents {
-                        let h = rows_for(a);
-                        if used + h > budget {
-                            break;
-                        }
-                        used += h;
-                        fit += 1;
-                    }
-                    (&agents[..fit], agents.len() - fit)
-                };
-
-                for a in visible {
-                    let (glyph, c) = state_look(a.state, t, self.tick, self.animate);
-                    let is_focused = self.snap.focused_pane == Some(a.pane);
-                    let detail = match a.state {
-                        AgentState::Working => fmt_elapsed(a.elapsed),
-                        _ => a.state.label().to_string(),
-                    };
-                    row(
-                        buf,
-                        area.x,
-                        y,
-                        area.width,
-                        RowSpec {
-                            marker: is_focused,
-                            glyph: &glyph,
-                            glyph_color: c,
-                            label: &a.name,
-                            // An agent elsewhere in the session reads dimmer, but is still here.
-                            label_color: if !a.here {
-                                t.ui.text_faint
-                            } else if is_focused {
-                                t.ui.text
-                            } else {
-                                t.ui.text_dim
+            for (i, r) in window.iter().enumerate() {
+                let on_cursor = self.focused
+                    && self.state.cursor.is_some()
+                    && from + i == self.state.at;
+                match &r.kind {
+                    RowKind::Group { space, roll, collapsed } => {
+                        let Some(sp) = self.snap.spaces.iter().find(|s| s.id == *space) else {
+                            continue;
+                        };
+                        let focused = self.snap.focused_space == Some(*space);
+                        row(
+                            buf,
+                            area.x,
+                            y,
+                            area.width,
+                            RowSpec {
+                                marker: if on_cursor { "▎" } else { " " },
+                                indent: r.indent,
+                                // A disclosure marker, so a folded group reads as folded
+                                // rather than as a project that lost its agents.
+                                glyph: if *collapsed { "▸" } else { "▾" },
+                                glyph_color: t.ui.text_faint,
+                                label: &sp.name,
+                                label_color: if focused { t.ui.text } else { t.ui.text_dim },
+                                bold: true,
+                                detail: rollup(*roll, d, t),
+                                bg: if on_cursor { t.ui.title_bg } else { t.ui.panel_bg },
                             },
-                            bold: is_focused,
-                            detail: &detail,
-                            detail_color: c,
-                            bg: if is_focused { t.ui.title_bg } else { t.ui.panel_bg },
-                        },
-                        t,
-                    );
-                    self.hits.push((y, Hit::Pane(a.pane)));
-                    y += 1;
-
+                            t,
+                        );
+                        self.hits.push((y, Hit::Group(*space)));
+                    }
+                    RowKind::Agent { pane, space, pinned } => {
+                        let Some(a) = self
+                            .snap
+                            .panes
+                            .iter()
+                            .find(|p| p.id == *pane)
+                            .and_then(|p| p.agent.as_ref())
+                        else {
+                            continue;
+                        };
+                        let (glyph, c) = state_look(a.state, t, self.tick, self.animate);
+                        let is_focused = self.snap.focused_pane == Some(*pane);
+                        // A pinned row sits outside its group, so it has to say why it is
+                        // there — otherwise it reads as an agent in the wrong place.
+                        let marker = if *pinned { "▪" } else { " " };
+                        let here = self.snap.focused_space == Some(*space);
+                        let detail = match a.state {
+                            AgentState::Working => fmt_elapsed(a.elapsed),
+                            _ => a.state.label().to_string(),
+                        };
+                        row(
+                            buf,
+                            area.x,
+                            y,
+                            area.width,
+                            RowSpec {
+                                marker: if is_focused || on_cursor { "▎" } else { marker },
+                                indent: r.indent,
+                                glyph: &glyph,
+                                glyph_color: c,
+                                label: &a.name,
+                                // An agent elsewhere in the session reads dimmer, but is
+                                // still here.
+                                label_color: if !here {
+                                    t.ui.text_faint
+                                } else if is_focused {
+                                    t.ui.text
+                                } else {
+                                    t.ui.text_dim
+                                },
+                                bold: is_focused,
+                                detail: plain(&detail, c),
+                                bg: if is_focused || on_cursor {
+                                    t.ui.title_bg
+                                } else {
+                                    t.ui.panel_bg
+                                },
+                            },
+                            t,
+                        );
+                        self.hits.push((y, Hit::Pane(*pane)));
+                    }
                     // What it is doing, indented under the name. Hooks only — screen
                     // detection cannot see tool calls.
-                    if let Some(act) = &a.activity {
-                        if y < end {
-                            put_line(
-                                buf,
-                                area.x,
-                                y,
-                                area.width,
-                                Line::from(vec![
-                                    Span::styled(
-                                        "    ",
-                                        Style::default().bg(color(t.ui.panel_bg)),
-                                    ),
-                                    Span::styled(
-                                        truncate(act, inner_w.saturating_sub(4) as usize),
-                                        Style::default()
-                                            .fg(color(t.ui.text_faint))
-                                            .bg(color(t.ui.panel_bg)),
-                                    ),
-                                ]),
-                            );
-                            y += 1;
-                        }
+                    RowKind::Activity(pane) => {
+                        let Some(act) = self
+                            .snap
+                            .panes
+                            .iter()
+                            .find(|p| p.id == *pane)
+                            .and_then(|p| p.agent.as_ref())
+                            .and_then(|a| a.activity.summary())
+                        else {
+                            continue;
+                        };
+                        let pad = r.indent as usize;
+                        put_line(
+                            buf,
+                            area.x,
+                            y,
+                            area.width,
+                            Line::from(vec![
+                                Span::styled(" ".repeat(pad), Style::default().bg(color(t.ui.panel_bg))),
+                                Span::styled(
+                                    truncate(&act, inner_w.saturating_sub(pad as u16) as usize),
+                                    Style::default()
+                                        .fg(color(t.ui.text_faint))
+                                        .bg(color(t.ui.panel_bg)),
+                                ),
+                            ]),
+                        );
+                    }
+                    RowKind::Empty(msg) => {
+                        // Say how to get one rather than leaving an unexplained empty panel.
+                        put_line(
+                            buf,
+                            area.x + 2,
+                            y,
+                            inner_w,
+                            Line::from(vec![Span::styled(
+                                *msg,
+                                Style::default()
+                                    .fg(color(t.ui.text_faint))
+                                    .bg(color(t.ui.panel_bg)),
+                            )]),
+                        );
                     }
                 }
-                if hidden > 0 {
-                    put_line(
-                        buf,
-                        area.x + 2,
-                        y,
-                        inner_w,
-                        Line::from(vec![Span::styled(
-                            format!("+{hidden} more"),
-                            Style::default()
-                                .fg(color(t.ui.text_faint))
-                                .bg(color(t.ui.panel_bg)),
-                        )]),
-                    );
-                }
+                y += 1;
             }
         }
 
@@ -317,71 +386,60 @@ impl Widget for Sidebar<'_> {
     }
 }
 
-/// Every agent in the session, in space then tab then pane order.
+/// A single-colour detail, which is what most rows have.
+fn plain(text: &str, c: Rgb) -> Vec<Span<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![Span::styled(text.to_string(), Style::default().fg(color(c)))]
+}
+
+/// A group header's state counts, one colour each.
 ///
-/// Stable ordering beats sorting by urgency: rows that jump around under you are worse than
-/// rows you have to scan, and colour already carries the urgency.
-fn collect_agents(snap: &Snapshot) -> Vec<AgentRow> {
+/// Multi-span rather than one string because the whole point is that `◍1` and `◐2` are
+/// different colours; flattening them to a single style would lose the only thing that makes
+/// the rollup readable at a glance.
+fn rollup(roll: Roll, d: Density, t: &Theme) -> Vec<Span<'static>> {
     let mut out = Vec::new();
-    for space in &snap.spaces {
-        for &tid in &space.tabs {
-            let Some(tab) = snap.tabs.iter().find(|t| t.id == tid) else { continue };
-            for &pid in &tab.panes {
-                let Some(pane) = snap.panes.iter().find(|p| p.id == pid) else { continue };
-                let Some(a) = pane.agent.as_ref() else { continue };
-                out.push(AgentRow {
-                    pane: pid,
-                    name: a.name.clone(),
-                    state: a.state,
-                    elapsed: a.elapsed,
-                    here: snap.focused_space == Some(space.id),
-                    // Only while it is actually doing something; a finished turn's counts
-                    // would be stale trivia.
-                    activity: (a.state == AgentState::Working)
-                        .then(|| a.activity.summary())
-                        .flatten(),
-                });
-            }
+    for (state, count) in roll.compact(d) {
+        let (_, c) = state_look(state, t, 0, false);
+        if !out.is_empty() {
+            out.push(Span::styled(" ".to_string(), Style::default()));
         }
+        out.push(Span::styled(
+            format!("{}{}", state.glyph(), count),
+            Style::default().fg(color(c)),
+        ));
     }
     out
 }
 
-fn state_look(state: AgentState, t: &Theme, tick: usize, animate: bool) -> (String, Rgb) {
-    let glyph = match state {
-        AgentState::Working if animate => spinner_frame(tick).to_string(),
-        _ => state.glyph().to_string(),
-    };
-    let c = match state {
-        AgentState::Working => t.ui.working,
-        AgentState::Blocked => t.ui.blocked,
-        AgentState::Done => t.ui.done,
-        AgentState::Idle => t.ui.idle,
-        AgentState::Unknown => t.ui.unknown,
-    };
-    (glyph, c)
-}
-
 struct RowSpec<'a> {
-    marker: bool,
+    /// The one-cell gutter: focus bar, pin mark, or nothing.
+    marker: &'a str,
+    /// Columns of indent after the marker, so a grouped agent sits under its header.
+    indent: u16,
     glyph: &'a str,
     glyph_color: Rgb,
     label: &'a str,
     label_color: Rgb,
     bold: bool,
-    detail: &'a str,
-    detail_color: Rgb,
+    /// Right-aligned, already styled apart from its background.
+    detail: Vec<Span<'static>>,
     bg: Rgb,
 }
 
-/// One sidebar row: focus marker, glyph, label, right-aligned detail.
+/// One sidebar row: focus marker, indent, glyph, label, right-aligned detail.
+///
+/// The only place row arithmetic lives. Every row in the panel comes through here, so a
+/// column budget that is right once is right everywhere.
 fn row(buf: &mut Buffer, x: u16, y: u16, w: u16, spec: RowSpec<'_>, t: &Theme) {
     let inner = w.saturating_sub(2);
-    let detail_w = spec.detail.chars().count() as u16;
-    // 1 marker + 1 glyph + 1 space, then the label, then the detail flush right.
-    let label_room = inner.saturating_sub(3 + detail_w + 1);
+    let detail_w: u16 = spec.detail.iter().map(|s| width(&s.content) as u16).sum();
+    // 1 marker + indent + 1 glyph + 1 space, then the label, then the detail flush right.
+    let label_room = inner.saturating_sub(3 + spec.indent + detail_w + 1);
     let label = truncate(spec.label, label_room as usize);
-    let pad = inner.saturating_sub(3 + label.chars().count() as u16 + detail_w);
+    let pad = inner.saturating_sub(3 + spec.indent + width(&label) as u16 + detail_w);
 
     let bg = Style::default().bg(color(spec.bg));
     let mut label_style = bg.fg(color(spec.label_color));
@@ -389,35 +447,48 @@ fn row(buf: &mut Buffer, x: u16, y: u16, w: u16, spec: RowSpec<'_>, t: &Theme) {
         label_style = label_style.add_modifier(Modifier::BOLD);
     }
 
-    put_line(
-        buf,
-        x,
-        y,
-        w,
-        Line::from(vec![
-            Span::styled(if spec.marker { "▎" } else { " " }, bg.fg(color(t.ui.accent))),
-            Span::styled(format!("{} ", spec.glyph), bg.fg(color(spec.glyph_color))),
-            Span::styled(label, label_style),
-            Span::styled(" ".repeat(pad as usize), bg),
-            Span::styled(spec.detail.to_string(), bg.fg(color(spec.detail_color))),
-        ]),
-    );
+    let mut spans = vec![
+        Span::styled(spec.marker.to_string(), bg.fg(color(t.ui.accent))),
+        Span::styled(" ".repeat(spec.indent as usize), bg),
+        Span::styled(format!("{} ", spec.glyph), bg.fg(color(spec.glyph_color))),
+        Span::styled(label, label_style),
+        Span::styled(" ".repeat(pad as usize), bg),
+    ];
+    // The detail carries its own colour but inherits the row's background, so a focused row
+    // stays one unbroken band.
+    spans.extend(spec.detail.into_iter().map(|s| {
+        let fg = s.style.fg;
+        Span::styled(s.content, Style::default().patch(bg).fg(fg.unwrap_or(color(t.ui.text_dim))))
+    }));
+
+    put_line(buf, x, y, w, Line::from(spans));
 }
 
-fn section_label(buf: &mut Buffer, x: u16, y: u16, w: u16, text: &str, t: &Theme) {
-    put_line(
-        buf,
-        x,
-        y,
-        w,
-        Line::from(vec![Span::styled(
-            text.to_string(),
-            Style::default()
-                .fg(color(t.ui.text_faint))
-                .bg(color(t.ui.panel_bg))
-                .add_modifier(Modifier::BOLD),
-        )]),
-    );
+/// A section heading, with an optional right-aligned note.
+fn section_label(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    w: u16,
+    text: &str,
+    note: Option<&str>,
+    t: &Theme,
+) {
+    let base = Style::default().bg(color(t.ui.panel_bg));
+    let mut spans = vec![Span::styled(
+        text.to_string(),
+        base.fg(color(t.ui.text_faint)).add_modifier(Modifier::BOLD),
+    )];
+    // How much of the list you can see rides on the heading rather than costing a row of its
+    // own — the panel's scarcest resource is rows, and this is the least important thing in it.
+    if let Some(note) = note {
+        let pad = (w as usize).saturating_sub(width(text) + width(note));
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), base));
+            spans.push(Span::styled(note.to_string(), base.fg(color(t.ui.text_faint))));
+        }
+    }
+    put_line(buf, x, y, w, Line::from(spans));
 }
 
 /// Counts worth standing space at the bottom. Only non-zero rows appear, so a quiet session
@@ -460,93 +531,11 @@ fn rule(buf: &mut Buffer, x: u16, y: u16, w: u16, t: &Theme) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{AgentInfo, PaneInfo, Rect, SpaceInfo, TabInfo, ViewState};
-
-    fn pane(id: u32, space: u32, tab: u32, agent: Option<(&str, AgentState)>) -> PaneInfo {
-        PaneInfo {
-            id,
-            tab,
-            space,
-            title: format!("pane{id}"),
-            cwd: "/tmp".into(),
-            cell: Rect::default(),
-            content: Rect::default(),
-            cols: 80,
-            rows: 24,
-            agent: agent.map(|(n, s)| AgentInfo {
-                kind: "claude".into(),
-                name: n.into(),
-                state: s,
-                elapsed: 138,
-                authority: "hook".into(),
-                reason: "t".into(),
-                activity: Default::default(),
-            }),            spawned_by: None,
-            exited: false,
-            scroll_offset: 0,
-            wants_mouse: false,
-            bracketed_paste: false,
-        }
-    }
-
-    /// Two spaces: `api-refactor` with builder + reviewer + a shell, `docs` with writer.
-    fn snap() -> Snapshot {
-        let panes = vec![
-            pane(1, 1, 1, Some(("builder", AgentState::Working))),
-            pane(2, 1, 1, Some(("reviewer", AgentState::Blocked))),
-            pane(3, 1, 1, None),
-            pane(4, 2, 2, Some(("writer", AgentState::Idle))),
-        ];
-        Snapshot {
-            protocol: 1,
-            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-            spaces: vec![
-                SpaceInfo {
-                    id: 1,
-                    name: "api-refactor".into(),
-                    cwd: "/tmp".into(),
-                    tabs: vec![1],
-                    focused_tab: Some(1),
-                    agent_count: 2,
-                    attention_count: 1,
-                },
-                SpaceInfo {
-                    id: 2,
-                    name: "docs".into(),
-                    cwd: "/tmp".into(),
-                    tabs: vec![2],
-                    focused_tab: Some(2),
-                    agent_count: 1,
-                    attention_count: 0,
-                },
-            ],
-            tabs: vec![
-                TabInfo {
-                    id: 1,
-                    space: 1,
-                    name: "1".into(),
-                    panes: vec![1, 2, 3],
-                    focused_pane: Some(1),
-                },
-                TabInfo { id: 2, space: 2, name: "1".into(), panes: vec![4], focused_pane: Some(4) },
-            ],
-            panes,
-            focused_space: Some(1),
-            focused_tab: Some(1),
-            focused_pane: Some(1),
-            view: ViewState::default(),
-            sidebar: Rect::default(),
-            bus: Rect::default(),
-            status: Rect::default(),
-            tabbar: Rect::default(),
-            tasks_open: 0,
-            tasks_claimed: 0,
-            triggers_armed: 0,
-        }
-    }
+    use crate::client::roster::tests::{pane, snap};
+    use crate::proto::PaneInfo;
 
     fn render(s: &Snapshot, w: u16, h: u16) -> (String, Vec<(u16, Hit)>) {
-        render_board(s, w, h, None)
+        render_at(s, w, h, None, 0)
     }
 
     fn render_board(
@@ -555,12 +544,43 @@ mod tests {
         h: u16,
         board: Option<(usize, usize)>,
     ) -> (String, Vec<(u16, Hit)>) {
+        render_at(s, w, h, board, 0)
+    }
+
+    fn render_at(
+        s: &Snapshot,
+        w: u16,
+        h: u16,
+        board: Option<(usize, usize)>,
+        scroll: usize,
+    ) -> (String, Vec<(u16, Hit)>) {
+        let mut st = crate::client::roster::SidebarState { scroll, ..Default::default() };
+        render_state(s, w, h, board, &mut st, false)
+    }
+
+    fn render_state(
+        s: &Snapshot,
+        w: u16,
+        h: u16,
+        board: Option<(usize, usize)>,
+        state: &mut crate::client::roster::SidebarState,
+        focused: bool,
+    ) -> (String, Vec<(u16, Hit)>) {
         let area = TRect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
         let theme = Theme::horde();
         let mut hits = Vec::new();
-        Sidebar { snap: s, theme: &theme, tick: 0, animate: false, hits: &mut hits, board }
-            .render(area, &mut buf);
+        Sidebar {
+            snap: s,
+            theme: &theme,
+            tick: 0,
+            animate: false,
+            hits: &mut hits,
+            state,
+            focused,
+            board,
+        }
+        .render(area, &mut buf);
         let text = (0..h)
             .map(|y| (0..w).map(|x| buf.cell((x, y)).unwrap().symbol()).collect::<String>())
             .collect::<Vec<_>>()
@@ -570,7 +590,7 @@ mod tests {
 
     #[test]
     fn spaces_and_agents_are_separate_labelled_sections() {
-        let (out, _) = render(&snap(), 24, 20);
+        let (out, _) = render(&snap(), 24, 22);
         println!("\n{out}\n");
         assert!(out.contains("SPACES"), "{out}");
         assert!(out.contains("AGENTS"), "{out}");
@@ -582,7 +602,7 @@ mod tests {
 
     #[test]
     fn spaces_section_lists_only_spaces_never_panes() {
-        let (out, _) = render(&snap(), 24, 20);
+        let (out, _) = render(&snap(), 24, 22);
         let spaces_block = &out[out.find("SPACES").unwrap()..out.find("AGENTS").unwrap()];
         assert!(spaces_block.contains("api-refactor"));
         assert!(spaces_block.contains("docs"));
@@ -593,7 +613,7 @@ mod tests {
 
     #[test]
     fn agents_section_lists_every_agent_with_its_state() {
-        let (out, _) = render(&snap(), 24, 20);
+        let (out, _) = render(&snap(), 24, 22);
         let agents_block = &out[out.find("AGENTS").unwrap()..];
         for name in ["builder", "reviewer", "writer"] {
             assert!(agents_block.contains(name), "{name} missing from:\n{agents_block}");
@@ -604,24 +624,51 @@ mod tests {
         assert!(agents_block.contains("idle"), "{agents_block}");
     }
 
+    /// The whole point of the change: which project an agent belongs to is readable without
+    /// switching to that space and watching the dimming change.
+    #[test]
+    fn agents_are_grouped_under_a_header_for_their_space() {
+        let (out, _) = render(&snap(), 26, 22);
+        println!("\n{out}\n");
+        let block = &out[out.find("AGENTS").unwrap()..];
+        let header = block.find("api-refactor").expect("group header:\n{block}");
+        let builder = block.find("builder").unwrap();
+        let reviewer = block.find("reviewer").unwrap();
+        let docs = block.find("docs").expect("second group header");
+        let writer = block.find("writer").unwrap();
+        assert!(header < builder && builder < reviewer, "{block}");
+        assert!(reviewer < docs && docs < writer, "{block}");
+    }
+
+    #[test]
+    fn a_group_header_rolls_up_the_states_of_its_agents() {
+        // api-refactor holds one blocked and one working agent.
+        let (out, _) = render(&snap(), 26, 22);
+        let block = &out[out.find("AGENTS").unwrap()..];
+        let line = block.lines().find(|l| l.contains("api-refactor")).unwrap();
+        assert!(line.contains("◍1"), "blocked count on the header: {line:?}");
+        assert!(line.contains("◐1"), "working count on the header: {line:?}");
+    }
+
     #[test]
     fn agents_from_other_spaces_still_appear() {
         // `writer` lives in `docs` while `api-refactor` is focused.
-        let (out, hits) = render(&snap(), 24, 20);
+        let (out, hits) = render(&snap(), 24, 22);
         assert!(out.contains("writer"));
         assert!(hits.iter().any(|(_, h)| *h == Hit::Pane(4)));
     }
 
     #[test]
     fn shell_panes_are_not_listed_as_agents() {
-        let (out, hits) = render(&snap(), 24, 20);
+        let (out, hits) = render(&snap(), 24, 22);
         assert!(!out.contains("pane3"), "{out}");
         assert!(!hits.iter().any(|(_, h)| *h == Hit::Pane(3)));
     }
 
+    /// A group header is not a click target yet, so it must not steal one either.
     #[test]
     fn hit_rows_are_unique_and_cover_both_sections() {
-        let (_, hits) = render(&snap(), 24, 20);
+        let (_, hits) = render(&snap(), 24, 22);
         assert!(hits.iter().any(|(_, h)| *h == Hit::Space(1)));
         assert!(hits.iter().any(|(_, h)| *h == Hit::Pane(1)));
         let ys: Vec<u16> = hits.iter().map(|(y, _)| *y).collect();
@@ -639,7 +686,7 @@ mod tests {
             sp.agent_count = 0;
             sp.attention_count = 0;
         });
-        let (out, _) = render(&s, 24, 20);
+        let (out, _) = render(&s, 24, 22);
         assert!(out.contains("AGENTS"), "{out}");
         assert!(out.contains("none yet"), "{out}");
     }
@@ -661,7 +708,8 @@ mod tests {
                 };
             }
         }
-        let (out, hits) = render(&s, 26, 22);
+        // Two group headers cost two rows the flat list did not need.
+        let (out, hits) = render(&s, 26, 26);
         println!("\n{out}\n");
         assert!(out.contains("12 tools"), "{out}");
         // Failures outrank the file count in a 20-column gutter: one is actionable.
@@ -690,28 +738,71 @@ mod tests {
         assert_eq!(Activity::default().summary(), None);
     }
 
-    #[test]
-    fn footer_summary_survives_a_long_agent_list() {
+    fn crowded() -> Snapshot {
         let mut s = snap();
         let panes: Vec<PaneInfo> =
             (0..40u32).map(|i| pane(100 + i, 1, 1, Some(("a", AgentState::Blocked)))).collect();
         s.tabs[0].panes = panes.iter().map(|p| p.id).collect();
         s.tabs[1].panes = vec![];
         s.panes = panes;
-        let (out, _) = render(&s, 24, 20);
+        s
+    }
+
+    #[test]
+    fn footer_summary_survives_a_long_agent_list() {
+        let (out, _) = render(&crowded(), 24, 22);
         assert!(out.contains("needs you"), "footer must survive:\n{out}");
-        // And the overflow is stated rather than silently dropped.
-        assert!(out.contains("more"), "{out}");
+    }
+
+    /// The old list ended in "+3 more" and those agents were simply gone. Now the overflow is
+    /// stated as a fraction on the heading — costing no row of its own — and the rest is still
+    /// reachable.
+    #[test]
+    fn overflowing_agents_are_counted_on_the_heading_rather_than_dropped() {
+        let (out, _) = render(&crowded(), 24, 22);
+        println!("\n{out}\n");
+        assert!(!out.contains("more"), "the overflow note is gone: {out}");
+        let heading = out.lines().find(|l| l.contains("AGENTS")).unwrap();
+        assert!(heading.contains("/40"), "how much of the list is visible: {heading:?}");
+    }
+
+    #[test]
+    fn scrolling_reaches_agents_the_first_screen_could_not_show() {
+        let mut s = crowded();
+        // Give the last agent a name nothing else shares.
+        let last = s.panes.last_mut().unwrap();
+        last.agent.as_mut().unwrap().name = "zzlast".into();
+        let (top, _) = render_at(&s, 24, 22, None, 0);
+        assert!(!top.contains("zzlast"), "not on the first screen:\n{top}");
+        let (down, _) = render_at(&s, 24, 22, None, 100);
+        assert!(down.contains("zzlast"), "scrolling must reach it:\n{down}");
+    }
+
+    /// Scroll is clamped to the list, so a stale offset from a longer list cannot blank the
+    /// section.
+    #[test]
+    fn an_over_scrolled_list_still_shows_its_tail() {
+        let (out, hits) = render_at(&snap(), 24, 22, None, 900);
+        assert!(out.contains("writer"), "{out}");
+        assert!(!hits.is_empty());
     }
 
     #[test]
     fn nothing_ever_writes_past_the_panel_width() {
         let mut s = snap();
         s.spaces[0].name = "an-absurdly-long-space-name-that-cannot-fit".into();
-        for w in [10u16, 14, 18, 24, 40] {
-            let (out, _) = render(&s, w, 20);
-            for line in out.lines() {
-                assert_eq!(line.chars().count(), w as usize, "width {w}: {line:?}");
+        if let Some(a) = s.panes[0].agent.as_mut() {
+            a.name = "an-absurdly-long-agent-name-that-cannot-fit".into();
+        }
+        // Both sides of every density threshold: inner is two less than the width, so the
+        // rungs change at 20 and 32. A rung that goes untested ships broken at exactly one
+        // sidebar width.
+        for w in [10u16, 14, 16, 18, 20, 24, 28, 32, 40, 60] {
+            for scroll in [0usize, 3] {
+                let (out, _) = render_at(&s, w, 22, Some((3, 1)), scroll);
+                for line in out.lines() {
+                    assert_eq!(line.chars().count(), w as usize, "width {w}: {line:?}");
+                }
             }
         }
     }
@@ -735,7 +826,7 @@ mod tests {
 
     #[test]
     fn outstanding_board_work_appears_in_the_footer() {
-        let (out, _) = render_board(&snap(), 26, 22, Some((3, 1)));
+        let (out, _) = render_board(&snap(), 26, 24, Some((3, 1)));
         assert!(out.contains("3 tasks open"), "unclaimed work is the headline:\n{out}");
     }
 
@@ -744,30 +835,161 @@ mod tests {
     fn armed_triggers_show_in_the_footer() {
         let mut s = snap();
         s.triggers_armed = 2;
-        let (out, _) = render_board(&s, 26, 22, None);
+        let (out, _) = render_board(&s, 26, 24, None);
         assert!(out.contains("2 triggers armed"), "{out}");
     }
 
     /// And with the master switch off the daemon reports zero, so the row costs nothing.
     #[test]
     fn a_disarmed_session_shows_no_trigger_row() {
-        let (out, _) = render(&snap(), 26, 22);
+        let (out, _) = render(&snap(), 26, 24);
         assert!(!out.contains("armed"), "{out}");
     }
 
     #[test]
     fn a_fully_claimed_board_says_claimed_rather_than_zero_open() {
         // "0 tasks open" would read as an empty board when three agents are mid-task.
-        let (out, _) = render_board(&snap(), 26, 22, Some((0, 3)));
+        let (out, _) = render_board(&snap(), 26, 24, Some((0, 3)));
         assert!(out.contains("3 tasks claimed"), "{out}");
         assert!(!out.contains("0 tasks"), "{out}");
     }
 
     #[test]
     fn an_empty_board_costs_no_footer_line() {
-        let (with, _) = render_board(&snap(), 26, 22, Some((0, 0)));
-        let (without, _) = render_board(&snap(), 26, 22, None);
+        let (with, _) = render_board(&snap(), 26, 24, Some((0, 0)));
+        let (without, _) = render_board(&snap(), 26, 24, None);
         assert_eq!(with, without);
         assert!(!with.contains("task"), "{with}");
+    }
+
+    #[test]
+    fn a_collapsed_space_shows_only_its_header() {
+        let mut s = snap();
+        s.spaces[0].collapsed = true;
+        let (out, hits) = render(&s, 26, 22);
+        println!("\n{out}\n");
+        let block = &out[out.find("AGENTS").unwrap()..];
+        assert!(block.contains("api-refactor"), "the header stays: {block}");
+        assert!(!block.contains("builder"), "{block}");
+        assert!(!block.contains("reviewer"), "{block}");
+        // Folded rows are not clickable, because they are not drawn.
+        assert!(!hits.iter().any(|(_, h)| *h == Hit::Pane(1)));
+        // A folded group still says what is inside it — that is the point of folding.
+        let line = block.lines().find(|l| l.contains("api-refactor")).unwrap();
+        assert!(line.contains("◍1"), "{line:?}");
+        assert!(line.contains("▸"), "a folded group reads as folded: {line:?}");
+    }
+
+    #[test]
+    fn a_pinned_agent_is_lifted_above_the_groups() {
+        let mut s = snap();
+        s.panes.iter_mut().find(|p| p.id == 4).unwrap().pinned = true;
+        let (out, _) = render(&s, 26, 22);
+        println!("\n{out}\n");
+        let block = &out[out.find("AGENTS").unwrap()..];
+        let writer = block.find("writer").unwrap();
+        let first_group = block.find("api-refactor").unwrap();
+        assert!(writer < first_group, "pinned rows come first:\n{block}");
+        // And exactly once — pinning moves a row, it does not clone one.
+        assert_eq!(block.matches("writer").count(), 1, "{block}");
+    }
+
+    /// Until the panel has been given the keyboard, the wheel owns the scroll — a cursor
+    /// nobody asked for would drag the list back to the top on the very next frame.
+    #[test]
+    fn an_unfocused_sidebar_shows_no_cursor_and_leaves_the_scroll_alone() {
+        let mut st = crate::client::roster::SidebarState { scroll: 4, ..Default::default() };
+        let (_, _) = render_state(&crowded(), 24, 22, None, &mut st, false);
+        assert_eq!(st.scroll, 4, "the wheel keeps its position");
+        assert_eq!(st.cursor, None);
+    }
+
+    #[test]
+    fn the_cursor_is_scrolled_into_view() {
+        use crate::client::roster::{filtered_rows, Density, Focus, Lens, SidebarState};
+        let s = crowded();
+        // Name the last agent so it can be found on screen.
+        let mut s = {
+            let mut s = s;
+            s.panes.last_mut().unwrap().agent.as_mut().unwrap().name = "zzlast".into();
+            s
+        };
+        let rows = filtered_rows(&s, Density::of(22), &Lens::All);
+        let mut st = SidebarState::default();
+        st.jump(&rows, true);
+        assert!(matches!(st.cursor, Some(Focus::Agent(_))));
+
+        let (out, _) = render_state(&mut s, 24, 22, None, &mut st, true);
+        println!("\n{out}\n");
+        assert!(out.contains("zzlast"), "the cursor must drag the window to it:\n{out}");
+        assert!(st.scroll > 0, "and that means scrolling");
+    }
+
+    #[test]
+    fn a_focused_sidebar_marks_the_row_the_cursor_is_on() {
+        use crate::client::roster::{filtered_rows, Density, Lens, SidebarState};
+        let s = snap();
+        let rows = filtered_rows(&s, Density::of(24), &Lens::All);
+        let mut st = SidebarState::default();
+        st.resolve(&rows);
+        st.step(&rows, 1); // the first agent, `builder`
+        let (out, _) = render_state(&s, 26, 22, None, &mut st, true);
+        println!("\n{out}\n");
+        let line = out.lines().find(|l| l.contains("builder")).unwrap();
+        assert!(line.starts_with('▎'), "the cursor row carries the marker: {line:?}");
+    }
+
+    /// Clicking a header folds the group rather than switching to it — a disclosure triangle
+    /// that teleports you is not a disclosure triangle. So it needs its own hit kind.
+    #[test]
+    fn a_group_header_is_a_distinct_click_target_from_its_space_row() {
+        let (_, hits) = render(&snap(), 26, 22);
+        assert!(hits.iter().any(|(_, h)| *h == Hit::Space(1)), "{hits:?}");
+        assert!(hits.iter().any(|(_, h)| *h == Hit::Group(1)), "{hits:?}");
+        // On different lines, and every row still unique.
+        let ys: Vec<u16> = hits.iter().map(|(y, _)| *y).collect();
+        let mut u = ys.clone();
+        u.sort_unstable();
+        u.dedup();
+        assert_eq!(ys.len(), u.len(), "overlapping rows: {hits:?}");
+    }
+
+    /// A filtered list that does not say it is filtered reads as a broken one, so the lens
+    /// name outranks the overflow counter for the columns available.
+    #[test]
+    fn an_active_lens_names_itself_on_the_heading() {
+        use crate::client::roster::{Lens, SidebarState};
+        let mut st = SidebarState { lens: Lens::NeedsYou, ..Default::default() };
+        let (out, _) = render_state(&snap(), 40, 22, None, &mut st, false);
+        println!("\n{out}\n");
+        let heading = out.lines().find(|l| l.contains("AGENTS")).unwrap();
+        assert!(heading.contains("needs you"), "{heading:?}");
+        // And it actually filtered: only `reviewer` is blocked.
+        let block = &out[out.find("AGENTS").unwrap()..];
+        assert!(block.contains("reviewer"), "{block}");
+        assert!(!block.contains("builder"), "{block}");
+    }
+
+    /// The footer stays session-wide on purpose: a lens that also silenced the counts would
+    /// hide the very thing you filtered away.
+    #[test]
+    fn a_lens_does_not_change_the_footer_counts() {
+        use crate::client::roster::{Lens, SidebarState};
+        let mut plain = SidebarState::default();
+        let mut lensed = SidebarState { lens: Lens::Working, ..Default::default() };
+        let (a, _) = render_state(&snap(), 40, 22, None, &mut plain, false);
+        let (b, _) = render_state(&snap(), 40, 22, None, &mut lensed, false);
+        for out in [&a, &b] {
+            assert!(out.contains("1 needs you"), "{out}");
+            assert!(out.contains("1 working"), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_lens_matching_nothing_says_so_rather_than_showing_a_blank_section() {
+        use crate::client::roster::{Lens, SidebarState};
+        let mut st = SidebarState { lens: Lens::Role("nobody".into()), ..Default::default() };
+        let (out, _) = render_state(&snap(), 40, 22, None, &mut st, false);
+        assert!(out.contains("no agents match"), "{out}");
     }
 }

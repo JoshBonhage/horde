@@ -17,6 +17,7 @@ pub fn dispatch(eng: &mut Engine, req: Request) -> Response {
     }
 }
 
+#[derive(Debug)]
 struct Err_ {
     code: &'static str,
     message: String,
@@ -60,6 +61,23 @@ fn str_arg<'a>(req: &'a Request, key: &str) -> Option<&'a str> {
     req.params.get(key).and_then(|v| v.as_str())
 }
 
+/// A space, by name or by id, defaulting to the focused one.
+///
+/// Names are how spaces are addressed everywhere else (`space focus`, `horde broadcast
+/// --space`), so they come first; the id is there for a caller holding a snapshot.
+fn space_arg(eng: &Engine, req: &Request) -> Result<crate::proto::SpaceId, Err_> {
+    if let Some(name) = str_arg(req, "name") {
+        return eng
+            .session
+            .find_space_by_name(name)
+            .ok_or_else(|| not_found(format!("no space called {name:?}")));
+    }
+    if let Some(id) = req.params.get("space").and_then(|v| v.as_u64()) {
+        return Ok(id as u32);
+    }
+    eng.session.focused_space.ok_or_else(|| bad("no space"))
+}
+
 fn bool_arg(req: &Request, key: &str) -> bool {
     req.params.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
@@ -75,6 +93,38 @@ fn dir_arg(req: &Request, key: &str, default: Dir) -> Dir {
 }
 
 fn handle(eng: &mut Engine, req: &Request) -> R {
+    // The board is paused (see `tasks::ENABLED`), so nothing may move a task. Checked once in
+    // front of dispatch rather than once per method: this is the choke point every agent goes
+    // through however it was told to claim, and a `task.*` method added later cannot slip past a
+    // guard that names none of them.
+    //
+    // `task.list` is let through on purpose. Reading the record moves nothing, and while the
+    // board is paused what is stranded on it is the thing worth being able to see.
+    if !super::tasks::ENABLED && req.method.starts_with("task.") && req.method != "task.list" {
+        return Err(failed(
+            "the task board is paused while it is reworked — no task can be added, claimed, \
+             finished, or released. `horde task list` still shows what is on it.",
+        ));
+    }
+
+    // The bus is paused too (see `bus::ENABLED`), and for the same reason: this is the choke
+    // point every message goes through, so a `bus.*` method added later cannot slip past a
+    // guard that names none of them.
+    //
+    // `bus.tail` and `bus.reply_for` are let through on purpose. Both only read the log —
+    // neither can put text into a pane, which is the thing being paused — and the history is
+    // what you want to be able to look back over while it is off.
+    if !super::bus::ENABLED
+        && req.method.starts_with("bus.")
+        && !matches!(req.method.as_str(), "bus.tail" | "bus.reply_for")
+    {
+        return Err(failed(
+            "the message bus is paused while it is reworked — nothing can be sent, replied to, \
+             or broadcast, so no message can be injected into a pane. `horde bus tail` still \
+             shows the log.",
+        ));
+    }
+
     match req.method.as_str() {
         // -- server ------------------------------------------------------
         "ping" => Ok(json!({ "type": "pong", "protocol": crate::proto::PROTOCOL_VERSION })),
@@ -154,6 +204,43 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             eng.touch();
             Ok(json!({ "closed": id }))
         }
+        // Renaming a space existed only as a client frame, unreachable from a script while
+        // `pane.rename` was fully exposed. Answering with the name it actually got matters
+        // because a clash is uniquified silently, and the caller has no other way to find out.
+        "space.rename" => {
+            let name = str_arg(req, "name").ok_or_else(|| bad("name required"))?;
+            let to = str_arg(req, "to").ok_or_else(|| bad("to required"))?;
+            let id = eng
+                .session
+                .find_space_by_name(name)
+                .ok_or_else(|| not_found(format!("no space called {name:?}")))?;
+            if !eng.session.rename_space(id, to) {
+                return Err(bad("a space needs a name"));
+            }
+            let actual = eng.session.space(id).map(|s| s.name.clone()).unwrap_or_default();
+            eng.touch();
+            Ok(json!({ "renamed": id, "name": actual }))
+        }
+        "space.accent" => {
+            let id = space_arg(eng, req)?;
+            let slot = req.params.get("slot").and_then(|v| v.as_u64()).map(|v| v as u8);
+            let slot = eng
+                .session
+                .set_space_accent(id, slot)
+                .ok_or_else(|| not_found("no such space"))?;
+            eng.touch();
+            Ok(json!({ "space": id, "slot": slot }))
+        }
+        "space.collapse" => {
+            let id = space_arg(eng, req)?;
+            let to = req.params.get("collapsed").and_then(|v| v.as_bool());
+            let now = eng
+                .session
+                .toggle_space_collapsed(id, to)
+                .ok_or_else(|| not_found("no such space"))?;
+            eng.touch();
+            Ok(json!({ "space": id, "collapsed": now }))
+        }
 
         // -- tabs --------------------------------------------------------
         "tab.list" => {
@@ -180,6 +267,21 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             eng.session.close_tab(&cfg, t).map_err(|e| failed(e.to_string()))?;
             eng.touch();
             Ok(json!({ "closed": t }))
+        }
+        "tab.rename" => {
+            let t = req
+                .params
+                .get("tab")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .or_else(|| eng.session.focused_tab())
+                .ok_or_else(|| bad("no tab"))?;
+            let name = str_arg(req, "name").ok_or_else(|| bad("name required"))?;
+            if !eng.session.rename_tab(t, name) {
+                return Err(bad("a tab needs a name"));
+            }
+            eng.touch();
+            Ok(json!({ "renamed": t }))
         }
 
         // -- panes -------------------------------------------------------
@@ -228,6 +330,50 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             pane.name = if name.is_empty() { None } else { Some(name) };
             eng.touch();
             Ok(json!({ "renamed": p }))
+        }
+        // The normalised name comes back, because the caller has to be able to learn what it
+        // actually got — `Code Reviewer` is stored as `code-reviewer`, and a script that
+        // filters on the role it just set would otherwise never match.
+        "pane.role" => {
+            let p = pane_arg(eng, req, "pane")
+                .or_else(|| eng.session.focused_pane())
+                .ok_or_else(|| bad("no pane"))?;
+            let role = str_arg(req, "role").unwrap_or("");
+            let now = eng.session.set_pane_role(p, role).ok_or_else(|| not_found("no such pane"))?;
+            eng.touch();
+            Ok(json!({ "pane": p, "role": now }))
+        }
+        "pane.pin" => {
+            let p = pane_arg(eng, req, "pane")
+                .or_else(|| eng.session.focused_pane())
+                .ok_or_else(|| bad("no pane"))?;
+            let to = req.params.get("pinned").and_then(|v| v.as_bool());
+            let now =
+                eng.session.toggle_pane_pinned(p, to).ok_or_else(|| not_found("no such pane"))?;
+            eng.touch();
+            Ok(json!({ "pane": p, "pinned": now }))
+        }
+        // Every role in use, and how many panes wear it. The payoff for a role being a name
+        // rather than a note: "who is reviewing, across every project" is one call rather than
+        // a walk of the whole session.
+        "role.list" => {
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                eng.cfg.roles.iter().map(|r| (r.name.clone(), 0)).collect();
+            for p in eng.session.panes.values() {
+                if let Some(r) = &p.role {
+                    *counts.entry(r.clone()).or_insert(0) += 1;
+                }
+            }
+            let declared: std::collections::HashSet<&str> =
+                eng.cfg.roles.iter().map(|r| r.name.as_str()).collect();
+            Ok(json!(counts
+                .into_iter()
+                .map(|(name, panes)| json!({
+                    "declared": declared.contains(name.as_str()),
+                    "name": name,
+                    "panes": panes,
+                }))
+                .collect::<Vec<_>>()))
         }
         "pane.read" => {
             let p = pane_arg(eng, req, "pane")
@@ -541,6 +687,21 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 _ => return Err(bad("give exactly one of task, to, or spawn")),
             };
 
+            // Refused at creation as well as at firing (see `tasks::autonomous()`): a rule that
+            // cannot act is better said no to now than at 09:00 tomorrow.
+            if !super::tasks::autonomous() && matches!(what, super::triggers::What::Task { .. }) {
+                return Err(bad(
+                    "the --task action is parked while the task board is reworked — use --spawn",
+                ));
+            }
+            // Same, for the action that goes over the bus. `--spawn` is the one left: it starts
+            // a program rather than typing at one that is already running.
+            if !super::bus::ENABLED && matches!(what, super::triggers::What::Send { .. }) {
+                return Err(bad(
+                    "the --to action is parked while the message bus is reworked — use --spawn",
+                ));
+            }
+
             // The depth guard. An agent creating a trigger is the interesting part; a
             // machine-started agent creating one closes the loop with no human anywhere in it,
             // and nothing downstream would ever refuse it.
@@ -763,5 +924,77 @@ mod tests {
             params: json!({ "direction": "sideways" }),
         };
         assert_eq!(dir_arg(&req, "direction", Dir::Down), Dir::Down);
+    }
+
+    fn req(method: &str, params: serde_json::Value) -> Request {
+        Request { id: String::new(), method: method.into(), params }
+    }
+
+    /// Renaming a space existed only as a client frame — unreachable from the CLI or a
+    /// script, while `pane.rename` was fully exposed. This is the regression test for that
+    /// gap, not just for the new method.
+    #[test]
+    fn renaming_a_space_is_reachable_from_the_control_api() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-rename", 1);
+        let old = eng.session.spaces[0].name.clone();
+        let v = handle(&mut eng, &req("space.rename", json!({ "name": old, "to": "api" })))
+            .expect("space.rename must exist");
+        assert_eq!(v["name"], "api");
+        assert_eq!(eng.session.spaces[0].name, "api");
+    }
+
+    /// A clash is uniquified silently, so the caller has no way to learn what it actually got
+    /// unless the method says.
+    #[test]
+    fn a_renamed_space_reports_the_name_it_actually_got() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-rename-clash", 1);
+        let cfg = eng.cfg.clone();
+        eng.session.create_space(&cfg, Some("api"), &std::env::temp_dir()).unwrap();
+        let other = eng.session.spaces[0].name.clone();
+        let v = handle(&mut eng, &req("space.rename", json!({ "name": other, "to": "api" })))
+            .unwrap();
+        assert_eq!(v["name"], "api-2", "not the name that was asked for");
+    }
+
+    /// `Code Reviewer` is stored as `code-reviewer`; a script filtering on the role it just
+    /// set would never match unless the normalised form comes back.
+    #[test]
+    fn setting_a_role_returns_the_normalised_name() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-role", 1);
+        let pane = *eng.session.panes.keys().next().unwrap();
+        let v = handle(&mut eng, &req("pane.role", json!({ "pane": pane, "role": "Code Reviewer" })))
+            .unwrap();
+        assert_eq!(v["role"], "code-reviewer");
+
+        // And an empty role clears it rather than naming nothing.
+        let v = handle(&mut eng, &req("pane.role", json!({ "pane": pane, "role": "" }))).unwrap();
+        assert!(v["role"].is_null());
+    }
+
+    #[test]
+    fn an_accent_can_be_set_or_cycled_over_the_control_api() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-accent", 1);
+        let name = eng.session.spaces[0].name.clone();
+        let v = handle(&mut eng, &req("space.accent", json!({ "name": name, "slot": 3 }))).unwrap();
+        assert_eq!(v["slot"], 3);
+        // Omitting the slot steps to the next one, so a caller with no snapshot can still move it.
+        let v = handle(&mut eng, &req("space.accent", json!({ "name": name }))).unwrap();
+        assert_eq!(v["slot"], 4);
+    }
+
+    /// The payoff for a role being a name rather than a note: one call answers "who is
+    /// reviewing", across every project.
+    #[test]
+    fn role_list_counts_every_pane_wearing_each_role() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-rolelist", 2);
+        let panes: Vec<_> = eng.session.panes.keys().copied().collect();
+        for p in &panes {
+            eng.session.set_pane_role(*p, "reviewer");
+        }
+        let v = handle(&mut eng, &req("role.list", json!({}))).unwrap();
+        let rows = v.as_array().unwrap();
+        let row = rows.iter().find(|r| r["name"] == "reviewer").unwrap();
+        assert_eq!(row["panes"], panes.len());
+        assert_eq!(row["declared"], false, "it works without being declared");
     }
 }

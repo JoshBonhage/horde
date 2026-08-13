@@ -138,6 +138,18 @@ pub struct Pane {
     /// may run unattended, and the refusal to let a machine-started agent create more triggers.
     /// Distinguishing the fleet you built from the fleet the machine built is not cosmetic.
     pub spawned_by: Option<u64>,
+    /// What this pane is *for*, as you decided: `reviewer`, `builder`, `docs`.
+    ///
+    /// Three names meet on an agent pane and none substitutes for another. `name` is how you
+    /// address it, `agent.kind` is which program was detected, and this is the job. Only the
+    /// job recurs across projects, which is what makes it the one worth grouping by.
+    ///
+    /// Here rather than on `AgentRuntime` for the same reason `name` is: detection creates
+    /// and destroys the agent record, and a label you gave should not evaporate because the
+    /// process it described exited, or came back as a shell under `restore = false`.
+    pub role: Option<String>,
+    /// Held at the top of the sidebar's agent list, whichever space it lives in.
+    pub pinned: bool,
 
     term: Term<EventProxy>,
     parser: Processor,
@@ -234,6 +246,8 @@ impl Pane {
             exited: None,
             agent: None,
             spawned_by: None,
+            role: None,
+            pinned: false,
             term,
             parser: Processor::new(),
             master,
@@ -585,6 +599,8 @@ impl Pane {
                     queued: a.queued.clone(),
                 }),
                 spawned_by: self.spawned_by,
+                role: self.role.clone(),
+                pinned: self.pinned,
                 screen: self.mirror.clone(),
                 pending,
                 cursor_x: cursor.x,
@@ -631,6 +647,8 @@ impl Pane {
             rows: saved.rows,
             exited: None,
             spawned_by: saved.spawned_by,
+            role: saved.role.clone(),
+            pinned: saved.pinned,
             agent: saved.agent.as_ref().map(|a| super::state::AgentRuntime {
                 kind: a.kind.clone(),
                 name: a.name.clone(),

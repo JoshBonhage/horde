@@ -16,11 +16,35 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use super::{App, Mode};
-use crate::proto::{Rect, Rgb};
+use crate::proto::{AgentState, Rect, Rgb};
 use crate::theme::{mix, Theme};
 
 pub fn color(c: Rgb) -> Color {
     Color::Rgb(c.r, c.g, c.b)
+}
+
+/// Display columns a string occupies, which is not its character count once a glyph is wide.
+pub fn width(s: &str) -> usize {
+    s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+}
+
+/// The glyph and colour an agent state is drawn with.
+///
+/// Shared rather than sidebar-local because more than one view now draws agent states, and
+/// two copies of this would drift the moment one gained a state the other did not.
+pub fn state_look(state: AgentState, t: &Theme, tick: usize, animate: bool) -> (String, Rgb) {
+    let glyph = match state {
+        AgentState::Working if animate => pane_widget::spinner_frame(tick).to_string(),
+        _ => state.glyph().to_string(),
+    };
+    let c = match state {
+        AgentState::Working => t.ui.working,
+        AgentState::Blocked => t.ui.blocked,
+        AgentState::Done => t.ui.done,
+        AgentState::Idle => t.ui.idle,
+        AgentState::Unknown => t.ui.unknown,
+    };
+    (glyph, c)
 }
 
 /// Style for a terminal cell run.
@@ -211,6 +235,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let zoomed = snap.view.zoom == Some(pane.id);
 
         if app.cfg.pane_titles {
+            // The space's colour is resolved here rather than inside the widget: a pane knows
+            // which space it is in, but only the snapshot knows that space's slot.
+            let accent = snap
+                .spaces
+                .iter()
+                .find(|s| s.id == pane.space)
+                .map(|s| theme.space_accent(s.accent))
+                .unwrap_or(theme.ui.border);
             let block = pane_widget::pane_frame(
                 pane,
                 focused,
@@ -218,6 +250,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 &theme,
                 app.tick,
                 app.cfg.animate,
+                accent,
+                &app.cfg.roles,
             );
             block.render(trect(pane.cell), f.buffer_mut());
         }
@@ -240,7 +274,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Panels
     if !snap.sidebar.is_empty() {
+        // Both of these are borrowed mutably by the widget while `app` still is, so they are
+        // lifted out and put back — the same trick the hit list has always used.
         let mut hits = std::mem::take(&mut app.sidebar_hits);
+        let mut state = std::mem::take(&mut app.sidebar);
+        let focused = matches!(app.mode, Mode::Sidebar);
         sidebar::Sidebar {
             snap: &snap,
             board: Some((snap.tasks_open, snap.tasks_claimed)),
@@ -248,9 +286,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             tick: app.tick,
             animate: app.cfg.animate,
             hits: &mut hits,
+            state: &mut state,
+            focused,
         }
         .render(trect(snap.sidebar), f.buffer_mut());
         app.sidebar_hits = hits;
+        app.sidebar = state;
     }
     if !snap.bus.is_empty() {
         bus_drawer::BusDrawer { messages: &app.bus, theme: &theme, now: now_millis() }
@@ -274,6 +315,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Terminal => {}
         Mode::Prefix => {}
+        // The panel is already on screen and already drew its own cursor; there is no overlay
+        // to put in front of it.
+        Mode::Sidebar => {}
+        Mode::Roster { .. } => {
+            dim_area(f.buffer_mut(), area, &theme, 0.6);
+            overlays::roster(f, area, app);
+        }
         Mode::Help => {
             dim_area(f.buffer_mut(), area, &theme, 0.6);
             overlays::help(f, area, app);
@@ -432,7 +480,7 @@ mod frame_tests {
                         last_tool: Some("Edit".into()),
                     },
                 }),                spawned_by: None,
-                exited: false, scroll_offset: 0, wants_mouse: false, bracketed_paste: true,
+                exited: false, scroll_offset: 0, wants_mouse: false, bracketed_paste: true, role: None, pinned: false,
             }
         };
 
@@ -447,9 +495,9 @@ mod frame_tests {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             spaces: vec![
                 SpaceInfo { id: 1, name: "api-refactor".into(), cwd: "/x".into(),
-                    tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1 },
+                    tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1, accent: 0, collapsed: false },
                 SpaceInfo { id: 2, name: "docs".into(), cwd: "/y".into(),
-                    tabs: vec![2], focused_tab: Some(2), agent_count: 1, attention_count: 0 },
+                    tabs: vec![2], focused_tab: Some(2), agent_count: 1, attention_count: 0, accent: 1, collapsed: false },
             ],
             tabs: vec![
                 TabInfo { id: 1, space: 1, name: "agents".into(), panes: vec![1,2,3], focused_pane: Some(1) },
@@ -528,6 +576,45 @@ mod frame_tests {
         let out = render(&mut app, 146, 39);
         println!("\n{out}\n");
         assert!(out.contains("keys"));
+    }
+
+    #[test]
+    fn roster_overlay_renders() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        app.mode = crate::client::Mode::Roster { scroll: 0 };
+        let out = render(&mut app, 146, 39);
+        println!("\n{out}\n");
+        assert!(out.contains("roster"), "{out}");
+        assert!(out.contains("enter jumps"), "the footer hint must survive: {out}");
+    }
+
+    /// The roster is a whole-frame view, so every landable line must record where it was
+    /// drawn or the mouse could not reach any of them.
+    #[test]
+    fn the_roster_records_a_hit_box_for_every_row_it_draws() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        app.mode = crate::client::Mode::Roster { scroll: 0 };
+        let _ = render(&mut app, 146, 39);
+        assert!(!app.roster_hits.is_empty());
+        assert!(app.roster_hits.iter().all(|(_, _, w, _)| *w > 0));
+    }
+
+    /// A terminal too narrow for two cards gets one column rather than two unreadable ones.
+    #[test]
+    fn a_narrow_terminal_still_renders_the_roster() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        app.mode = crate::client::Mode::Roster { scroll: 0 };
+        let out = render(&mut app, 60, 20);
+        // Not every frame line is padded to full width — the tab bar never has been — so the
+        // invariant worth asserting is that nothing *exceeds* it.
+        for line in out.lines() {
+            assert!(line.chars().count() <= 60, "{line:?}");
+        }
+        assert!(out.contains("roster"), "{out}");
+        assert!(out.contains("api-refactor"), "one column, but still readable:\n{out}");
     }
 
     #[test]

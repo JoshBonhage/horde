@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -232,6 +232,14 @@ pub struct PaneInfo {
     /// The program enabled bracketed paste, so a multi-line paste must be wrapped rather
     /// than submitted line by line.
     pub bracketed_paste: bool,
+    /// What this pane is *for*, when you have said. Independent of `title` and of
+    /// `agent.kind`, and present on panes with no agent at all — a pane can be labelled
+    /// before the program in it has booted far enough to be recognised.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Held at the top of the sidebar's agent list, whichever space it lives in.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// What an agent has actually been doing, counted from its lifecycle hooks.
@@ -309,6 +317,17 @@ pub struct SpaceInfo {
     /// Cheap rollup so the sidebar doesn't have to walk every pane.
     pub agent_count: usize,
     pub attention_count: usize,
+    /// Slot in the theme's project ramp. The client turns it into a colour with *its* theme,
+    /// which is the whole reason this is an index and not a hex string.
+    ///
+    /// The `serde(default)` buys nothing on the render channel — postcard is positional, so
+    /// this field is a protocol break regardless. It is here for the JSON control channel,
+    /// where `space.list` and `session.snapshot` serialise this same struct.
+    #[serde(default)]
+    pub accent: u8,
+    /// The sidebar folds this space's agents away.
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 /// Everything the client needs to draw a frame apart from cell contents.
@@ -474,6 +493,16 @@ pub enum Cmd {
     RequestDigest,
     /// Make every program on screen repaint at the size it actually has.
     Redraw,
+    /// Retint a space. `slot` wraps into the theme's project ramp; `None` means "the next one
+    /// along", so a caller with no snapshot in hand can still cycle.
+    SetSpaceAccent { space: SpaceId, slot: Option<u8> },
+    /// Give a pane a job, or clear it with an empty string — the same contract `RenamePane`
+    /// uses, so there is one rule for "a text field a menu can empty".
+    SetPaneRole { pane: PaneId, role: String },
+    /// Fold a space's agents away in the sidebar.
+    ToggleSpaceCollapsed(SpaceId),
+    /// Hold a pane at the top of the sidebar's agent list.
+    TogglePanePinned(PaneId),
 }
 
 // Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
@@ -743,5 +772,35 @@ mod digest_tests {
         d.gone.push("c".into());
         let h = d.headline().unwrap();
         assert_eq!(h.matches(',').count(), 1, "too much for a toast: {h}");
+    }
+
+    /// Postcard identifies an enum variant by its index, so inserting one silently renumbers
+    /// every variant below it: a client one build ahead sends `FocusPane`, the daemon decodes
+    /// something else, reads a field that is not there, and drops the connection. That is not
+    /// hypothetical — it shipped once, and clicking a pane killed the session while every
+    /// keybinding above the inserted variant carried on working.
+    ///
+    /// Pinning the encoded index of a few mid-enum variants turns the next attempt into a
+    /// failing test instead. **If this fails, you inserted a variant rather than appending
+    /// one — move it to the end of the enum.**
+    #[test]
+    fn cmd_variants_are_append_only() {
+        for (cmd, want) in [
+            (Cmd::SplitRight, 0u8),
+            (Cmd::NewTab, 7),
+            (Cmd::JumpAttention, 18),
+            (Cmd::RequestDigest, 30),
+            (Cmd::Redraw, 31),
+        ] {
+            let bytes = postcard::to_allocvec(&cmd).unwrap();
+            assert_eq!(bytes[0], want, "{cmd:?} moved: variants must only ever be appended");
+        }
+    }
+
+    /// Adding a field to a snapshot struct is just as much a wire break as moving a variant,
+    /// and the only defence is the handshake — so the version has to move with the shape.
+    #[test]
+    fn the_protocol_version_covers_the_current_wire_shape() {
+        assert_eq!(PROTOCOL_VERSION, 3, "bump this whenever a wire struct or enum changes");
     }
 }

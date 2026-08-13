@@ -129,6 +129,7 @@ pub fn rows(cfg: &Config, cat: Category) -> Vec<Row> {
             setting("Sidebar width", cfg.sidebar_width.to_string(), Field::SidebarWidth),
             setting("Bus drawer", onoff(cfg.bus), Field::Bus),
             setting("Bus width", cfg.bus_width.to_string(), Field::BusWidth),
+            note("The bus is paused; the drawer still reads back what it logged."),
             separator(),
             setting("Pane titles", onoff(cfg.pane_titles), Field::PaneTitles),
             setting("Animations", onoff(cfg.animate), Field::Animate),
@@ -171,10 +172,10 @@ pub fn rows(cfg: &Config, cat: Category) -> Vec<Row> {
             note("Rows of the live buffer that screen detection matches against."),
             separator(),
             setting("Force message delivery", onoff(cfg.force_inject), Field::ForceInject),
-            note("Off is safer: messages wait rather than answering a live prompt."),
+            note("Parked while the bus is reworked — nothing is delivered to force."),
             separator(),
             setting("Nudge idle agents", onoff(cfg.task_nudge), Field::TaskNudge),
-            note("When the board has work, tell one idle agent to claim it."),
+            note("Parked while the board is reworked — this has no effect yet."),
             separator(),
             Row {
                 label: "Install Claude Code hooks".into(),
@@ -535,10 +536,12 @@ mod tests {
     #[test]
     fn rebinding_a_bare_key_becomes_a_prefix_binding() {
         let mut cfg = Config::default();
-        let chord = Chord::new(KeyModifiers::NONE, KeyCode::Char('f'));
+        // `v` rather than a key the default table already owns — rebinding onto a taken chord
+        // is refused, which is a different behaviour and has its own test below.
+        let chord = Chord::new(KeyModifiers::NONE, KeyCode::Char('v'));
         let (key, value) = rebind(&mut cfg, "zoom", chord).unwrap();
         assert_eq!(key, "keys.zoom");
-        assert_eq!(value, Value::Str("prefix+f".into()));
+        assert_eq!(value, Value::Str("prefix+v".into()));
         assert_eq!(cfg.keys.lookup(&Trigger::Prefix(chord)).is_some(), true);
     }
 

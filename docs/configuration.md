@@ -33,6 +33,10 @@ shell = "/bin/zsh"          # defaults to $SHELL
 [theme]
 # horde · tokyo-night · catppuccin · gruvbox · terminal
 name = "horde"
+# Colours projects are tinted with, by position. Six slots; a short list replaces only the
+# ones you name. A space stores which *slot* it uses, not a colour, so retinting here moves
+# every project on that slot at once — see below.
+space_accents = ["#79c0ff", "#d2a8ff"]
 
 [theme.custom]
 accent = "#7ee2c0"
@@ -41,6 +45,17 @@ working = "#f0c674"
 # any of: accent accent_alt bg panel_bg title_bg text text_dim text_faint border
 #         border_focus working blocked done idle unknown ok warn error selection fg cursor
 # accepts #rgb, #rrggbb, rgb(r,g,b), or an ANSI colour name
+
+# Roles you have named, and how each is drawn. Declaring one styles it; it does not permit
+# it — `horde pane role %2 anything` works whether or not it appears here.
+[[roles]]
+name = "reviewer"
+color = "#79c0ff"
+glyph = "◈"                 # must be one cell wide
+
+[[roles]]
+name = "builder"
+color = "#7ee787"
 
 [ui]
 sidebar = true
@@ -55,8 +70,8 @@ animate = true              # spinners for working agents
 [agents]
 restore = true              # resume agents after a daemon restart
 detection_lines = 40        # rows of the live buffer detection reads
-force_inject = false        # deliver messages even mid-stream — see below
-task_nudge = true           # tell an idle agent when the board has work
+force_inject = false        # deliver messages even mid-stream — parked, see below
+task_nudge = false          # tell an idle agent when the board has work — parked, see below
 
 [notifications]
 delivery = "horde"          # horde · system · off
@@ -74,6 +89,47 @@ close_pane = "none"         # unbind
 
 Run `horde keys` for every rebindable action name.
 
+## Project colours
+
+Every space is assigned an accent when it is created — the least-used slot, so two projects
+next to each other differ in colour as well as name without you asking for either. It shows
+in the tab bar, on the space's sidebar dot, and on the borders of every pane in that space.
+
+A space stores a **slot number**, not a colour. That is what lets a theme change repaint all
+of them together: chrome colours are resolved by the client from whichever theme it is
+running, so a stored `#79c0ff` would leave one project painted in the old palette while
+everything around it moved. It also means `space_accents` in `[theme]` is the right place to
+put a literal colour — config outlives `state.json`, so your choices survive `horde stop`.
+
+The focused pane keeps its own border colour rather than the project's. Which pane has the
+keyboard is the one thing that border exists to answer, and it should not become a question
+of hue.
+
+```sh
+horde space accent api-refactor 3    # a specific slot
+horde space accent api-refactor      # step to the next one
+```
+
+## Roles
+
+A role is what a pane is *for*: `reviewer`, `builder`, `docs`. Three names meet on an agent
+pane and none substitutes for another — the pane's name is how you address it, the agent's
+kind is which program was detected, and the role is the job. Only the role recurs across
+projects, which is what makes it worth grouping by.
+
+```sh
+horde pane role %2 reviewer
+horde pane role %2                   # clears it
+horde role list                      # who is doing what, across every project
+```
+
+Names are normalised — trimmed, lowercased, spaces and underscores folded to `-`, capped at
+16 characters — so `Code Reviewer` and `code_reviewer` are one role rather than three.
+Without that, roles would fragment and stop being the thing they exist to be.
+
+An undeclared role still works, and gets a glyph of `◆` and a colour derived from its name,
+stable across runs and projects. `[[roles]]` only chooses how a role looks.
+
 ## `theme = "terminal"`
 
 Follows your terminal's own ANSI palette, and passes cell colours that are still "default"
@@ -81,13 +137,32 @@ through untouched, so panes look exactly as they would outside horde.
 
 ## `agents.force_inject`
 
+**Parked, along with the bus it forces.** Setting it currently does nothing: `daemon::bus::ENABLED`
+is off, so `bus.send`, `bus.reply` and `bus.broadcast` are refused at the socket and no message
+is delivered to any pane — by hand, by a trigger, or by the board's nudge. `bus.tail` and
+`bus.reply_for` still read the log, and the log on disk is left alone. Messages that were queued
+when the switch went off stay queued rather than flushing.
+
+The rest of this section is how it behaves when the bus is back on.
+
 Off by default, and worth leaving off. On, it removes the state gate that holds messages
 destined for a busy or blocked agent. Against a `blocked` agent that means your message
 answers its open permission prompt. See [orchestration §4](orchestration.md).
 
 ## `agents.task_nudge`
 
-On by default. The task board is pull-based — nobody assigns work, whoever is free claims it.
+**Parked, and so is the board it nudges about.** Off by default, and setting it to `true`
+currently does nothing. Two switches in `daemon::tasks` hold this:
+
+- `ENABLED` — the board itself. While it is off the board is **paused**: `task.add`, `task.claim`,
+  `task.done` and `task.release` are refused at the socket, so no agent can take work off it
+  however it was told to. `horde task list` still reads it, and the log on disk is left alone.
+- `AUTONOMOUS` — the half that acts unasked: this nudge, the sweep that reclaims a departed
+  agent's tasks, and the `--task` trigger action.
+
+The rest of this section describes the nudge as it will be when both go back on.
+
+The task board is pull-based — nobody assigns work, whoever is free claims it.
 But an idle agent has no reason to look at a board it was never told about, so horde tells one:
 when there are open tasks and an agent is free, it receives a single `[horde]` line naming
 `horde task claim`.
@@ -108,7 +183,8 @@ Three limits keep it from wasting turns, and each exists because the obvious ver
   and then went quiet.
 
 Turn it off with `task_nudge = false`, or from the settings page under Agents, and the board
-becomes purely manual: agents only find work when they look.
+becomes purely manual: agents only find work when they look. Today it is neither — the board is
+paused outright, whatever this setting says.
 
 ## `notifications.command`
 

@@ -27,6 +27,20 @@ pub struct Space {
     pub cwd: PathBuf,
     pub tabs: Vec<TabId>,
     pub focused_tab: Option<TabId>,
+    /// Which slot of the theme's project ramp tints this space.
+    ///
+    /// An index, not a colour. Chrome colours are resolved by the *client* from its own
+    /// theme, so a stored hex would leave one project painted in the old palette after a
+    /// theme change while everything around it moved. Assigned at creation from the
+    /// least-used slot, and changed only when you ask.
+    pub accent: u8,
+    /// The sidebar shows this space's row but folds its agents away.
+    ///
+    /// Session state rather than client state, because it is a decision and not a view: a
+    /// group you collapsed should still be collapsed after a detach, from any client, and
+    /// after an upgrade. The client owns where rows are drawn; it does not own which ones
+    /// you asked to stop seeing.
+    pub collapsed: bool,
 }
 
 pub struct Tab {
@@ -138,12 +152,15 @@ impl Session {
         });
         let name = self.unique_space_name(&base);
 
+        let accent = self.pick_accent();
         self.spaces.push(Space {
             id,
             name,
             cwd: cwd.to_path_buf(),
             tabs: Vec::new(),
             focused_tab: None,
+            accent,
+            collapsed: false,
         });
         // Focus the new space. Creating one and being left in the old one means the next
         // `pane split` or spawned agent lands somewhere you did not ask for — which is how
@@ -151,6 +168,23 @@ impl Session {
         self.focused_space = Some(id);
         self.create_tab(cfg, id, None)?;
         Ok(id)
+    }
+
+    /// The accent a new space takes: the least-used slot, ties broken by the lowest index.
+    ///
+    /// Deliberately the same shape as `unique_space_name` — a new space should differ from
+    /// its neighbours in both of the things you identify it by, and neither should need
+    /// asking for.
+    pub fn pick_accent(&self) -> u8 {
+        let mut used = [0usize; crate::theme::SPACE_ACCENTS];
+        for s in &self.spaces {
+            used[s.accent as usize % crate::theme::SPACE_ACCENTS] += 1;
+        }
+        used.iter()
+            .enumerate()
+            .min_by_key(|(i, n)| (**n, *i))
+            .map(|(i, _)| i as u8)
+            .unwrap_or(0)
     }
 
     fn unique_space_name(&self, base: &str) -> String {
@@ -434,6 +468,44 @@ impl Session {
             }
             None => false,
         }
+    }
+
+    /// Retint a space, or step it to the next slot when `slot` is `None`.
+    ///
+    /// Returns the slot it ended on, so a caller that asked to cycle learns what it got —
+    /// the same reason `rename_space` is worth asking about its result.
+    pub fn set_space_accent(&mut self, space: SpaceId, slot: Option<u8>) -> Option<u8> {
+        let n = crate::theme::SPACE_ACCENTS as u8;
+        let s = self.space_mut(space)?;
+        s.accent = match slot {
+            Some(v) => v % n,
+            None => (s.accent + 1) % n,
+        };
+        Some(s.accent)
+    }
+
+    /// Label what a pane is for. An empty or all-punctuation role clears it.
+    ///
+    /// Normalising here rather than at each caller is what keeps `Reviewer` typed at the CLI
+    /// and `reviewer` picked from a menu the same role — which is the only reason roles are
+    /// worth grouping by at all.
+    pub fn set_pane_role(&mut self, pane: PaneId, role: &str) -> Option<Option<String>> {
+        let normalised = crate::config::normalise_role(role);
+        let p = self.panes.get_mut(&pane)?;
+        p.role = normalised;
+        Some(p.role.clone())
+    }
+
+    pub fn toggle_space_collapsed(&mut self, space: SpaceId, to: Option<bool>) -> Option<bool> {
+        let s = self.space_mut(space)?;
+        s.collapsed = to.unwrap_or(!s.collapsed);
+        Some(s.collapsed)
+    }
+
+    pub fn toggle_pane_pinned(&mut self, pane: PaneId, to: Option<bool>) -> Option<bool> {
+        let p = self.panes.get_mut(&pane)?;
+        p.pinned = to.unwrap_or(!p.pinned);
+        Some(p.pinned)
     }
 
     pub fn rename_tab(&mut self, tab: TabId, name: &str) -> bool {
@@ -775,12 +847,18 @@ impl Session {
             let space_id = self.next_space;
             self.next_space += 1;
             let name = self.unique_space_name(&hspace.name);
+            // A manifest from a daemon that predates accents carries none, and defaulting
+            // those to slot 0 would turn every space the same colour after one `horde
+            // upgrade` — the feature would look broken rather than absent.
+            let accent = hspace.accent.unwrap_or_else(|| self.pick_accent());
             self.spaces.push(Space {
                 id: space_id,
                 name,
                 cwd: PathBuf::from(&hspace.cwd),
                 tabs: Vec::new(),
                 focused_tab: None,
+                accent,
+                collapsed: hspace.collapsed,
             });
             space_ids.push(space_id);
 
@@ -878,6 +956,8 @@ impl Session {
                     scroll_offset: p.scroll_offset(),
                     wants_mouse: p.wants_mouse(),
                     bracketed_paste: p.bracketed_paste(),
+                    role: p.role.clone(),
+                    pinned: p.pinned,
                 }
             })
             .collect();
@@ -920,6 +1000,8 @@ impl Session {
                     focused_tab: s.focused_tab,
                     agent_count,
                     attention_count,
+                    accent: s.accent,
+                    collapsed: s.collapsed,
                 }
             })
             .collect();
@@ -1160,6 +1242,72 @@ mod tests {
         assert_eq!(s.space(c).unwrap().name, "api-3");
         // An empty rename is refused rather than leaving an unaddressable space.
         assert!(!s.rename_space(c, "   "));
+        kill_all(&mut s);
+    }
+
+    /// The colour sibling of `space_names_stay_unique_so_they_remain_addressable`: a new space
+    /// should differ from its neighbours in both of the things you identify it by, and neither
+    /// should need asking for.
+    #[test]
+    fn a_new_space_takes_the_least_used_accent() {
+        let (cfg, mut s) = session();
+        let mut seen = Vec::new();
+        for i in 0..crate::theme::SPACE_ACCENTS {
+            let id = s.create_space(&cfg, Some(&format!("p{i}")), &std::env::temp_dir()).unwrap();
+            seen.push(s.space(id).unwrap().accent);
+        }
+        let mut uniq = seen.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), seen.len(), "each project its own colour: {seen:?}");
+        kill_all(&mut s);
+    }
+
+    /// Past the end of the ramp colours have to repeat — there are only so many. What must not
+    /// happen is repeating one while another is still unused.
+    #[test]
+    fn accents_only_repeat_once_every_slot_is_taken() {
+        let (cfg, mut s) = session();
+        let n = crate::theme::SPACE_ACCENTS;
+        for i in 0..n + 2 {
+            s.create_space(&cfg, Some(&format!("p{i}")), &std::env::temp_dir()).unwrap();
+        }
+        let mut counts = vec![0usize; n];
+        for sp in &s.spaces {
+            counts[sp.accent as usize % n] += 1;
+        }
+        let lo = counts.iter().min().unwrap();
+        let hi = counts.iter().max().unwrap();
+        assert!(hi - lo <= 1, "slots used unevenly: {counts:?}");
+        kill_all(&mut s);
+    }
+
+    /// The executable argument for the role living on `Pane` rather than on `AgentRuntime`:
+    /// detection creates and destroys the agent record, and a label you gave should not
+    /// evaporate because the process it described exited.
+    #[test]
+    fn a_role_outlives_the_agent_that_wore_it() {
+        let (cfg, mut s) = session();
+        s.create_space(&cfg, Some("api"), &std::env::temp_dir()).unwrap();
+        let pane = s.focused_pane().unwrap();
+        assert_eq!(s.set_pane_role(pane, "Code Reviewer"), Some(Some("code-reviewer".into())));
+        s.panes.get_mut(&pane).unwrap().agent = None;
+        assert_eq!(s.panes[&pane].role.as_deref(), Some("code-reviewer"));
+        // And an empty role clears it, the same way an empty rename does.
+        assert_eq!(s.set_pane_role(pane, "  "), Some(None));
+        kill_all(&mut s);
+    }
+
+    #[test]
+    fn an_accent_can_be_set_or_cycled_and_always_lands_in_the_ramp() {
+        let (cfg, mut s) = session();
+        let space = s.create_space(&cfg, Some("api"), &std::env::temp_dir()).unwrap();
+        assert_eq!(s.set_space_accent(space, Some(2)), Some(2));
+        // Cycling steps to the next slot, so a caller with no snapshot can still move it.
+        assert_eq!(s.set_space_accent(space, None), Some(3));
+        // And an out-of-range slot wraps rather than being refused or stored raw.
+        let n = crate::theme::SPACE_ACCENTS as u8;
+        assert_eq!(s.set_space_accent(space, Some(n + 1)), Some(1));
         kill_all(&mut s);
     }
 }

@@ -5,6 +5,7 @@
 
 pub mod input;
 pub mod menu;
+pub mod roster;
 pub mod selection;
 pub mod settings;
 pub mod ui;
@@ -36,6 +37,7 @@ use crate::proto::{
     SpaceId, TabId, PROTOCOL_VERSION,
 };
 use ui::overlays::Item;
+use crate::client::roster::Focus;
 use ui::sidebar::Hit;
 
 /// Animation cadence for spinners and toast expiry.
@@ -62,6 +64,17 @@ pub enum Mode {
     Menu { stack: Vec<Level>, at: (u16, u16) },
     /// The catch-up report. Scrollable, because a long absence produces a long digest.
     Digest { scroll: usize },
+    /// The full-screen roster. Scroll lives here because it is a one-shot view; the
+    /// *selection* is `app.sidebar.cursor`, so one cursor serves both views of the same list.
+    Roster { scroll: usize },
+    /// The sidebar has the keyboard.
+    ///
+    /// Carries nothing: everything it edits lives on `App` or in the daemon, because a
+    /// collapse has to survive leaving the mode and `Mode` variants are constructed and
+    /// discarded. A mode at all — rather than plain bindings — because `Keymap::rebind`
+    /// rightly refuses bare printable keys, so without one every cursor move would cost
+    /// `prefix`+key and crossing a dozen rows would cost two dozen keystrokes.
+    Sidebar,
 }
 
 /// What selecting a picker row does.
@@ -91,6 +104,11 @@ pub struct App {
     pub tick: usize,
     /// Row-to-target map produced by the sidebar during render, used to resolve clicks.
     pub sidebar_hits: Vec<(u16, Hit)>,
+    /// Cursor, scroll, and nothing else — see `roster::SidebarState`.
+    pub sidebar: roster::SidebarState,
+    /// Where each landable roster row was drawn: row, column, width, and what it is. Rects
+    /// rather than rows, because the roster is multi-column and a row means several things.
+    pub roster_hits: Vec<(u16, u16, u16, Focus)>,
     /// Set once the version mismatch warning has been shown, so it appears only once.
     pub warned_version: bool,
     /// Screen row to menu-item index, recorded during render for mouse hit-testing.
@@ -124,6 +142,8 @@ impl App {
             toasts: VecDeque::new(),
             tick: 0,
             sidebar_hits: Vec::new(),
+            sidebar: roster::SidebarState::default(),
+            roster_hits: Vec::new(),
             warned_version: false,
             menu_hits: Vec::new(),
             menu_rect: crate::proto::Rect::default(),
@@ -454,6 +474,9 @@ fn apply_frame(app: &mut App, frame: ServerFrame) -> Option<String> {
             let live: Vec<PaneId> = snap.panes.iter().map(|p| p.id).collect();
             app.rows.retain(|id, _| live.contains(id));
             app.cursors.retain(|id, _| live.contains(id));
+            // And a cursor pointing at a space that closed or an agent that exited. The same
+            // "forget what no longer exists" site, so there is only one of them.
+            app.sidebar.prune(&snap);
             app.snapshot = Some(*snap);
         }
         ServerFrame::Rows { pane, rows, cursor } => {
@@ -527,6 +550,12 @@ fn handle_event(
     }
 }
 
+/// The role of the agent the cursor is on, when it has one.
+fn role_under_cursor(app: &App) -> Option<String> {
+    let Some(Focus::Agent(pane)) = app.sidebar.cursor else { return None };
+    app.pane_info(pane)?.role.clone()
+}
+
 fn handle_key(
     app: &mut App,
     k: KeyEvent,
@@ -542,6 +571,136 @@ fn handle_key(
 
     // Overlay modes consume keys entirely.
     match app.mode.clone() {
+        // The sidebar takes the keyboard while it has the cursor. Everything it does not
+        // recognise is *ignored* rather than passed through: falling through would type `x`
+        // into an agent you were only looking at.
+        Mode::Sidebar => {
+            // The *filtered* list, so the cursor only ever walks rows that are on screen.
+            let lens = app.sidebar.lens.clone();
+            let rows = app
+                .snapshot
+                .as_ref()
+                .map(|s| {
+                    let w = s.view.sidebar_width.saturating_sub(2);
+                    roster::filtered_rows(s, roster::Density::of(w), &lens)
+                })
+                .unwrap_or_default();
+            let page = 10;
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => app.sidebar.step(&rows, 1),
+                KeyCode::Char('k') | KeyCode::Up => app.sidebar.step(&rows, -1),
+                KeyCode::PageDown => app.sidebar.step(&rows, page),
+                KeyCode::PageUp => app.sidebar.step(&rows, -page),
+                KeyCode::Char('g') | KeyCode::Home => app.sidebar.jump(&rows, false),
+                KeyCode::Char('G') | KeyCode::End => app.sidebar.jump(&rows, true),
+                // Acts *and* exits, so the common path — glance, jump, type — never leaves
+                // you parked in a mode you then have to notice and leave.
+                KeyCode::Enter => {
+                    if let Some(f) = app.sidebar.cursor {
+                        let _ = out.send(ClientFrame::Command(f.activate()));
+                    }
+                    app.mode = Mode::Terminal;
+                }
+                KeyCode::Char(' ') | KeyCode::Char('h') | KeyCode::Char('l')
+                | KeyCode::Left | KeyCode::Right => {
+                    let collapse = matches!(k.code, KeyCode::Char('h') | KeyCode::Left);
+                    let expand = matches!(k.code, KeyCode::Char('l') | KeyCode::Right);
+                    match app.sidebar.cursor {
+                        Some(Focus::Group(space)) => {
+                            let now = app
+                                .snapshot
+                                .as_ref()
+                                .and_then(|s| s.spaces.iter().find(|x| x.id == space))
+                                .is_some_and(|x| x.collapsed);
+                            // `h`/`l` are directional, so they only act in their direction;
+                            // space toggles. Pressing `l` on an open group should do nothing,
+                            // not close it.
+                            if (collapse && !now) || (expand && now) || (!collapse && !expand) {
+                                let _ = out.send(ClientFrame::Command(
+                                    Cmd::ToggleSpaceCollapsed(space),
+                                ));
+                            }
+                        }
+                        // On an agent, `h` folds the group it belongs to and moves the cursor
+                        // up to the header — otherwise the cursor would be left pointing at a
+                        // row that just stopped existing.
+                        Some(Focus::Agent(pane)) if collapse => {
+                            if let Some(space) = app
+                                .snapshot
+                                .as_ref()
+                                .and_then(|s| s.panes.iter().find(|p| p.id == pane))
+                                .map(|p| p.space)
+                            {
+                                app.sidebar.cursor = Some(Focus::Group(space));
+                                let _ = out.send(ClientFrame::Command(
+                                    Cmd::ToggleSpaceCollapsed(space),
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Char('p') => {
+                    if let Some(Focus::Agent(pane)) = app.sidebar.cursor {
+                        let _ = out.send(ClientFrame::Command(Cmd::TogglePanePinned(pane)));
+                    }
+                }
+                KeyCode::Char('f') => app.sidebar.lens = app.sidebar.lens.cycle(),
+                // "Show me everyone doing this job." Discoverable because you are pointing
+                // at the role when you press it, and `f` steps back out to `all` from here.
+                KeyCode::Char('r') => {
+                    if let Some(role) = role_under_cursor(app) {
+                        app.sidebar.lens = roster::Lens::Role(role);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Terminal,
+                _ => {}
+            }
+            return Ok(());
+        }
+        // The roster is the sidebar's list at a size that can afford detail, so it shares the
+        // sidebar's cursor — open it and you land where you left off, jump from it and the
+        // sidebar agrees.
+        Mode::Roster { scroll } => {
+            let lens = app.sidebar.lens.clone();
+            let rows = app
+                .snapshot
+                .as_ref()
+                .map(|s| roster::filtered_rows(s, roster::Density::Wide, &lens))
+                .unwrap_or_default();
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => app.sidebar.step(&rows, 1),
+                KeyCode::Char('k') | KeyCode::Up => app.sidebar.step(&rows, -1),
+                KeyCode::PageDown => app.mode = Mode::Roster { scroll: scroll + 5 },
+                KeyCode::PageUp => {
+                    app.mode = Mode::Roster { scroll: scroll.saturating_sub(5) }
+                }
+                KeyCode::Char('g') | KeyCode::Home => app.sidebar.jump(&rows, false),
+                KeyCode::Char('G') | KeyCode::End => app.sidebar.jump(&rows, true),
+                KeyCode::Enter => {
+                    if let Some(f) = app.sidebar.cursor {
+                        let _ = out.send(ClientFrame::Command(f.activate()));
+                    }
+                    app.mode = Mode::Terminal;
+                }
+                KeyCode::Char('p') => {
+                    if let Some(Focus::Agent(pane)) = app.sidebar.cursor {
+                        let _ = out.send(ClientFrame::Command(Cmd::TogglePanePinned(pane)));
+                    }
+                }
+                KeyCode::Char('f') => app.sidebar.lens = app.sidebar.lens.cycle(),
+                // "Show me everyone doing this job." Discoverable because you are pointing
+                // at the role when you press it, and `f` steps back out to `all` from here.
+                KeyCode::Char('r') => {
+                    if let Some(role) = role_under_cursor(app) {
+                        app.sidebar.lens = roster::Lens::Role(role);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Terminal,
+                _ => {}
+            }
+            return Ok(());
+        }
         Mode::Help => {
             // Any key closes help; there is nothing else to do in it.
             app.mode = Mode::Terminal;
@@ -708,6 +867,9 @@ pub fn open_prompt(app: &mut App, prompt: Prompt) {
             .and_then(|s| s.tabs.iter().find(|x| x.id == *id))
             .map(|x| x.name.clone())
             .unwrap_or_default(),
+        Prompt::SetRole(p) => {
+            app.pane_info(*p).and_then(|i| i.role.clone()).unwrap_or_default()
+        }
         // Nothing sensible to prefill for these.
         Prompt::NewSpace | Prompt::SendTo(_) | Prompt::RunCommand => String::new(),
     };
@@ -732,7 +894,7 @@ fn activate(app: &mut App, act: Act, out: &mpsc::UnboundedSender<ClientFrame>) -
         Act::Submenu(sub) => {
             if let Mode::Menu { stack, at } = &app.mode {
                 let mut stack = stack.clone();
-                stack.push(menu::submenu(sub));
+                stack.push(menu::submenu(sub, &app.cfg));
                 app.mode = Mode::Menu { stack, at: *at };
             }
         }
@@ -850,6 +1012,11 @@ fn prompt_key(
                 Prompt::RenameTab(tab) => {
                     let _ = out.send(ClientFrame::Command(Cmd::RenameTab { tab, name: v }));
                 }
+                Prompt::SetRole(pane) => {
+                    // An empty value clears it, the same contract every other text prompt
+                    // here uses — see `Prompt::hint`.
+                    let _ = out.send(ClientFrame::Command(Cmd::SetPaneRole { pane, role: v }));
+                }
                 Prompt::NewSpace => {
                     let name = if v.is_empty() { None } else { Some(v) };
                     let _ = out.send(ClientFrame::Command(Cmd::NewSpace { name }));
@@ -865,6 +1032,16 @@ fn prompt_key(
                 }
                 Prompt::SendTo(pane) => {
                     if v.is_empty() {
+                        return Ok(());
+                    }
+                    // Said here rather than left to the daemon's refusal: the text you just
+                    // typed is about to be thrown away either way, and a plain sentence beats
+                    // an RPC error for something that is off on purpose.
+                    if !crate::daemon::bus::ENABLED {
+                        app.toast(
+                            NoticeLevel::Warn,
+                            "the message bus is paused while it is reworked".to_string(),
+                        );
                         return Ok(());
                     }
                     // Route through the bus so the message is recorded and state-gated,
@@ -1073,6 +1250,41 @@ fn run_action(
             app.quit = true;
         }
         Action::Help => app.mode = Mode::Help,
+        Action::SidebarFocus => {
+            // Opening the panel is part of asking for it: focusing a hidden sidebar would
+            // silently eat every key with nothing on screen to explain why.
+            if !app.snapshot.as_ref().is_some_and(|s| s.view.sidebar_open) {
+                let _ = out.send(ClientFrame::Command(Cmd::ToggleSidebar));
+            }
+            // Seed the cursor so the first `j` moves off row one rather than onto it.
+            if app.sidebar.cursor.is_none() {
+                if let Some(snap) = app.snapshot.as_ref() {
+                    let w = snap.view.sidebar_width.saturating_sub(2);
+                    let rows =
+                        roster::filtered_rows(snap, roster::Density::of(w), &app.sidebar.lens);
+                    app.sidebar.resolve(&rows);
+                }
+            }
+            app.mode = Mode::Sidebar;
+        }
+        Action::TogglePin => {
+            if let Some(pane) = app.snapshot.as_ref().and_then(|s| s.focused_pane) {
+                let _ = out.send(ClientFrame::Command(Cmd::TogglePanePinned(pane)));
+            }
+        }
+        Action::Roster => {
+            // Land on whatever the sidebar cursor was on, so the two views agree about where
+            // you are rather than each keeping their own idea of it.
+            if app.sidebar.cursor.is_none() {
+                if let Some(snap) = app.snapshot.as_ref() {
+                    let rows =
+                        roster::filtered_rows(snap, roster::Density::Wide, &app.sidebar.lens);
+                    app.sidebar.resolve(&rows);
+                }
+            }
+            app.mode = Mode::Roster { scroll: 0 };
+        }
+        Action::CycleLens => app.sidebar.lens = app.sidebar.lens.cycle(),
         Action::Palette => app.mode = Mode::Palette { query: String::new(), sel: 0 },
         Action::SpaceSwitcher => {
             app.mode = Mode::SpaceSwitcher { query: String::new(), sel: 0 }
@@ -1179,7 +1391,7 @@ fn handle_mouse(
     if matches!(m.kind, MouseEventKind::Down(MouseButton::Right)) {
         let target = if snap.sidebar.contains(x, y) {
             match app.sidebar_hits.iter().find(|(hy, _)| *hy == y) {
-                Some((_, Hit::Space(id))) => Target::Space(*id),
+                Some((_, Hit::Space(id))) | Some((_, Hit::Group(id))) => Target::Space(*id),
                 Some((_, Hit::Pane(id))) => Target::Agent(*id),
                 None => Target::Root,
             }
@@ -1215,6 +1427,29 @@ fn handle_mouse(
         return continue_drag(app, m, &snap);
     }
 
+    // The roster covers the whole frame, so it claims the mouse before any pane hit-test.
+    if let Mode::Roster { scroll } = app.mode {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, _, _, f)) = app
+                    .roster_hits
+                    .iter()
+                    .find(|(hy, hx, w, _)| *hy == y && x >= *hx && x < hx + w)
+                {
+                    app.sidebar.cursor = Some(*f);
+                    let _ = out.send(ClientFrame::Command(f.activate()));
+                    app.mode = Mode::Terminal;
+                }
+            }
+            MouseEventKind::ScrollDown => app.mode = Mode::Roster { scroll: scroll + 1 },
+            MouseEventKind::ScrollUp => {
+                app.mode = Mode::Roster { scroll: scroll.saturating_sub(1) }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     // Clicks on the settings page pick a category or a row.
     if let Mode::Settings { cat, sel, .. } = app.mode.clone() {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -1231,16 +1466,41 @@ fn handle_mouse(
         return Ok(());
     }
 
-    // Sidebar clicks jump straight to a space or pane.
+    // Sidebar clicks jump straight to a space or pane; the wheel pages the agent list.
     if snap.sidebar.contains(x, y) {
-        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if let Some((_, hit)) = app.sidebar_hits.iter().find(|(hy, _)| *hy == y) {
-                let cmd = match hit {
-                    Hit::Space(id) => Cmd::FocusSpace(*id),
-                    Hit::Pane(id) => Cmd::FocusPane(*id),
-                };
-                let _ = out.send(ClientFrame::Command(cmd));
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, hit)) = app.sidebar_hits.iter().find(|(hy, _)| *hy == y) {
+                    // Every click also moves the cursor, so mouse and keyboard never disagree
+                    // about where you are in the list.
+                    let cmd = match *hit {
+                        Hit::Space(id) => {
+                            app.sidebar.cursor = Some(Focus::Group(id));
+                            Some(Cmd::FocusSpace(id))
+                        }
+                        Hit::Pane(id) => {
+                            app.sidebar.cursor = Some(Focus::Agent(id));
+                            Some(Cmd::FocusPane(id))
+                        }
+                        // A disclosure triangle that teleports you is not a disclosure
+                        // triangle: clicking a group header folds it, it does not switch space.
+                        Hit::Group(id) => {
+                            app.sidebar.cursor = Some(Focus::Group(id));
+                            Some(Cmd::ToggleSpaceCollapsed(id))
+                        }
+                    };
+                    if let Some(cmd) = cmd {
+                        let _ = out.send(ClientFrame::Command(cmd));
+                    }
+                }
             }
+            // Clamping is the renderer's job — it is the only thing that knows how many rows
+            // fit — so this only ever has to avoid going below zero.
+            MouseEventKind::ScrollDown => app.sidebar.scroll += 1,
+            MouseEventKind::ScrollUp => {
+                app.sidebar.scroll = app.sidebar.scroll.saturating_sub(1)
+            }
+            _ => {}
         }
         return Ok(());
     }
@@ -1400,6 +1660,8 @@ mod tests {
                 focused_tab: Some(1),
                 agent_count: 0,
                 attention_count: 0,
+                accent: 0,
+                collapsed: false,
             }],
             tabs,
             panes: vec![],
@@ -1518,5 +1780,200 @@ mod tests {
         let mut app = App::new(Config::default());
         let r = apply_frame(&mut app, ServerFrame::Bye { reason: "mismatch".into() });
         assert_eq!(r.as_deref(), Some("mismatch"));
+    }
+
+    // -- key handling ------------------------------------------------------
+    //
+    // New harness: nothing drove `handle_key` before this. `out` is where frames destined for
+    // the daemon go, so asserting on it is how "did this key reach the pane or not" gets
+    // answered without a socket.
+
+    fn app_with_snapshot() -> App {
+        let mut app = App::new(Config::default());
+        app.snapshot = Some(crate::client::roster::tests::snap());
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Vec<ClientFrame> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE), &tx).unwrap();
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            out.push(f);
+        }
+        out
+    }
+
+    fn cmds(frames: Vec<ClientFrame>) -> Vec<Cmd> {
+        frames
+            .into_iter()
+            .filter_map(|f| match f {
+                ClientFrame::Command(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The whole justification for a mode: bare `j` and `k` walk the list instead of being
+    /// typed at whatever agent happened to be focused.
+    #[test]
+    fn sidebar_keys_move_the_cursor_and_send_nothing_to_the_pane() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        let before = app.sidebar.cursor;
+        let frames = press(&mut app, KeyCode::Char('j'));
+        assert!(frames.is_empty(), "nothing reached the pane: {frames:?}");
+        assert_ne!(app.sidebar.cursor, before, "but the cursor moved");
+        assert_eq!(app.mode, Mode::Sidebar, "and we are still in the panel");
+    }
+
+    /// Acts *and* exits, so the common path — glance, jump, type — never leaves you parked in
+    /// a mode you then have to notice and leave.
+    #[test]
+    fn enter_in_the_sidebar_focuses_and_returns_to_the_terminal() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        app.sidebar.cursor = Some(Focus::Agent(2));
+        let out = cmds(press(&mut app, KeyCode::Enter));
+        assert_eq!(out, vec![Cmd::FocusPane(2)]);
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn enter_on_a_group_header_goes_to_that_space() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        app.sidebar.cursor = Some(Focus::Group(2));
+        assert_eq!(cmds(press(&mut app, KeyCode::Enter)), vec![Cmd::FocusSpace(2)]);
+    }
+
+    #[test]
+    fn escaping_the_sidebar_returns_keys_to_the_pane() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        assert!(press(&mut app, KeyCode::Esc).is_empty());
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    /// An unrecognised key is ignored rather than passed through: falling through would type
+    /// `x` into an agent you were only looking at.
+    #[test]
+    fn an_unknown_key_in_the_sidebar_is_ignored_not_forwarded() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        let frames = press(&mut app, KeyCode::Char('x'));
+        assert!(frames.is_empty(), "{frames:?}");
+        assert_eq!(app.mode, Mode::Sidebar);
+    }
+
+    /// `h` and `l` are directional, so they only act in their own direction — pressing `l` on
+    /// an already-open group should do nothing rather than close it.
+    #[test]
+    fn collapse_keys_only_act_in_their_own_direction() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        app.sidebar.cursor = Some(Focus::Group(1));
+        assert_eq!(cmds(press(&mut app, KeyCode::Char('l'))), vec![], "already open");
+        assert_eq!(
+            cmds(press(&mut app, KeyCode::Char('h'))),
+            vec![Cmd::ToggleSpaceCollapsed(1)]
+        );
+        // Space toggles either way.
+        assert_eq!(
+            cmds(press(&mut app, KeyCode::Char(' '))),
+            vec![Cmd::ToggleSpaceCollapsed(1)]
+        );
+    }
+
+    /// Folding from an agent row has to move the cursor to the header too, or it would be left
+    /// pointing at a row that just stopped being drawn.
+    #[test]
+    fn folding_from_an_agent_row_moves_the_cursor_to_its_header() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        app.sidebar.cursor = Some(Focus::Agent(1));
+        let out = cmds(press(&mut app, KeyCode::Char('h')));
+        assert_eq!(out, vec![Cmd::ToggleSpaceCollapsed(1)]);
+        assert_eq!(app.sidebar.cursor, Some(Focus::Group(1)));
+    }
+
+    #[test]
+    fn pinning_only_applies_to_an_agent_row() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        app.sidebar.cursor = Some(Focus::Agent(4));
+        assert_eq!(cmds(press(&mut app, KeyCode::Char('p'))), vec![Cmd::TogglePanePinned(4)]);
+        // A header is not a pane, so there is nothing to pin.
+        app.sidebar.cursor = Some(Focus::Group(1));
+        assert_eq!(cmds(press(&mut app, KeyCode::Char('p'))), vec![]);
+    }
+
+    /// The direct test of constraint one: the snapshot is replaced wholesale every frame, so a
+    /// cursor naming something that has gone must be forgotten rather than trusted.
+    #[test]
+    fn a_cursor_whose_pane_exits_is_forgotten_on_the_next_snapshot() {
+        let mut app = app_with_snapshot();
+        app.sidebar.cursor = Some(Focus::Agent(2));
+        let mut snap = crate::client::roster::tests::snap();
+        snap.panes.retain(|p| p.id != 2);
+        app.sidebar.prune(&snap);
+        assert_eq!(app.sidebar.cursor, None, "a stale cursor is not kept");
+    }
+
+    /// The gesture that makes a role filter reachable: point at an agent doing the job and
+    /// ask for everyone doing it. `f` steps back out to `all` from there.
+    #[test]
+    fn r_in_the_sidebar_filters_to_the_role_under_the_cursor() {
+        let mut app = app_with_snapshot();
+        app.snapshot.as_mut().unwrap().panes.iter_mut().find(|p| p.id == 2).unwrap().role =
+            Some("reviewer".into());
+        app.mode = Mode::Sidebar;
+        app.sidebar.cursor = Some(Focus::Agent(2));
+
+        assert!(press(&mut app, KeyCode::Char('r')).is_empty(), "a client-side filter");
+        assert_eq!(app.sidebar.lens, roster::Lens::Role("reviewer".into()));
+
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(app.sidebar.lens, roster::Lens::All, "one press back out");
+    }
+
+    /// An agent with no role has nothing to filter to, so the key does nothing rather than
+    /// filtering to an empty list.
+    #[test]
+    fn r_on_an_unlabelled_agent_leaves_the_lens_alone() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        app.sidebar.cursor = Some(Focus::Agent(1));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.sidebar.lens, roster::Lens::All);
+    }
+
+    #[test]
+    fn cycling_the_lens_sends_nothing_to_the_daemon() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Sidebar;
+        // A lens is a client-side view; it must never mutate the session.
+        assert!(press(&mut app, KeyCode::Char('f')).is_empty());
+        assert_eq!(app.sidebar.lens, roster::Lens::NeedsYou);
+    }
+
+    /// One cursor, two views of the same list: open the roster and you land where you left
+    /// off, jump from it and the sidebar agrees.
+    #[test]
+    fn the_roster_shares_the_sidebar_cursor() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Roster { scroll: 0 };
+        app.sidebar.cursor = Some(Focus::Agent(4));
+        let out = cmds(press(&mut app, KeyCode::Enter));
+        assert_eq!(out, vec![Cmd::FocusPane(4)]);
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn escaping_the_roster_returns_to_the_terminal() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Roster { scroll: 3 };
+        assert!(press(&mut app, KeyCode::Esc).is_empty());
+        assert_eq!(app.mode, Mode::Terminal);
     }
 }

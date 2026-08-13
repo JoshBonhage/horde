@@ -26,6 +26,8 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Prompt {
     RenamePane(PaneId),
+    /// Label what a pane is for.
+    SetRole(PaneId),
     RenameSpace(SpaceId),
     RenameTab(TabId),
     NewSpace,
@@ -39,6 +41,7 @@ impl Prompt {
     pub fn title(&self) -> &'static str {
         match self {
             Prompt::RenamePane(_) => "rename pane",
+            Prompt::SetRole(_) => "role for this pane",
             Prompt::RenameSpace(_) => "rename space",
             Prompt::RenameTab(_) => "rename tab",
             Prompt::NewSpace => "new space name",
@@ -77,6 +80,9 @@ pub enum Act {
 pub enum Sub {
     Layout,
     Spawn,
+    /// Retint a space. Carries the id because the submenu outlives the click that opened it.
+    Accent(SpaceId),
+    Role(PaneId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,15 +91,22 @@ pub struct Item {
     /// Key equivalent, shown right-aligned so the menu teaches the keyboard path.
     pub hint: String,
     pub act: Act,
+    /// Overrides the label's colour. Used where the colour *is* the content — a colour
+    /// picker that does not show colours is asking you to remember which slot was which.
+    pub color: Option<crate::proto::Rgb>,
 }
 
 impl Item {
     fn new(label: &str, hint: &str, act: Act) -> Item {
-        Item { label: label.into(), hint: hint.into(), act }
+        Item { label: label.into(), hint: hint.into(), act, color: None }
+    }
+
+    fn swatch(label: &str, act: Act, color: crate::proto::Rgb) -> Item {
+        Item { label: label.into(), hint: String::new(), act, color: Some(color) }
     }
 
     pub fn separator() -> Item {
-        Item { label: String::new(), hint: String::new(), act: Act::Close }
+        Item { label: String::new(), hint: String::new(), act: Act::Close, color: None }
     }
 
     pub fn is_separator(&self) -> bool {
@@ -158,6 +171,12 @@ pub fn build(target: Target, snap: &Snapshot, prefix: &str) -> Level {
                     Act::Cmd(Cmd::ToggleZoom),
                 ),
                 Item::new("Rename…", &k(","), Act::Prompt(Prompt::RenamePane(pane))),
+                Item::new("Role", "", Act::Submenu(Sub::Role(pane))),
+                Item::new(
+                    if info.is_some_and(|p| p.pinned) { "Unpin" } else { "Pin to top" },
+                    "",
+                    Act::Cmd(Cmd::TogglePanePinned(pane)),
+                ),
                 Item::new("Copy visible text", "", Act::CopyPane(pane)),
             ];
             // Messaging only makes sense when something is listening.
@@ -178,18 +197,21 @@ pub fn build(target: Target, snap: &Snapshot, prefix: &str) -> Level {
         }
 
         Target::Space(space) => {
-            let name = snap
-                .spaces
-                .iter()
-                .find(|s| s.id == space)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| "space".into());
+            let info = snap.spaces.iter().find(|s| s.id == space);
+            let name = info.map(|s| s.name.clone()).unwrap_or_else(|| "space".into());
+            let collapsed = info.is_some_and(|s| s.collapsed);
             Level::new(
                 &name,
                 vec![
                     Item::new("Focus", "", Act::Cmd(Cmd::FocusSpace(space))),
                     Item::new("New tab here", "", Act::Cmd(Cmd::NewTabIn(space))),
                     Item::new("Rename…", "", Act::Prompt(Prompt::RenameSpace(space))),
+                    Item::new("Colour", "", Act::Submenu(Sub::Accent(space))),
+                    Item::new(
+                        if collapsed { "Expand" } else { "Collapse" },
+                        "",
+                        Act::Cmd(Cmd::ToggleSpaceCollapsed(space)),
+                    ),
                     Item::separator(),
                     Item::new("New space…", &k("S"), Act::Prompt(Prompt::NewSpace)),
                     Item::separator(),
@@ -254,8 +276,47 @@ pub fn build(target: Target, snap: &Snapshot, prefix: &str) -> Level {
 }
 
 /// Contents of a submenu.
-pub fn submenu(sub: Sub) -> Level {
+pub fn submenu(sub: Sub, cfg: &crate::config::Config) -> Level {
     match sub {
+        // Swatches rather than slot numbers — a colour picker that does not show colours is
+        // asking you to remember which number was which.
+        Sub::Accent(space) => Level::new(
+            "colour",
+            cfg.theme
+                .space_accents()
+                .into_iter()
+                .enumerate()
+                .map(|(slot, c)| {
+                    Item::swatch(
+                        "██████",
+                        Act::Cmd(Cmd::SetSpaceAccent { space, slot: Some(slot as u8) }),
+                        c,
+                    )
+                })
+                .collect(),
+        ),
+        Sub::Role(pane) => Level::new(
+            "role",
+            cfg.roles
+                .iter()
+                .map(|r| {
+                    Item::swatch(
+                        &format!("{} {}", r.glyph, r.name),
+                        Act::Cmd(Cmd::SetPaneRole { pane, role: r.name.clone() }),
+                        r.color,
+                    )
+                })
+                .chain([
+                    Item::new("Other…", "", Act::Prompt(Prompt::SetRole(pane))),
+                    Item::separator(),
+                    Item::new(
+                        "Clear role",
+                        "",
+                        Act::Cmd(Cmd::SetPaneRole { pane, role: String::new() }),
+                    ),
+                ])
+                .collect(),
+        ),
         Sub::Layout => Level::new(
             "layout",
             vec![
@@ -350,6 +411,8 @@ mod tests {
             scroll_offset: 0,
             wants_mouse: false,
             bracketed_paste: false,
+            role: None,
+            pinned: false,
         };
         Snapshot {
             protocol: 1,
@@ -362,6 +425,8 @@ mod tests {
                 focused_tab: Some(1),
                 agent_count: 1,
                 attention_count: 0,
+                accent: 0,
+                collapsed: false,
             }],
             tabs: vec![TabInfo {
                 id: 1,
@@ -464,8 +529,9 @@ mod tests {
 
     #[test]
     fn every_submenu_has_entries_and_no_dangling_submenu() {
-        for sub in [Sub::Layout, Sub::Spawn] {
-            let l = submenu(sub);
+        let cfg = crate::config::Config::default();
+        for sub in [Sub::Layout, Sub::Spawn, Sub::Accent(1), Sub::Role(1)] {
+            let l = submenu(sub, &cfg);
             assert!(l.selected().is_some(), "{sub:?}");
             // A submenu opening another submenu would need a deeper stack than exists.
             assert!(
@@ -477,7 +543,7 @@ mod tests {
 
     #[test]
     fn layout_submenu_offers_exactly_the_known_presets() {
-        let l = submenu(Sub::Layout);
+        let l = submenu(Sub::Layout, &crate::config::Config::default());
         let names: Vec<String> = l
             .items
             .iter()
@@ -525,5 +591,57 @@ mod tests {
             assert!(!p.title().is_empty());
             assert!(!p.hint().is_empty());
         }
+    }
+
+    #[test]
+    fn a_space_menu_offers_its_colour_and_a_way_to_fold_it() {
+        let l = build(Target::Space(1), &snap(), "p");
+        assert!(l.items.iter().any(|i| i.act == Act::Submenu(Sub::Accent(1))), "{l:?}");
+        assert!(
+            l.items.iter().any(|i| i.act == Act::Cmd(Cmd::ToggleSpaceCollapsed(1))),
+            "{l:?}"
+        );
+    }
+
+    /// The label has to say what activating it does, not what the space currently is — the
+    /// same pattern the Zoom entry already follows.
+    #[test]
+    fn the_collapse_entry_reflects_the_current_state() {
+        let mut s = snap();
+        assert!(build(Target::Space(1), &s, "p").items.iter().any(|i| i.label == "Collapse"));
+        s.spaces[0].collapsed = true;
+        assert!(build(Target::Space(1), &s, "p").items.iter().any(|i| i.label == "Expand"));
+    }
+
+    /// A role submenu with no way back out would make a mislabelled pane permanent.
+    #[test]
+    fn a_role_submenu_offers_a_way_to_clear() {
+        let l = submenu(Sub::Role(1), &crate::config::Config::default());
+        assert!(
+            l.items.iter().any(|i| i.act == Act::Cmd(Cmd::SetPaneRole { pane: 1, role: String::new() })),
+            "{l:?}"
+        );
+        // And a way to name one that was never declared.
+        assert!(l.items.iter().any(|i| i.act == Act::Prompt(Prompt::SetRole(1))), "{l:?}");
+    }
+
+    /// Declaring a role is what puts it in the menu; it is not what makes it usable.
+    #[test]
+    fn declared_roles_appear_in_the_submenu() {
+        let mut cfg = crate::config::Config::default();
+        cfg.roles.push(crate::config::Role {
+            name: "reviewer".into(),
+            color: crate::proto::Rgb::new(1, 2, 3),
+            glyph: "◈".into(),
+        });
+        let l = submenu(Sub::Role(1), &cfg);
+        assert!(l.items.iter().any(|i| i.label == "◈ reviewer"), "{l:?}");
+    }
+
+    #[test]
+    fn an_agent_menu_offers_a_role_and_a_pin() {
+        let l = build(Target::Agent(1), &snap(), "p");
+        assert!(l.items.iter().any(|i| i.act == Act::Submenu(Sub::Role(1))), "{l:?}");
+        assert!(l.items.iter().any(|i| i.act == Act::Cmd(Cmd::TogglePanePinned(1))), "{l:?}");
     }
 }
