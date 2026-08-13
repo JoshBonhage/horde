@@ -9,17 +9,23 @@
 ![Tests](https://img.shields.io/badge/476%20tests-passing-2ea986?style=for-the-badge&labelColor=1a3b3b)
 ![Binary](https://img.shields.io/badge/one%20binary-no%20runtime-086c69?style=for-the-badge&labelColor=1a3b3b)
 
-**[Concepts](docs/concepts.md)** · **[Keys](docs/keys.md)** · **[Agents](docs/agents.md)** · **[Socket API](docs/socket-api.md)** · **[Config](docs/configuration.md)** · **[Orchestration](docs/orchestration.md)**
+**[Concepts](docs/concepts.md)** · **[Keys](docs/keys.md)** · **[Agents](docs/agents.md)** · **[Socket API](docs/socket-api.md)** · **[Config](docs/configuration.md)** · **[Unattended](docs/unattended.md)** · **[Orchestration](docs/orchestration.md)**
 
 </div>
 
 ---
 
-tmux doesn't know the difference between an agent that's thinking and one that's been waiting
-twenty minutes for you to approve a file write.
+# You are the bottleneck in your own agent fleet.
+
+Six repos. Nine agents. Every one of them finishes, gets stuck, or asks a question at a moment
+you didn't pick — and the only thing standing between "done" and "still sitting there" is you
+remembering to go and look.
+
+tmux can't help. It doesn't know the difference between an agent that's thinking and one that's
+been waiting twenty minutes for you to approve a file write.
 
 horde does. A background daemon owns every PTY, so your agents keep working when you close the
-terminal — and it knows which ones need you.
+terminal. It knows which ones need you. And when you're not there at all, it can act on its own.
 
 <div align="center">
 <br>
@@ -30,13 +36,6 @@ terminal — and it knows which ones need you.
 
 ---
 
-## The problem this solves
-
-You're running agents across six repos. One project has three of them, another has one. They
-all report `working`, and you need to know which one is stuck.
-
-A flat list of a dozen names can't answer that. Neither can six terminal windows.
-
 <table>
 <tr><td width="50%" valign="top">
 
@@ -46,6 +45,7 @@ A flat list of a dozen names can't answer that. Neither can six terminal windows
 - An agent finishes while you're away — you find out by scrolling
 - Close the lid, lose the session
 - "Is it thinking or is it stuck?" means reading scrollback
+- Nothing happens unless you're sitting there
 
 </td><td width="50%" valign="top">
 
@@ -55,6 +55,7 @@ A flat list of a dozen names can't answer that. Neither can six terminal windows
 - `horde digest` tells you what happened while you were gone
 - Detach freely — the daemon outlives every client
 - `◐ 14 tools · 3 files` vs `◐ 9 tools · 2 failed`
+- Scheduled rules that start agents while you sleep
 
 </td></tr>
 </table>
@@ -118,6 +119,162 @@ repaints together. Put a literal colour in `[theme] space_accents` instead — c
 The focused pane keeps its own border colour rather than the project's. Which pane has the
 keyboard is the one thing that border exists to answer, and it shouldn't become a question of
 hue.
+
+</details>
+
+---
+
+## Panes, splits and layouts
+
+Panes tile edge to edge in a binary space partition tree. No floating windows, no gaps, no
+pane you have to go find.
+
+```sh
+horde layout dev      # solo · duo · trio · dev · quad
+```
+
+| Preset | Shape |
+|---|---|
+| `solo` | one pane, everything else closed |
+| `duo` | two side by side |
+| `trio` | one tall on the left, two stacked on the right |
+| `dev` | a main pane with a short logs strip beneath, plus a side column |
+| `quad` | 2×2 |
+
+A preset spawns or closes panes to match its count, so `horde layout quad` from one pane gives
+you four rather than an error.
+
+<details>
+<summary><b>Moving, resizing and rearranging</b></summary>
+
+<br>
+
+| Key | What it does |
+|---|---|
+| `\|` `-` | split right / down (`%` and `"` also work) |
+| `h` `j` `k` `l` | move focus — **resolved by geometry, not tree position** |
+| `H` `J` `K` `L` | resize the focused edge |
+| `ctrl+h/j/k/l` | swap this pane with its neighbour |
+| `z` | zoom — one pane takes the frame, the tree is untouched |
+| `x` | close |
+| `c` `n` `p` `1`–`9` | tabs: new, next, prev, go to |
+
+**Focus by geometry is the one worth calling out.** In a BSP tree, "the pane to my right" and
+"my sibling in the tree" stop agreeing the moment you split twice. horde resolves `l` against
+the drawn rectangles, so it goes where your eye goes.
+
+**Geometry lives in the daemon and nowhere else.** The client draws where it's told. That's why
+a pane's PTY size and its drawn rectangle can never drift apart — a resize is one calculation,
+not two that have to agree.
+
+Tabs are layouts *inside* a project: use them to separate views — `agents`, `logs`, `review` —
+rather than to separate projects. Projects are spaces.
+
+**Mouse works too.** Click a pane or a sidebar row to focus, click a tab to switch, scroll for
+scrollback. Drag to highlight and it copies on release. If a program has taken the mouse for
+itself, `shift`-drag takes it back.
+
+</details>
+
+---
+
+## When nobody's watching
+
+Detach and horde keeps going. Arm it and horde starts *acting*.
+
+A rule is **when × what × guard**. The guard is the whole engineering problem; the rest is
+plumbing over things that already existed.
+
+```sh
+horde trigger add --at 09:00 --days mon-fri --spawn claude --name morning
+horde trigger add --every 30m --when "! cargo test -q" --spawn claude --name on-red
+horde trigger list
+```
+
+| | Options |
+|---|---|
+| **when** | `--every 30m` · `--at 09:00` with `--days mon-fri` · `--when "<shell cmd>"`, acting when it exits 0 |
+| **what** | `--spawn <cmd>` starts an agent |
+| **guard** | see below — this is the part that makes it safe to arm |
+
+Nothing fires until you say so. `triggers.unattended` is off by default, because acting with
+nobody present is a different promise from running side by side and has to be asked for.
+
+<details>
+<summary><b>The guards, and why each one is there</b></summary>
+
+<br>
+
+| Guard | Why |
+|---|---|
+| Master switch off by default | Arming is a decision, not a default |
+| `--every` floors at **60s** | A rule that fires every second is a fork bomb with a schedule |
+| **12 firings per rolling hour**, across all rules | Agents can create rules, so the failure mode isn't one bad rule — it's fifty. Hitting the ceiling warns once an hour rather than silently doing nothing |
+| One firing in flight per rule | A slow action can't stack copies of itself |
+| `max_spawned` — default **2**, clamped to **16** | The number of full-permission agents that can work with nobody present. Counted live, so a finished one frees its slot |
+| No rule-making by machine-started agents | Otherwise the loop closes with no human anywhere in it |
+| A failed action still counts as a firing | Or a broken rule would retry forever inside its budget |
+
+**Provenance is its own guard.** A pane horde started is marked `[by trigger #3]` and stays
+marked — through a restart, and through `horde upgrade`. Provenance you can launder is not
+provenance, and it's what stops a machine-started agent quietly inheriting the rights of one you
+started yourself.
+
+</details>
+
+<details>
+<summary><b>Catching up: <code>horde digest</code></b></summary>
+
+<br>
+
+Detach, go to lunch, come back. Instead of five panes of scrollback:
+
+```
+while you were away · 42m
+
+  needs you
+    ◍ reviewer         stuck 12m    approval prompt
+
+  finished
+    ● builder          4m           22 tools · 6 files
+
+  horde decided
+    ◈ #3  09:00 mon-fri → spawned claude as morning
+
+  exited
+    ✕ worker3
+```
+
+The order is by what would make you act: what's stuck, then what finished, then what horde did
+on its own, then the chatter.
+
+The window is *since you last looked* — reading advances the marker, so ignoring digests
+**widens** the window instead of losing history. `--keep` looks without advancing it.
+
+```sh
+horde digest                # since you last looked
+horde digest --since 2h     # a wider window
+horde digest --json         # for scripts
+```
+
+</details>
+
+<details>
+<summary><b>Reaching you when nothing is attached</b></summary>
+
+<br>
+
+Notifications exist so an armed daemon can tell you something without a TUI to toast into.
+
+```toml
+[notifications]
+delivery = "system"                  # horde · system · off
+command = "~/bin/horde-ping"         # your script, your service
+```
+
+Your command gets a one-line summary as `$1` and the full digest as JSON on stdin. That's
+deliberately all — it keeps Pushover, Telegram, ntfy and email out of horde and in a script you
+own, with no secret store and no built-in HTTP client to go stale.
 
 </details>
 
@@ -203,20 +360,17 @@ Prefix is `ctrl+b`, and `ctrl+b ?` lists everything. Every action is rebindable 
 
 | | |
 |---|---|
-| `\|` `-` | split right / down |
-| `h j k l` | move focus — resolved by geometry, not tree position |
-| `H J K L` | resize; `ctrl+h/j/k/l` swaps panes |
-| `z` `x` | zoom / close pane |
-| `c` `n` `p` `1`-`9` | new tab / next / prev / go to |
-| `s` `S` | space switcher / new space |
 | **`a`** | **jump to the next agent that needs you** |
 | **`o`** | **the roster — every project and agent, full screen** |
 | `E` `P` | walk the sidebar with `j`/`k` / pin the focused agent |
 | `f` | filter the agent list |
+| `s` `S` | space switcher / new space |
 | `e` `b` | toggle sidebar / bus drawer |
 | `g` `.` `?` | command palette / settings / keys |
 | `,` | rename the focused pane |
 | `d` `D` | detach / digest |
+
+Splits, focus and resize are in **[Panes, splits and layouts](#panes-splits-and-layouts)** above.
 
 `ctrl+b a` is the one that earns its keep once you have more than two agents: it walks the
 queue of agents that are `blocked` or `done`, so you never hunt for the one waiting on you.
@@ -264,6 +418,29 @@ wide your panes are.
 </details>
 
 <details>
+<summary><b>Scripting it</b></summary>
+
+<br>
+
+Everything the TUI does goes through one socket, and the control half is newline-delimited JSON
+on purpose — so it can be debugged with `nc` and driven from anything that writes a line.
+
+```sh
+horde api space.list
+horde api pane.role --params '{"pane": 2, "role": "reviewer"}'
+horde roster --json | jq '.[] | select(.state == "blocked")'
+```
+
+Every `horde <noun> <verb>` command is one call against that API. Full method list:
+**[docs/socket-api.md](docs/socket-api.md)**.
+
+Agents drive themselves through the same interface. Each pane carries `HORDE_PANE`,
+`HORDE_TAB`, `HORDE_SPACE` and `HORDE_DOCS` in its environment, so an agent can work out who
+and where it is without being told.
+
+</details>
+
+<details>
 <summary><b>Configuration</b></summary>
 
 <br>
@@ -285,12 +462,16 @@ glyph = "◈"
 [ui]
 sidebar_width = 24                          # 14–60
 animate = true                              # spinners for working agents
+
+[triggers]
+unattended = false                          # master switch: no rule fires until this is on
+max_spawned = 2                             # agents horde may run that it started itself
 ```
 
 `ctrl+b .` opens a settings page for the same values. Writing goes through `toml_edit`, so
 comments and formatting in a hand-edited file survive.
 
-Full reference: [`docs/configuration.md`](docs/configuration.md).
+Full reference: **[docs/configuration.md](docs/configuration.md)**.
 
 </details>
 
@@ -298,9 +479,12 @@ Full reference: [`docs/configuration.md`](docs/configuration.md).
 
 ## Honest caveats
 
-- **The bus and the task board are paused.** Agent-to-agent messaging and the shared work
-  queue are switched off in code while they're reworked. `horde bus tail` and `horde task list`
-  still read their logs; nothing can be sent or claimed. Everything else on this page works.
+- **The bus and the task board are paused.** Agent-to-agent messaging and the shared work queue
+  are switched off in code while they're reworked, so `horde trigger --task` and `--to` are
+  refused too — `--spawn` is the live action. `horde bus tail` and `horde task list` still read
+  their logs. Everything else on this page works.
+- **One machine.** horde is a local tool. No cloud, no plugin marketplace, no remote host
+  management — dropped on purpose.
 - macOS and Linux. No Windows.
 - The socket path has to stay under ~100 bytes — an OS limit on `AF_UNIX`. Set `HORDE_SOCKET`
   if your config directory is deep.
