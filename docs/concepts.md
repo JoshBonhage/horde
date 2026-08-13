@@ -12,6 +12,10 @@ session
 **Space** — one per repo, task, or investigation. Has a working directory that new panes
 inherit. Addressable by name in `horde send` and `horde space focus`.
 
+Each space is also given an accent colour when it is created, shown in the tab bar, its
+sidebar dot, and the borders of its panes — so which project you are looking at is something
+you see rather than something you read. See [configuration](configuration.md#project-colours).
+
 **Tab** — a layout inside a space. Use them to separate views: `agents`, `logs`, `review`.
 
 **Pane** — a real PTY. Panes tile edge-to-edge in a binary space partition tree and each
@@ -139,6 +143,24 @@ and others. horde does not launch them any differently; it watches them.
 What it adds is **state**: `working`, `blocked`, `done`, `idle`, `unknown`. See
 [agents](agents.md) for how that is determined and [orchestration](orchestration.md) for
 what you can do with it.
+
+### Three names, one pane
+
+An agent pane carries three names and none of them substitutes for another:
+
+| | What it is | Set by |
+|---|---|---|
+| **name** | how you address it in `horde send` | `horde pane rename`, else the detected agent name |
+| **kind** | which program is running — `claude`, `codex` | detection |
+| **role** | what it is *for* — `reviewer`, `builder`, `docs` | `horde pane role`, or the right-click menu |
+
+Only the role recurs across projects: every repo has a reviewer, and it is the same word each
+time. That is what makes it the one worth grouping by, and why `horde role list` can answer
+"who is reviewing, everywhere" when neither of the other two could.
+
+A role is normalised on the way in — lowercased, spaces folded to `-`, capped at 16
+characters — so `Code Reviewer` and `code_reviewer` are one role rather than three. Roles do
+not have to be declared in `config.toml`; declaring one only chooses how it looks.
 
 `done` deserves a note: it means *finished while you were not looking*. It clears when you
 look at the pane. That is what makes the sidebar worth glancing at — it distinguishes "still

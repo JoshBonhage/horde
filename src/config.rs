@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use crossterm::event::{KeyCode, KeyModifiers};
 use serde::Deserialize;
 
-use crate::proto::{Cmd, Dir};
+use crate::proto::{Cmd, Dir, Rgb};
 use crate::theme::{Theme, ThemeOverrides};
 
 /// Where config, state, and the socket live.
@@ -86,6 +86,17 @@ struct RawConfig {
     notifications: RawNotifications,
     #[serde(default)]
     triggers: RawTriggers,
+    #[serde(default)]
+    roles: Vec<RawRole>,
+}
+
+/// One `[[roles]]` block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRole {
+    name: String,
+    color: Option<String>,
+    glyph: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -94,6 +105,12 @@ struct RawTheme {
     name: Option<String>,
     #[serde(default)]
     custom: ThemeOverrides,
+    /// Replacement colours for the project ramp, by position.
+    ///
+    /// Literal colours belong to a theme, not to a space: a space stores which slot it uses,
+    /// so retinting here moves every project on that slot at once and none of them have to
+    /// be told. Short lists are fine — only the slots you name are replaced.
+    space_accents: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -173,6 +190,7 @@ pub struct Config {
     pub restore_agents: bool,
     pub detection_lines: usize,
     pub force_inject: bool,
+    /// Tell an idle agent when the board has work. Parked: see `daemon::tasks::AUTONOMOUS`.
     pub task_nudge: bool,
     /// Whether triggers may fire at all. Off by default: acting with nobody watching is a
     /// different promise from running side by side, and has to be asked for.
@@ -188,7 +206,68 @@ pub struct Config {
     /// summary arrives as `$1` and the full digest as JSON on stdin, which is what keeps
     /// Pushover, Telegram, ntfy and email out of horde and in a script you own.
     pub notify_command: Option<String>,
+    /// Roles you have named, and how each one looks.
+    ///
+    /// Declaring a role styles it; it does not permit it. Any role name works whether or not
+    /// it appears here — putting a config edit in front of a one-word label is not how
+    /// anything else in horde behaves.
+    pub roles: Vec<Role>,
     pub keys: Keymap,
+}
+
+/// A job you can give a pane, and how it is drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Role {
+    /// Already normalised, so `Reviewer` and `reviewer` are the same role.
+    pub name: String,
+    pub color: Rgb,
+    /// One cell wide. Plain Unicode geometrics, no Nerd Font dependency — the same rule
+    /// `AgentState::glyph` follows, and for the same reason: a replacement box is worse than
+    /// no glyph at all.
+    pub glyph: String,
+}
+
+/// The glyph an undeclared role is drawn with.
+pub const ROLE_GLYPH: &str = "◆";
+
+/// Canonical form of a role name: trimmed, lowercased, whitespace and underscores folded to
+/// `-`, capped at 16 columns. `None` when nothing is left, which is how a role is cleared.
+///
+/// Roles are only worth having because they recur across projects, and `Reviewer` filed
+/// separately from `reviewer` is exactly the failure that would stop them recurring.
+/// Normalising here is cheaper than a whitelist and does not put a config file in front of a
+/// label.
+pub fn normalise_role(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.trim().chars() {
+        if c.is_whitespace() || c == '_' || c == '-' {
+            // Collapse runs, and never lead with one.
+            dash = !out.is_empty();
+            continue;
+        }
+        if dash {
+            out.push('-');
+            dash = false;
+        }
+        out.extend(c.to_lowercase());
+        if out.chars().count() >= 16 {
+            break;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The colour a role is drawn in: the one you declared, else one derived from its name.
+///
+/// Derived rather than random so the same role is the same colour in every project and
+/// across restarts — which is the entire point of a role being a name rather than a note.
+pub fn role_style(roles: &[Role], name: &str, theme: &Theme) -> (String, Rgb) {
+    if let Some(r) = roles.iter().find(|r| r.name == name) {
+        return (r.glyph.clone(), r.color);
+    }
+    let hash = name.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    (ROLE_GLYPH.to_string(), theme.space_accent((hash % crate::theme::SPACE_ACCENTS as u32) as u8))
 }
 
 impl Default for Config {
@@ -209,11 +288,14 @@ impl Default for Config {
             restore_agents: true,
             detection_lines: 40,
             force_inject: false,
-            task_nudge: true,
+            // Off while the board's autonomous half is parked; see `daemon::tasks::AUTONOMOUS`.
+            // Turning it on in config.toml does nothing until that switch is back too.
+            task_nudge: false,
             unattended: false,
             max_spawned: 2,
             notify: Notify::Horde,
             notify_command: None,
+            roles: Vec::new(),
             keys: Keymap::default(),
         }
     }
@@ -270,6 +352,55 @@ impl Config {
             }
         }
         cfg.theme.apply_overrides(&raw.theme.custom);
+        if let Some(list) = &raw.theme.space_accents {
+            if list.len() > crate::theme::SPACE_ACCENTS {
+                warnings.push(format!(
+                    "space_accents has {} entries; only the first {} are used",
+                    list.len(),
+                    crate::theme::SPACE_ACCENTS
+                ));
+            }
+            for (i, s) in list.iter().take(crate::theme::SPACE_ACCENTS).enumerate() {
+                match crate::theme::parse_color(s) {
+                    Some(c) => cfg.theme.space_accent_overrides[i] = Some(c),
+                    None => warnings.push(format!("space_accents[{i}]: bad color {s:?}")),
+                }
+            }
+        }
+
+        // Roles resolve after the theme, because an undeclared one derives its colour from
+        // the project ramp and a declared one may name a palette colour.
+        for (i, r) in raw.roles.iter().enumerate() {
+            let Some(name) = normalise_role(&r.name) else {
+                warnings.push(format!("roles[{i}]: empty name"));
+                continue;
+            };
+            if cfg.roles.iter().any(|e| e.name == name) {
+                warnings.push(format!("roles[{i}]: {name:?} is declared twice"));
+                continue;
+            }
+            let color = match r.color.as_deref() {
+                Some(s) => match crate::theme::parse_color(s) {
+                    Some(c) => c,
+                    None => {
+                        warnings.push(format!("roles[{i}]: bad color {s:?}"));
+                        role_style(&[], &name, &cfg.theme).1
+                    }
+                },
+                None => role_style(&[], &name, &cfg.theme).1,
+            };
+            // A two-cell glyph would push every row that carries it one column wider than the
+            // panel budgeted for, so it is refused rather than allowed to overflow.
+            let glyph = match r.glyph.as_deref() {
+                Some(g) if crate::client::ui::width(g) == 1 => g.to_string(),
+                Some(g) => {
+                    warnings.push(format!("roles[{i}]: glyph {g:?} is not one cell wide"));
+                    ROLE_GLYPH.to_string()
+                }
+                None => ROLE_GLYPH.to_string(),
+            };
+            cfg.roles.push(Role { name, color, glyph });
+        }
 
         let ui = raw.ui;
         cfg.sidebar = ui.sidebar.unwrap_or(cfg.sidebar);
@@ -486,6 +617,14 @@ pub enum Action {
     Settings,
     /// Send the prefix key itself to the pane.
     SendPrefix,
+    /// Give the sidebar the keyboard, so its list can be walked without the prefix.
+    SidebarFocus,
+    /// Pin or unpin the focused pane, from anywhere.
+    TogglePin,
+    /// Open the full-screen roster.
+    Roster,
+    /// Step the agent list's filter.
+    CycleLens,
 }
 
 /// How a binding is reached.
@@ -544,6 +683,10 @@ impl Default for Keymap {
             ("space_switcher", Trigger::Prefix(d("s")), Action::SpaceSwitcher),
             // Panels and navigation
             ("toggle_sidebar", Trigger::Prefix(d("e")), Action::Cmd(ToggleSidebar)),
+            ("sidebar_focus", Trigger::Prefix(d("E")), Action::SidebarFocus),
+            ("toggle_pin", Trigger::Prefix(d("P")), Action::TogglePin),
+            ("roster", Trigger::Prefix(d("o")), Action::Roster),
+            ("cycle_lens", Trigger::Prefix(d("f")), Action::CycleLens),
             ("toggle_bus", Trigger::Prefix(d("b")), Action::Cmd(ToggleBus)),
             ("jump_attention", Trigger::Prefix(d("a")), Action::Cmd(JumpAttention)),
             ("redraw", Trigger::Prefix(d("r")), Action::Cmd(Redraw)),
@@ -805,6 +948,123 @@ bogus_action = "prefix+q"
         let (cfg, _) = Config::load_from(&p);
         assert_eq!(cfg.sidebar_width, 14);
         assert_eq!(cfg.bus_width, 70);
+        let _ = std::fs::remove_file(p);
+    }
+
+
+    /// Roles are only worth having because they recur across projects, and `Reviewer` filed
+    /// separately from `reviewer` is exactly the failure that would stop them recurring.
+    #[test]
+    fn role_names_are_normalised_so_one_job_is_one_role() {
+        for (input, want) in [
+            ("reviewer", "reviewer"),
+            ("Reviewer", "reviewer"),
+            ("  REVIEWER  ", "reviewer"),
+            ("code reviewer", "code-reviewer"),
+            ("code_reviewer", "code-reviewer"),
+            ("code   reviewer", "code-reviewer"),
+            ("code-reviewer", "code-reviewer"),
+        ] {
+            assert_eq!(normalise_role(input).as_deref(), Some(want), "{input:?}");
+        }
+    }
+
+    /// Empty clears the role, which is the same contract `rename` uses for an empty name.
+    #[test]
+    fn an_empty_role_clears_rather_than_naming_nothing() {
+        assert_eq!(normalise_role(""), None);
+        assert_eq!(normalise_role("   "), None);
+        assert_eq!(normalise_role(" _ - "), None);
+    }
+
+    /// A row budgets a fixed number of columns for the role, so the name cannot be unbounded.
+    #[test]
+    fn a_long_role_is_capped_rather_than_overflowing_a_row() {
+        let r = normalise_role("an-absurdly-long-role-name-nobody-would-type").unwrap();
+        assert!(r.chars().count() <= 16, "{r:?}");
+    }
+
+    /// Declaring a role styles it; it does not permit it. An undeclared one still works, and
+    /// gets the same colour every time — which is the property that matters, because a role
+    /// is a name you expect to recognise in another project tomorrow.
+    ///
+    /// Deliberately *not* asserting that two roles differ: there are six colours, so enough
+    /// roles must collide. Distinctness is not on offer and pretending otherwise would make
+    /// this test a hostage to the hash function.
+    #[test]
+    fn an_undeclared_role_still_renders_and_stays_the_same_colour() {
+        let t = Theme::horde();
+        let (glyph, color) = role_style(&[], "reviewer", &t);
+        assert_eq!(glyph, ROLE_GLYPH);
+        assert_eq!(role_style(&[], "reviewer", &t).1, color, "stable across calls");
+        assert!(t.space_accents().contains(&color), "drawn from the palette, not invented");
+    }
+
+    #[test]
+    fn a_declared_role_wins_over_the_derived_look() {
+        let t = Theme::horde();
+        let roles = vec![Role { name: "reviewer".into(), color: Rgb::new(1, 2, 3), glyph: "◈".into() }];
+        assert_eq!(role_style(&roles, "reviewer", &t), ("◈".to_string(), Rgb::new(1, 2, 3)));
+    }
+
+    /// A two-cell glyph would push every row carrying it one column past what the panel
+    /// budgeted, so it warns and falls back rather than being allowed through.
+    #[test]
+    fn a_wide_role_glyph_is_refused_without_stopping_startup() {
+        let p = write_tmp("wide-glyph", "[[roles]]\nname = \"reviewer\"\nglyph = \"🚀\"\n");
+        let (cfg, warnings) = Config::load_from(&p);
+        assert_eq!(cfg.roles.len(), 1);
+        assert_eq!(cfg.roles[0].glyph, ROLE_GLYPH, "fell back rather than overflowing");
+        assert!(warnings.iter().any(|w| w.contains("one cell")), "{warnings:?}");
+    }
+
+    #[test]
+    fn roles_and_space_accents_parse_from_config() {
+        let p = write_tmp(
+            "roles",
+            "[theme]\nspace_accents = [\"#ff0000\", \"bad\"]\n\n\
+             [[roles]]\nname = \"Code Reviewer\"\ncolor = \"#00ff00\"\nglyph = \"◈\"\n",
+        );
+        let (cfg, warnings) = Config::load_from(&p);
+        assert_eq!(cfg.roles[0].name, "code-reviewer", "normalised on the way in");
+        assert_eq!(cfg.roles[0].color, Rgb::new(0, 255, 0));
+        assert_eq!(cfg.theme.space_accent(0), Rgb::new(255, 0, 0));
+        assert!(warnings.iter().any(|w| w.contains("space_accents[1]")), "{warnings:?}");
+        // A bad slot must not disturb the ones around it.
+        assert_eq!(cfg.theme.space_accent(2), Theme::horde().space_accent(2));
+    }
+
+    #[test]
+    fn a_role_declared_twice_warns_and_keeps_the_first() {
+        let p = write_tmp(
+            "dup-roles",
+            "[[roles]]\nname = \"reviewer\"\nglyph = \"◈\"\n\n\
+             [[roles]]\nname = \"Reviewer\"\nglyph = \"◆\"\n",
+        );
+        let (cfg, warnings) = Config::load_from(&p);
+        assert_eq!(cfg.roles.len(), 1);
+        assert_eq!(cfg.roles[0].glyph, "◈");
+        assert!(warnings.iter().any(|w| w.contains("twice")), "{warnings:?}");
+    }
+
+    /// The documented example is the first config most people copy, and `deny_unknown_fields`
+    /// means one stale key there costs the reader their *entire* config, not just that line.
+    /// Adding a second `[theme]` table while writing these docs is how this test came to exist.
+    #[test]
+    fn the_documented_example_config_parses_without_warnings() {
+        let doc = include_str!("../docs/configuration.md");
+        let block = doc
+            .split("```toml")
+            .nth(1)
+            .and_then(|b| b.split("```").next())
+            .expect("configuration.md must carry a toml example");
+        let p = write_tmp("documented", block);
+        let (cfg, warnings) = Config::load_from(&p);
+        assert!(warnings.is_empty(), "the documented example warns: {warnings:?}");
+        // And it is actually being applied, not silently falling back to defaults.
+        assert_eq!(cfg.scrollback, 10000);
+        assert_eq!(cfg.roles.len(), 2, "{:?}", cfg.roles);
+        assert_eq!(cfg.theme.space_accent(0), Rgb::new(0x79, 0xc0, 0xff));
         let _ = std::fs::remove_file(p);
     }
 }

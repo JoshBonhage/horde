@@ -42,6 +42,26 @@ pub struct Ui {
     pub selection: Rgb,
 }
 
+/// How many colours projects are tinted from.
+///
+/// Six is what every bundled theme can actually supply as *distinct* colours, which is the
+/// binding constraint rather than a round number — see `ACCENT_SLOTS`. It is also about the
+/// ceiling for telling hues apart when the thing carrying one is a single cell, and more
+/// projects than anyone watches at once.
+pub const SPACE_ACCENTS: usize = 6;
+
+/// Which ANSI slots the project ramp is built from, ordered so that consecutive spaces differ
+/// in hue *and* lightness rather than only hue.
+///
+/// Only the six chromatic normals. 0, 7, 8 and 15 are excluded because every theme reserves
+/// them for text and background, so a space tinted with one would be invisible against the
+/// panel it is drawn on. The *bright* variants 9–14 are excluded for a less obvious reason:
+/// several themes alias them to the normal colours — catppuccin's 9–14 are byte-identical to
+/// its 1–6 — so drawing from them would silently hand two projects the same colour under some
+/// themes and not others. `every_theme_hands_out_distinct_visible_project_accents` is what
+/// found that, and is what keeps a future palette from reintroducing it.
+const ACCENT_SLOTS: [usize; SPACE_ACCENTS] = [4, 5, 6, 2, 3, 1];
+
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub name: String,
@@ -54,6 +74,11 @@ pub struct Theme {
     /// When true, cell colors that are still "default" pass through to the host terminal's
     /// own palette instead of being pinned to `fg`/`bg`.
     pub inherit_terminal: bool,
+    /// Per-slot replacements for the project ramp, from `[theme] space_accents`.
+    ///
+    /// Sparse rather than a whole palette, so naming one project's colour does not mean
+    /// choosing all eight.
+    pub space_accent_overrides: [Option<Rgb>; SPACE_ACCENTS],
 }
 
 impl Default for Theme {
@@ -112,6 +137,7 @@ impl Theme {
                 selection: rgb(0x2d, 0x3a, 0x44),
             },
             inherit_terminal: false,
+            space_accent_overrides: [None; SPACE_ACCENTS],
         }
     }
 
@@ -248,6 +274,22 @@ impl Theme {
         t.name = "terminal".into();
         t.inherit_terminal = true;
         t
+    }
+
+    /// The colours projects are tinted with, in assignment order.
+    ///
+    /// Derived from `ansi` rather than stored, because every theme but `horde` is built by
+    /// cloning `horde()` and overwriting the ANSI table. A stored ramp would be one more
+    /// thing each of them had to remember to set, and the one that forgot would quietly hand
+    /// out horde's mint against gruvbox brown.
+    pub fn space_accents(&self) -> [Rgb; SPACE_ACCENTS] {
+        std::array::from_fn(|i| self.space_accent(i as u8))
+    }
+
+    /// One project accent. Wraps, so no caller has to know how many there are.
+    pub fn space_accent(&self, slot: u8) -> Rgb {
+        let i = slot as usize % SPACE_ACCENTS;
+        self.space_accent_overrides[i].unwrap_or(self.ansi[ACCENT_SLOTS[i]])
     }
 
     pub fn by_name(name: &str) -> Option<Theme> {
@@ -518,5 +560,52 @@ mod tests {
         assert_eq!(mix(a, b, 1.0), b);
         assert_eq!(mix(a, b, 0.5), Rgb::new(50, 100, 25));
         assert_eq!(mix(a, b, 5.0), b, "t must clamp");
+    }
+
+    /// A project dot is often a single cell, so two spaces sharing a colour is the same as
+    /// having no colour — and one drawn in the panel's own background is invisible outright.
+    #[test]
+    fn every_theme_hands_out_distinct_visible_project_accents() {
+        for name in Theme::names() {
+            let t = Theme::by_name(name).unwrap();
+            let ramp = t.space_accents();
+            for (i, c) in ramp.iter().enumerate() {
+                assert_ne!(*c, t.ui.panel_bg, "{name} slot {i} is invisible on the panel");
+            }
+            let mut sorted: Vec<(u8, u8, u8)> = ramp.iter().map(|c| (c.r, c.g, c.b)).collect();
+            sorted.sort_unstable();
+            let n = sorted.len();
+            sorted.dedup();
+            assert_eq!(sorted.len(), n, "{name} repeats a project colour");
+        }
+    }
+
+    /// The executable form of "an accent is a slot, not a hex string": the same space, drawn
+    /// under two themes, is two different colours. Storing RGB would have left one project
+    /// painted in the old palette while everything around it moved.
+    #[test]
+    fn project_accents_follow_the_theme_not_a_stored_hex() {
+        let a = Theme::horde();
+        let b = Theme::gruvbox();
+        assert_ne!(a.space_accent(0), b.space_accent(0));
+    }
+
+    #[test]
+    fn a_space_accent_override_replaces_only_that_slot() {
+        let mut t = Theme::horde();
+        let before = t.space_accents();
+        t.space_accent_overrides[2] = Some(Rgb::new(1, 2, 3));
+        assert_eq!(t.space_accent(2), Rgb::new(1, 2, 3));
+        assert_eq!(t.space_accent(0), before[0]);
+        assert_eq!(t.space_accent(5), before[5]);
+    }
+
+    /// Callers pass a slot without knowing how many exist, so it has to wrap rather than
+    /// panic at the edge of the ramp.
+    #[test]
+    fn an_out_of_range_slot_wraps() {
+        let t = Theme::horde();
+        assert_eq!(t.space_accent(SPACE_ACCENTS as u8), t.space_accent(0));
+        assert_eq!(t.space_accent(255), t.space_accent((255 % SPACE_ACCENTS) as u8));
     }
 }

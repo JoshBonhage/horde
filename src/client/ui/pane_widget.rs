@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use unicode_width::UnicodeWidthChar;
 
 use super::{color, rstyle};
-use crate::proto::{attrs, AgentState, PaneInfo, Row};
+use crate::proto::{attrs, AgentState, PaneInfo, Rgb, Row};
 use crate::theme::Theme;
 
 /// Draws one pane's cells. `rows` is the client's cache for that pane.
@@ -123,10 +123,16 @@ pub fn spinner_frame(tick: usize) -> &'static str {
     SPINNER[tick % SPINNER.len()]
 }
 
+/// A role's glyph and colour, declared or derived.
+fn role_look(role: &str, roles: &[crate::config::Role], theme: &Theme) -> (String, Rgb) {
+    crate::config::role_style(roles, role, theme)
+}
+
 /// Border and inline title for a pane.
 ///
 /// The title lives in the top border rather than on its own row, which buys back a line of
 /// terminal for every pane on screen.
+#[allow(clippy::too_many_arguments)]
 pub fn pane_frame(
     pane: &PaneInfo,
     focused: bool,
@@ -134,8 +140,13 @@ pub fn pane_frame(
     theme: &Theme,
     tick: usize,
     animate: bool,
+    accent: Rgb,
+    roles: &[crate::config::Role],
 ) -> Block<'static> {
-    let border_color = if focused { theme.ui.border_focus } else { theme.ui.border };
+    // The focused pane keeps the one unmistakable border; project identity is what the
+    // *others* now carry. Tinting the focused one too would make "which pane has the
+    // keyboard" a question of hue, which is the one thing this border exists to answer.
+    let border_color = if focused { theme.ui.border_focus } else { accent };
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     spans.push(Span::styled(" ", Style::default().fg(color(border_color))));
@@ -155,6 +166,13 @@ pub fn pane_frame(
         };
         spans.push(Span::styled(glyph.to_string(), Style::default().fg(color(c))));
         spans.push(Span::raw(" "));
+    }
+
+    // What the pane is *for*, before what it is called. `reviewer` says more about why this
+    // pane is on screen than `claude-3` does, and it is the same word in every project.
+    if let Some(role) = &pane.role {
+        let (glyph, c) = role_look(role, roles, theme);
+        spans.push(Span::styled(format!("{glyph} {role} "), Style::default().fg(color(c))));
     }
 
     let title_style = if focused {
@@ -248,7 +266,7 @@ pub fn modifiers(a: u8) -> Modifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{Rgb, Run};
+    use crate::proto::Run;
 
     fn row(text: &str) -> Row {
         Row {

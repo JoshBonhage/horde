@@ -22,6 +22,12 @@ use crate::proto::Dir;
 
 /// Bumped when the on-disk shape changes. An unrecognised version is discarded rather than
 /// guessed at, so a stale file can never corrupt a session.
+///
+/// Which is exactly why it moves so rarely: **bump this when old data would be *misread*,
+/// never when new data would merely be *missing*.** Discarding the file throws away every
+/// space, tab, pane and cwd — so a field that can carry `#[serde(default)]` should, and does
+/// (`last_seen`, `last_alert`, `spawned_by`, `accent`, `role`). Trading a whole restored
+/// session for one defaulted field is a strictly worse deal than defaulting it.
 const STATE_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,6 +52,13 @@ pub struct SavedSpace {
     pub cwd: String,
     pub tabs: Vec<SavedTab>,
     pub focused_tab: Option<usize>,
+    /// Project accent slot. `None` in a file written before accents existed — restore then
+    /// picks one, rather than defaulting every space to slot 0 and making the feature look
+    /// broken after a single upgrade.
+    #[serde(default)]
+    pub accent: Option<u8>,
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,6 +89,12 @@ pub struct SavedPane {
     /// unattended cap and re-granting it the right to create triggers.
     #[serde(default)]
     pub spawned_by: Option<u64>,
+    /// The job you gave this pane. Restored even when the pane comes back as a shell,
+    /// because the absence of the agent is temporary and the label is yours.
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 pub fn save(eng: &Engine, path: &Path) -> Result<()> {
@@ -100,6 +119,8 @@ pub fn save(eng: &Engine, path: &Path) -> Result<()> {
             name: space.name.clone(),
             cwd: space.cwd.to_string_lossy().to_string(),
             tabs,
+            accent: Some(space.accent),
+            collapsed: space.collapsed,
         });
     }
 
@@ -135,6 +156,8 @@ fn save_node(eng: &Engine, n: &Node) -> SavedNode {
                 agent_kind: p.and_then(|p| p.agent.as_ref().map(|a| a.kind.clone())),
                 agent_session: p.and_then(|p| p.agent.as_ref().and_then(|a| a.session_id.clone())),
                 spawned_by: p.and_then(|p| p.spawned_by),
+                role: p.and_then(|p| p.role.clone()),
+                pinned: p.is_some_and(|p| p.pinned),
             })
         }
         Node::Split { axis, ratio, a, b, .. } => SavedNode::Split {
@@ -174,6 +197,15 @@ pub fn restore(eng: &mut Engine, saved: SavedState) -> Result<()> {
 
         // `create_space` also makes a first tab; the saved tabs replace it.
         let space_id = eng.session.create_space(&cfg, Some(&space.name), &cwd)?;
+        // A file written before accents existed carries none; `create_space` has already
+        // picked one, so leaving it alone is what keeps an upgraded session colourful
+        // instead of uniformly slot 0.
+        if let Some(sp) = eng.session.space_mut(space_id) {
+            if let Some(a) = space.accent {
+                sp.accent = a;
+            }
+            sp.collapsed = space.collapsed;
+        }
         let auto_tabs: Vec<_> =
             eng.session.space(space_id).map(|s| s.tabs.clone()).unwrap_or_default();
 
@@ -200,6 +232,8 @@ pub fn restore(eng: &mut Engine, saved: SavedState) -> Result<()> {
                 if let Some(p) = eng.session.panes.get_mut(&id) {
                     p.name = leaf.name.clone();
                     p.spawned_by = leaf.spawned_by;
+                    p.role = leaf.role.clone();
+                    p.pinned = leaf.pinned;
                 }
                 ids.push(id);
             }
@@ -366,6 +400,8 @@ mod tests {
                 agent_kind: None,
                 agent_session: None,
                 spawned_by: None,
+                    role: None,
+                    pinned: false,
             })),
             b: Box::new(SavedNode::Split {
                 horizontal: false,
@@ -377,6 +413,8 @@ mod tests {
                     agent_kind: None,
                     agent_session: None,
                     spawned_by: None,
+                    role: None,
+                    pinned: false,
                 })),
                 b: Box::new(SavedNode::Leaf(SavedPane {
                     cmd: "zsh".into(),
@@ -385,6 +423,8 @@ mod tests {
                     agent_kind: None,
                     agent_session: None,
                     spawned_by: None,
+                    role: None,
+                    pinned: false,
                 })),
             }),
         };
@@ -418,6 +458,8 @@ mod tests {
             agent_kind: Some("claude".into()),
             agent_session: Some("abc123".into()),
             spawned_by: None,
+                    role: None,
+                    pinned: false,
         };
         assert_eq!(restore_command(&cfg, &with_session), "claude --resume abc123");
 
@@ -433,6 +475,8 @@ mod tests {
             agent_kind: Some("someagent".into()),
             agent_session: Some("abc123".into()),
             spawned_by: None,
+                    role: None,
+                    pinned: false,
         };
         assert_eq!(restore_command(&cfg, &unknown_agent), "/bin/zsh");
 
@@ -446,6 +490,8 @@ mod tests {
             agent_kind: Some("claude".into()),
             agent_session: Some("abc123".into()),
             spawned_by: None,
+                    role: None,
+                    pinned: false,
         };
         assert_eq!(restore_command(&cfg, &with_session), "/bin/zsh");
 
@@ -457,6 +503,8 @@ mod tests {
             agent_kind: None,
             agent_session: None,
             spawned_by: None,
+                    role: None,
+                    pinned: false,
         };
         assert_eq!(restore_command(&cfg, &shell), "zsh");
     }
@@ -482,5 +530,89 @@ mod tests {
         assert!(path.exists());
         assert!(!tmp.exists(), "temp file must not survive");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ids are not persisted — the tree is flattened to positional indices and every id is
+    /// reassigned on restore — so metadata has to live *inside* these structs. This asserts by
+    /// name for exactly that reason: a side table keyed by `SpaceId` would come back attached
+    /// to the wrong space, or to nothing.
+    #[test]
+    fn metadata_survives_a_save_and_restore_round_trip() {
+        let p = std::env::temp_dir().join("horde-state-meta.json");
+        let _ = std::fs::remove_file(&p);
+
+        let mut eng = crate::daemon::tests::engine_with_idle_agents("persist-meta", 2);
+        let space = eng.session.focused_space.unwrap();
+        eng.session.rename_space(space, "api-refactor");
+        eng.session.set_space_accent(space, Some(5));
+        eng.session.toggle_space_collapsed(space, Some(true));
+        let pane = eng.session.focused_pane().unwrap();
+        eng.session.set_pane_role(pane, "Reviewer");
+        eng.session.toggle_pane_pinned(pane, Some(true));
+
+        save(&eng, &p).unwrap();
+        let loaded = load(&p).unwrap().expect("state file");
+        let saved_space = loaded.spaces.iter().find(|s| s.name == "api-refactor").unwrap();
+        assert_eq!(saved_space.accent, Some(5));
+        assert!(saved_space.collapsed);
+
+        let mut fresh = crate::daemon::tests::engine();
+        restore(&mut fresh, loaded).unwrap();
+        let sp = fresh.session.spaces.iter().find(|s| s.name == "api-refactor").unwrap();
+        assert_eq!(sp.accent, 5, "the slot, not a fresh pick");
+        assert!(sp.collapsed);
+        let roles: Vec<Option<String>> =
+            fresh.session.panes.values().map(|p| p.role.clone()).collect();
+        assert!(roles.contains(&Some("reviewer".into())), "normalised and restored: {roles:?}");
+        assert_eq!(fresh.session.panes.values().filter(|p| p.pinned).count(), 1);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// The exact old-`state.json` case: a file written before accents existed. It must load —
+    /// discarding it would cost every space, tab and pane — and the spaces must come back with
+    /// *distinct* slots rather than eight copies of slot 0, or the feature looks broken after
+    /// one upgrade rather than merely absent.
+    #[test]
+    fn a_state_file_without_accents_still_loads_and_gets_them() {
+        let p = std::env::temp_dir().join("horde-state-preaccent.json");
+        let tab = |n: &str| serde_json::json!({
+            "name": n,
+            "tree": { "Leaf": { "cmd": "zsh", "cwd": ".", "name": null,
+                                "agent_kind": null, "agent_session": null } },
+            "focused_pane": 0,
+        });
+        let doc = serde_json::json!({
+            "version": 1,
+            "focused_space": 0,
+            "spaces": [
+                { "name": "one", "cwd": ".", "tabs": [tab("1")], "focused_tab": 0 },
+                { "name": "two", "cwd": ".", "tabs": [tab("1")], "focused_tab": 0 },
+                { "name": "three", "cwd": ".", "tabs": [tab("1")], "focused_tab": 0 },
+            ],
+        });
+        std::fs::write(&p, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        let loaded = load(&p).unwrap().expect("an older file must still load");
+        assert!(loaded.spaces.iter().all(|s| s.accent.is_none()));
+        assert!(loaded.spaces.iter().all(|s| !s.collapsed));
+
+        let mut eng = crate::daemon::tests::engine();
+        eng.session.spaces.clear();
+        eng.session.tabs.clear();
+        eng.session.panes.clear();
+        restore(&mut eng, loaded).unwrap();
+        let slots: Vec<u8> = eng.session.spaces.iter().map(|s| s.accent).collect();
+        let mut uniq = slots.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(slots.len(), uniq.len(), "every space needs its own colour: {slots:?}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// Bumping this discards the whole file (see `load`), so it is only ever for changes that
+    /// would make old data *misread* — never for a field that would merely be missing.
+    #[test]
+    fn the_state_version_did_not_move_for_an_additive_field() {
+        assert_eq!(STATE_VERSION, 1);
     }
 }

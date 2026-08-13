@@ -38,6 +38,10 @@ authoritative version — this page describes the defaults.
 | **`a`** | **jump to the next agent that needs you** |
 | **`D`** | **what happened while you were away** |
 | `e` | toggle sidebar |
+| `E` | give the sidebar the keyboard — see below |
+| `o` | the roster: every project and agent, full screen |
+| `f` | filter the agent list — see below |
+| `P` | pin the focused agent to the top of the sidebar |
 | `b` | toggle bus drawer |
 | `g` | command palette |
 | `.` | settings |
@@ -47,6 +51,67 @@ authoritative version — this page describes the defaults.
 
 `ctrl+b a` is the one that earns its keep once you have more than two agents: it walks the
 queue of agents that are `blocked` or `done`, so you never hunt for the one waiting on you.
+
+### Walking the sidebar
+
+`ctrl+b E` hands the keyboard to the sidebar so its list can be walked with single keys. The
+status bar shows a **SIDEBAR** chip while it has them, because a panel that quietly stops your
+keystrokes reaching a pane is the worst thing it could do.
+
+| Key | Action |
+|---|---|
+| `j` `k`, `↓` `↑` | move a row |
+| `pgdn` `pgup` | move a page |
+| `g` `G` | first / last row |
+| `enter` | go to that space or agent, **and leave the panel** |
+| `h` `l`, `←` `→` | fold / unfold a group |
+| `space` | fold or unfold, either way |
+| `p` | pin or unpin the agent under the cursor |
+| `f` | step the filter |
+| `r` | show every agent doing the same job as this one |
+| `esc` `q` | give the keys back |
+
+`enter` acts and exits in one keystroke, so the common path — glance, jump, type — never
+leaves you parked in a mode you then have to notice and get out of. Any key the panel does not
+recognise is ignored rather than passed through: falling through would type `x` into an agent
+you were only looking at.
+
+A group you fold stays folded across a detach, a restart, and a `horde upgrade` — it is a
+decision about your session, not a property of the client that happens to be drawing it. The
+cursor is not: where it happens to be does not deserve to survive being away.
+
+### Filtering the list
+
+`ctrl+b f` steps the agent list through a filter, and the heading names the one in force —
+a filtered list that does not say it is filtered reads as a broken one.
+
+```
+all → needs you → working → here → all
+```
+
+The cycle ends back at `all`, so the same key is always also the way out. The footer counts
+stay session-wide whatever the filter, on purpose: a lens that also silenced them would hide
+the very thing you filtered away.
+
+`here` is the focused space only.
+
+Pressing `r` on an agent filters to *its role* — every `reviewer` across all your projects,
+which is the question the space tree cannot express at all and the reason roles exist. You
+are pointing at the role when you press it, so it needs no explaining; `f` steps back out to
+`all` from there.
+
+### The roster
+
+`ctrl+b o` drops the panes and gives the whole terminal to one view: every project as a card,
+with its agents, their states, what they are doing, and the directory it lives in. Up to
+three columns, one on a narrow terminal.
+
+It shares the sidebar's cursor, so opening it lands you where you left off and jumping from it
+leaves the sidebar in agreement. `j`/`k` move, `enter` jumps and closes, `p` pins, `f`
+filters, `esc` closes. Click a row to jump straight to it.
+
+This is the view for "what is running everywhere" — the sidebar answers that in fourteen
+columns, and the roster answers it with room to spell things out.
 
 `ctrl+b D` opens the digest — the same report as `horde digest`, in a scrollable panel
 (`↑↓`/`j k` to move, space to page, any other key to close). Opening it counts as looking, so
@@ -86,8 +151,8 @@ selection.
 | Right-click | You get |
 |---|---|
 | a pane | split, start an agent, run a command, zoom, rename, copy visible text, layout, close |
-| an agent pane or agent row | the above plus **send message** |
-| a space row | focus, new tab here, rename, new space, close space |
+| an agent pane or agent row | the above plus **role**, **pin to top**, and **send message** |
+| a space row | focus, new tab here, rename, **colour**, **collapse**, new space, close space |
 | a tab | focus, rename, layout, new tab, close tab |
 | anywhere else | new space, new tab, start agent, layout, toggle panels, jump to attention |
 
