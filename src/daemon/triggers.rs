@@ -28,6 +28,11 @@
 //! The action to reach for is [`What::Task`]. It puts work on the board and lets the nudge that
 //! already exists find a free agent, which means a trigger never has to know who is idle and the
 //! exclusivity guarantee stays where it already is — in `Board::claim`'s compare-and-set.
+//!
+//! That action is parked for now, along with the nudge it depends on: see
+//! [`super::tasks::autonomous`]. [`What::Send`] is parked too, with the bus it routes through
+//! (see [`super::bus::ENABLED`]). [`What::Spawn`] is the one action still standing — it starts a
+//! program rather than typing at one that is already running.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -616,12 +621,31 @@ pub fn owner_tag(id: u64) -> String {
 fn perform(eng: &mut Engine, t: &Trigger) -> Result<(String, Vec<Event>)> {
     match &t.what {
         What::Task { text } => {
+            // Parked with the rest of the board's autonomous half (`tasks::autonomous()`): a rule
+            // that feeds agents work is the behaviour being reworked. Refused loudly rather than
+            // skipped quietly, and it counts as a firing, so a rule left over from before this
+            // switch complains once an interval instead of every tick.
+            if !super::tasks::autonomous() {
+                return Err(anyhow!(
+                    "the --task action is parked while the task board is reworked — delete this \
+                     rule, or point it at an agent with --to"
+                ));
+            }
             let task = eng.board.add(text, &owner_tag(t.id))?;
             // The sidebar carries the open count, so it has to be told.
             eng.touch();
             Ok((format!("put task #{} on the board: {}", task.id, task.text), Vec::new()))
         }
         What::Send { to, body } => {
+            // Parked with the bus itself (`bus::ENABLED`). Refused loudly rather than skipped
+            // quietly, and it counts as a firing, so a rule left over from before this switch
+            // complains once an interval instead of every tick.
+            if !super::bus::ENABLED {
+                return Err(anyhow!(
+                    "the --to action is parked while the message bus is reworked — delete this \
+                     rule, or use --spawn"
+                ));
+            }
             let cfg = eng.cfg.clone();
             let Engine { bus, session, .. } = eng;
             let m = bus.send(session, &cfg, None, to, body, false, false, None)?;

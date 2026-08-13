@@ -50,10 +50,17 @@ horde trigger off --all      # the kill switch
 horde trigger rm 1
 ```
 
-**`--task` is the one to reach for.** The work lands on the board, and the nudge that already
-exists finds whichever agent is free. That means a rule never has to know who is idle, and the
-exclusivity guarantee stays where it already is — in the board's compare-and-set claim. Adding
-agents adds throughput with no change to the rule.
+**`--task` and `--to` are both parked.** Either is refused for now, both when you try to add the
+rule and if an older one comes due: the board is paused while it is reworked (see
+`daemon::tasks::ENABLED` and `AUTONOMOUS`), and `--to` routes through the message bus, which is
+paused with it (`daemon::bus::ENABLED`). **`--spawn` is the one action still standing** — it
+starts a program rather than typing at one already running. The rest of this section is how the
+other two behave when the switches go back on.
+
+The work lands on the board, and the nudge that already exists finds whichever agent is free.
+That means a rule never has to know who is idle, and the exclusivity guarantee stays where it
+already is — in the board's compare-and-set claim. Adding agents adds throughput with no change
+to the rule.
 
 `--to` pushes a line at one named agent instead. It bypasses the board, so it also bypasses
 everything the board guarantees; worth it only when the work genuinely belongs to that agent.
@@ -145,7 +152,10 @@ horde trigger add --at 02:01 --spawn claude --name nightly
 ```
 
 The task lands on the board; the spawned agent gets nudged about it a moment later and claims it.
-That ordering is the whole pattern — the rule never has to know who is free.
+That ordering is the whole pattern — the rule never has to know who is free. (Parked: with both
+`--task` and `--to` refused, a `--spawn` rule brings an agent up at an empty prompt and nothing
+briefs it. Until the switches are back, a scheduled agent needs its instructions baked into the
+command it is spawned with.)
 
 ### `horde trigger fire`
 
