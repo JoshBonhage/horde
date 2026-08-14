@@ -4,9 +4,9 @@
 
 <br>
 
-![Rust](https://img.shields.io/badge/Rust-1.85+-2ea986?style=for-the-badge&labelColor=1a3b3b)
+![Rust](https://img.shields.io/badge/Rust-1.88+-2ea986?style=for-the-badge&labelColor=1a3b3b)
 ![Platform](https://img.shields.io/badge/macOS%20%C2%B7%20Linux-086c69?style=for-the-badge&labelColor=1a3b3b)
-![Tests](https://img.shields.io/badge/476%20tests-passing-2ea986?style=for-the-badge&labelColor=1a3b3b)
+![Tests](https://img.shields.io/badge/535%20tests-passing-2ea986?style=for-the-badge&labelColor=1a3b3b)
 ![Binary](https://img.shields.io/badge/one%20binary-no%20runtime-086c69?style=for-the-badge&labelColor=1a3b3b)
 
 **[Concepts](docs/concepts.md)** · **[Keys](docs/keys.md)** · **[Agents](docs/agents.md)** · **[Socket API](docs/socket-api.md)** · **[Config](docs/configuration.md)** · **[Unattended](docs/unattended.md)** · **[Orchestration](docs/orchestration.md)**
@@ -75,6 +75,9 @@ This is the part that earns its keep past two agents.
 | **Folding** | Collapse a project you're not looking at — it stays collapsed after a restart | `ctrl+b E` then `h` |
 | **Filters** | Show only what needs you, only what's working, or every `reviewer` everywhere | `ctrl+b f` · `r` |
 | **Roster** | Drop the panes, give the whole terminal to one view of everything | `ctrl+b o` |
+| **Approvals** | Every blocked agent's question in one list, answered without switching panes | `ctrl+b A` |
+| **Worktrees** | Give each agent its own git worktree, so a fleet in one repo can't overwrite itself | `--worktree` |
+| **Fleets** | An agent spawns a team: roles, models, worktrees, and work on the board | `horde spawn` |
 
 <details>
 <summary><b>Why roles, and not just names</b></summary>
@@ -100,6 +103,38 @@ horde role list
 Role names get normalised on the way in — lowercased, spaces folded to `-`, capped at 16
 characters — so `Code Reviewer` and `code_reviewer` are one role rather than three. Without
 that they'd fragment and stop being the thing they exist to be.
+
+</details>
+
+<details>
+<summary><b>One tree per agent</b></summary>
+
+<br>
+
+Two agents editing the same file on the same branch is not a merge conflict you get to
+resolve. It is one agent's work silently overwritten, usually found an hour later.
+
+```sh
+horde spawn --cmd claude --name builder  --worktree
+horde spawn --cmd claude --name reviewer --worktree
+```
+
+Each lands in `<repo>/.horde/worktrees/<name>` on its own `horde/<name>` branch, and starts
+there. Both can run the full test suite and rewrite the same file, and neither can touch what
+the other is holding.
+
+Two details, both checked rather than assumed. horde writes `.horde/` to **`.git/info/exclude`**,
+which is per-clone and untracked, so nothing the repository owns is modified — without it the
+first agent to run `git add -A` in the main tree commits a mess. And the **leading dot** is what
+keeps the worktrees out of every agent's search results; `horde-worktrees/` would return one hit
+per worktree per match.
+
+Worktrees survive a closed pane, deliberately: nothing an agent produced should be lost by
+closing a window. `horde worktree list` shows them and who is in each, `horde worktree remove`
+is the only thing that deletes one, and it refuses while a pane is still in it or while the
+tree has uncommitted work.
+
+Full reasoning, including what `git clean` can still do to them: `horde docs worktrees`.
 
 </details>
 
@@ -390,12 +425,33 @@ An agent is a program in a pane that horde recognises — `claude`, `codex`, `ge
 `cursor-agent`, `aider`, `opencode`. horde doesn't launch them any differently; it watches
 them.
 
-States are `working ◐`, `blocked ◍`, `done ●`, `idle ○`, `unknown ◌`. Two are load-bearing:
+States are `working ◐`, `blocked ◍`, `done ●`, `idle ○`, `unknown ◌`, `serving ◆`. Three are
+load-bearing:
 
 - **`blocked`** means waiting on a human decision — an approval or permission prompt. Silence
   is never treated as blocked.
 - **`done`** means finished while you weren't looking. It clears when you look at the pane,
   which is what makes the sidebar worth glancing at.
+- **`serving`** is not an agent at all. A pane running `npm run dev`, a watcher or a tunnel is
+  recognised as a *service*: its own colour, its own count, never handed work, and never
+  `done` — because a dev server has no finish to read. A pane sitting at a shell prompt is
+  neither, whatever its scrollback still says.
+
+`ctrl+b A` opens the **approval queue**: every blocked agent in one list, longest wait first,
+with the question read off its screen and answerable in place.
+
+```
+◍ reviewer   Halo Suite   waiting 12m
+  Do you want to make this edit to src/mux.rs?
+    1  Yes
+    2  Yes, and don't ask again
+    3  No, and tell Claude what to do differently
+```
+
+Only the agent under the cursor shows its options, and a key it did not offer does nothing —
+this window shows you a menu, and a keystroke that means nothing in it must not mean something
+in the pane. When the prompt cannot be read, the agent is still listed with `enter` to go and
+look. It will not guess.
 
 Detection runs in two tiers, and only one is ever in charge of a pane. **Lifecycle hooks** are
 authoritative — install them and the agent reports its own state:
@@ -479,17 +535,19 @@ Full reference: **[docs/configuration.md](docs/configuration.md)**.
 
 ## Honest caveats
 
-- **The bus and the task board are paused.** Agent-to-agent messaging and the shared work queue
-  are switched off in code while they're reworked, so `horde trigger --task` and `--to` are
-  refused too — `--spawn` is the live action. `horde bus tail` and `horde task list` still read
-  their logs. Everything else on this page works.
+- **The idle nudge is off by default.** The board works by hand; the half that tells an idle
+  agent there is work waiting needs `agents.task_nudge = true`. It is off because it is the
+  part that acts without being asked, and it is worth watching the board behave for a day
+  before switching it on. Enlisting (`horde task work`) is required either way.
 - **One machine.** horde is a local tool. No cloud, no plugin marketplace, no remote host
   management — dropped on purpose.
-- macOS and Linux. No Windows.
+- macOS and Linux natively, Windows through WSL2 — `horde docs wsl`. There is no native Windows
+  build and there is not going to be one: a ConPTY cannot be asked what is running inside it,
+  which is most of what horde is for. Under WSL, `wsl --shutdown` and a Windows Update reboot end
+  a session the way a machine restart would — the layout comes back, the agents do not.
 - The socket path has to stay under ~100 bytes — an OS limit on `AF_UNIX`. Set `HORDE_SOCKET`
   if your config directory is deep.
-- Not implemented: dragging pane borders to resize (use `H J K L`), and OSC 52 clipboard
-  forwarding.
+- Not implemented: dragging pane borders to resize (use `H J K L`).
 
 ---
 

@@ -67,6 +67,13 @@ pub enum Mode {
     /// The full-screen roster. Scroll lives here because it is a one-shot view; the
     /// *selection* is `app.sidebar.cursor`, so one cursor serves both views of the same list.
     Roster { scroll: usize },
+    /// Every agent blocked on a decision, in one list, answerable from there.
+    ///
+    /// `sel` indexes `overlays::pending`, which is ordered by how long each has been waiting.
+    /// An index rather than a pane id because the list is short, always sorted the same way,
+    /// and only ever grows at the bottom: an agent that unblocks leaves, and the one under
+    /// the cursor keeps its place unless it was the one that left.
+    Approvals { sel: usize },
     /// The sidebar has the keyboard.
     ///
     /// Carries nothing: everything it edits lives on `App` or in the daemon, because a
@@ -240,11 +247,17 @@ fn fuzzy(query: &str, candidate: &str) -> bool {
     true
 }
 
-/// macOS notification. Best effort; a missing `osascript` is not worth reporting.
+/// Desktop notification, whatever this host has for one.
+///
+/// Best effort in both directions: a host with no notifier does nothing, and a notifier that
+/// fails to start is not worth reporting. The toast that prompted this is already on screen, so
+/// there is a human looking at the message either way — which is exactly what makes the
+/// detached path in `daemon::notify` the half that has to complain when it cannot deliver.
 fn notify_system(text: &str) {
-    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("display notification \"{escaped}\" with title \"horde\"");
-    let _ = std::process::Command::new("osascript").args(["-e", &script]).spawn();
+    if let Some(mut cmd) = crate::platform::system_notify(text) {
+        use std::process::Stdio;
+        let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +671,58 @@ fn handle_key(
             }
             return Ok(());
         }
+        // The one mode where a keypress answers on your behalf, so it is deliberately narrow:
+        // it moves, it opens a pane, and it sends exactly the digits the agent itself offered.
+        // Nothing here can type free text into a pane.
+        Mode::Approvals { sel } => {
+            let items = app
+                .snapshot
+                .as_ref()
+                .map(crate::client::ui::overlays::pending)
+                .unwrap_or_default();
+            let last = items.len().saturating_sub(1);
+            let sel = sel.min(last);
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.mode = Mode::Approvals { sel: (sel + 1).min(last) }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.mode = Mode::Approvals { sel: sel.saturating_sub(1) }
+                }
+                KeyCode::Enter => {
+                    // Answering from here covers the questions horde could read. Anything
+                    // else, and anything you would rather see in context, is one key away.
+                    if let Some(item) = items.get(sel) {
+                        let _ = out.send(ClientFrame::Command(Cmd::FocusPane(item.pane)));
+                    }
+                    app.mode = Mode::Terminal;
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() || c == 'y' || c == 'n' => {
+                    // Only a key the agent itself listed. A digit with no matching option is
+                    // ignored rather than forwarded: this window is showing you a menu, and a
+                    // keystroke that means nothing in it must not mean something in the pane.
+                    let choice = items
+                        .get(sel)
+                        .and_then(|i| i.question.as_ref())
+                        .and_then(|q| q.options.iter().find(|o| o.key == c.to_string()));
+                    if let (Some(item), Some(choice)) = (items.get(sel), choice) {
+                        let _ = out.send(ClientFrame::Input {
+                            pane: item.pane,
+                            bytes: crate::client::ui::overlays::answer_bytes(choice),
+                        });
+                        app.toast(
+                            NoticeLevel::Info,
+                            format!("{}: {}", item.name, choice.label),
+                        );
+                        // Stay open. Answering one of six is the case this exists for, and
+                        // the answered agent drops out of the list on the next snapshot.
+                        app.mode = Mode::Approvals { sel: sel.min(last.saturating_sub(1)) };
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Terminal,
+                _ => {}
+            }
+        }
         // The roster is the sidebar's list at a size that can afford detail, so it shares the
         // sidebar's cursor — open it and you land where you left off, jump from it and the
         // sidebar agrees.
@@ -933,15 +998,54 @@ fn activate(app: &mut App, act: Act, out: &mpsc::UnboundedSender<ClientFrame>) -
     Ok(())
 }
 
-/// Hand text to the system clipboard via `pbcopy`.
+/// Hand text to the system clipboard, by whichever route this machine has.
+///
+/// Two routes, and the order matters. A local clipboard program — `pbcopy`, `clip.exe`,
+/// `wl-copy` — is tried first because it is the only one that can be *checked*: it either exits
+/// zero or it does not. [`osc52`](crate::platform::osc52) asks the terminal to do the copying
+/// instead, which needs nothing installed and works from inside WSL or across SSH, but is
+/// write-only — the terminal never answers, so a terminal that ignores the sequence is
+/// indistinguishable from one that obeyed it.
+///
+/// So: try the route that can fail loudly, and fall through to the route that always "works".
+/// A program that is present but broken falls through too, which is the case that matters on a
+/// headless box where `xclip` is installed and there is no display behind it.
 fn copy_to_clipboard(text: &str) -> Result<()> {
+    if let Some(cmd) = crate::platform::clipboard_command() {
+        if pipe_into(cmd, text).is_ok() {
+            return Ok(());
+        }
+    }
+    if text.len() > crate::platform::OSC52_LIMIT {
+        return Err(anyhow!(
+            "no clipboard program, and {}KB is past what an escape sequence can carry",
+            text.len() / 1024
+        ));
+    }
+    // Straight at the terminal rather than through ratatui: this is a request to the emulator,
+    // not something to be drawn, and the next frame must not be able to overwrite it.
     use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+    let mut out = std::io::stdout();
+    out.write_all(crate::platform::osc52(text).as_bytes())?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Run `cmd`, feeding it `text` on stdin, and fail if it does not exit cleanly.
+fn pipe_into(mut cmd: std::process::Command, text: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(text.as_bytes())?;
+        // Closed here rather than at the end of the call: a clipboard program reads to EOF, and
+        // waiting on one that is still waiting on us is a deadlock rather than a slow copy.
+        drop(stdin);
     }
-    child.wait()?;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(anyhow!("{:?} exited with {status}", cmd.get_program()));
+    }
     Ok(())
 }
 
@@ -1032,16 +1136,6 @@ fn prompt_key(
                 }
                 Prompt::SendTo(pane) => {
                     if v.is_empty() {
-                        return Ok(());
-                    }
-                    // Said here rather than left to the daemon's refusal: the text you just
-                    // typed is about to be thrown away either way, and a plain sentence beats
-                    // an RPC error for something that is off on purpose.
-                    if !crate::daemon::bus::ENABLED {
-                        app.toast(
-                            NoticeLevel::Warn,
-                            "the message bus is paused while it is reworked".to_string(),
-                        );
                         return Ok(());
                     }
                     // Route through the bus so the message is recorded and state-gated,
@@ -1250,6 +1344,7 @@ fn run_action(
             app.quit = true;
         }
         Action::Help => app.mode = Mode::Help,
+        Action::Approvals => app.mode = Mode::Approvals { sel: 0 },
         Action::SidebarFocus => {
             // Opening the panel is part of asking for it: focusing a hidden sidebar would
             // silently eat every key with nothing on screen to explain why.
@@ -1662,6 +1757,7 @@ mod tests {
                 attention_count: 0,
                 accent: 0,
                 collapsed: false,
+                repo: None,
             }],
             tabs,
             panes: vec![],

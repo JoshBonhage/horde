@@ -1,6 +1,6 @@
 ---
 name: horde
-description: "Work alongside other AI agents running in horde, a terminal multiplexer. Agent-to-agent messaging (the bus) and the shared task board are both PAUSED — nothing can be sent, claimed, or delegated, and no work will arrive from another agent. Use this skill to find out what the other agents are doing, read another agent's output, wait for one to finish, start a helper agent, or catch up on a session — and to understand why a `horde send`/`task claim` command was refused. Requires HORDE_PANE to be set."
+description: "Work alongside other AI agents running in horde, a terminal multiplexer. Use this skill to message another agent, ask one a question and get the answer back, take work from the shared board, build a fleet of agents for a project (each in its own git worktree), see what the others are doing, or catch up on a session. Requires HORDE_PANE to be set."
 ---
 
 # horde
@@ -15,65 +15,117 @@ test -n "$HORDE_PANE"
 
 If that fails, say you are not running inside horde and stop.
 
-## What is switched off
+## Everything is scoped to a project
 
-**The message bus and the task board are both paused while they are reworked.** This is
-deliberate, not a fault, and there is nothing to diagnose or work around:
+horde calls a project a **space**. Every command below acts on the space your pane is in
+unless you say otherwise. This matters more than it sounds: the board is per project, so work
+you add is offered only to agents in *this* project, and `horde task list` shows only this
+project's board. If you want another project's, say `--everywhere` or name it.
 
-| Command | Now |
+## Talking to another agent
+
+```bash
+horde roster                                   # who is here, and what state they are in
+horde send reviewer "the parser lands in src/parse.rs"
+answer=$(horde ask reviewer "does src/bus.rs handle a dropped pane?")
+horde reply 42 "yes — it queues and flushes on the next idle pass"
+horde broadcast "I am taking the parser work"
+```
+
+`ask` blocks until they answer and prints the answer, so it can go straight into a variable.
+The recipient sees `[horde] request #42 from <you>` and is told the exact command to reply
+with.
+
+Delivery is gated on the recipient's state, which is why you never need to check first:
+
+| Their state | What happens |
 |---|---|
-| `horde send` · `horde ask` · `horde reply` · `horde broadcast` | refused, exits non-zero |
-| `horde task add` · `claim` · `done` · `release` | refused, exits non-zero |
-| `horde bus tail` · `horde task list` | still work, read-only |
+| `idle`, `done` | delivered now |
+| `working` | queued, delivered when they reach their prompt |
+| `blocked` | queued — they are at a permission prompt and a newline would answer it |
 
-What follows from that:
+`queued` is a normal result, not a failure. Do not resend, and never route around the bus by
+writing into another pane's tty.
 
-- **Nothing will arrive from another agent.** No `[horde]` lines, no nudges about work waiting
-  on the board. Your work comes from the human in your pane. Do not poll for it, and do not
-  treat a quiet board as "nothing to do".
-- **You cannot delegate or ask.** If a task needs another agent, say so to your human and let
-  them decide — do not try to route around it with `tmux send-keys`, by writing into another
-  pane's tty, or by any other back door. The pause is the point.
-- **If one of these commands is refused, that is the expected result.** Report it plainly and
-  move on; do not retry it, and do not go looking for a bug.
+## The board
 
-## What still works
-
-Observing the other agents is untouched — none of it puts text into anyone's pane.
+Work sits on the board and whoever is free takes it. Use it instead of pushing at a named
+agent whenever the work does not have to be done by someone specific.
 
 ```bash
-horde roster                                      # names and states
-horde roster --json                               # the same, for deciding what to do next
-horde pane read reviewer --source detection --lines 40   # what another agent is doing
-horde wait reviewer --until idle --timeout 300    # idle · done · blocked · working
-horde bus tail                                    # the message log, read-only
-horde task list                                   # what was left on the board
+horde task add "write tests for src/bus.rs"     # onto this project's board
+horde task work                                 # enlist: I will take board work
+horde task claim                                # take the oldest open one
+horde task done --result "18 tests added, all passing"
+horde task list                                 # this project's board
+horde task clear                                # drop every open task here
 ```
 
-States are `working`, `blocked`, `done`, `idle`, `unknown`. `blocked` means a **human** is
-needed — the agent is sitting at a permission prompt, and nothing you can do reaches it.
+Two things to know:
 
-## Starting a helper
+- **You are not offered work until you enlist.** `horde task work` once, then you may be told
+  when tasks are waiting. Without it nothing will ever interrupt you, which is deliberate: an
+  agent someone opened to think with is not a worker.
+- **A claim is exclusive.** Two agents claiming at the same moment get different tasks, never
+  the same one. Losing the race is a visible error, not a silent duplicate.
 
-Still available: it starts a new program rather than typing at one already running.
+The worker loop, when you have been told to work the board:
 
 ```bash
-horde spawn --cmd claude --name tester --split right
+horde task work
+while work=$(horde task claim); [ -n "$work" ]; do
+  # do $work as a normal turn — think, edit, test
+  horde task done --result "<what happened>"
+done
 ```
 
-Pass `--name` so the pane is addressable in the roster. Note that with the bus paused you
-cannot brief the agent you just started — it comes up at an empty prompt and waits for the
-human. Prefer telling your human what you would have spawned.
+An empty board exits 0 and prints nothing, so the loop ends cleanly. "No work" and "broken"
+are different things.
 
-## Catching up
+## Building a fleet
 
-If you were restarted, or you are picking up a session someone else was driving:
+You can start other agents. Each flag matters when you are standing up more than one:
 
 ```bash
-horde digest --keep
+horde spawn --cmd "claude --model opus" --name parser \
+  --role builder --worktree --board --task "port the old parser"
 ```
 
-Tells you which agents need a human and what has happened. Use `--keep`; the digest belongs to
-your human, not to you.
+| Flag | What it does |
+|---|---|
+| `--name` | how you address it in `horde send`. Always pass it |
+| `--role` | what it is *for*: reviewer, builder, docs. Makes a fleet readable |
+| `--worktree` | its own git worktree and branch, so it cannot overwrite its neighbours |
+| `--board` | enlist it for board work in this project |
+| `--task` | a first job, put on the board for it to claim |
+| `--cmd` | the whole command, so the model goes here: `"claude --model opus"` |
+
+**Use `--worktree` whenever you start more than one agent in the same repository.** Without
+it they share one working tree, and two agents editing the same file is not a merge conflict
+you can resolve — it is one agent's work silently overwritten.
+
+There is a cap on how many panes agents may have open at once (`agents.max_fleet`, six by
+default). Hitting it is an error that says so. Do not work around it; tell your human.
+
+After spawning, brief each agent with `horde send`, or put the work on the board and let them
+claim it. The board is better for more than two agents: it self-balances, and you never have
+to track who is free.
+
+## Watching
+
+```bash
+horde roster --json                                      # states, for deciding what to do next
+horde pane read reviewer --source detection --lines 40   # what another agent is looking at
+horde wait reviewer --until idle --timeout 300           # idle · done · blocked · working · serving
+horde bus tail                                           # the message log
+horde digest --keep                                      # what has happened; --keep leaves it unread for your human
+```
+
+States are `working`, `blocked`, `done`, `idle`, `unknown`, `serving`. Two need explaining:
+
+- **`blocked` means a human is needed.** The agent is at a permission prompt. Nothing you can
+  send reaches it, and messages you send are held until it is answered.
+- **`serving` is not an agent.** It is a dev server or watcher, and there is nobody in there
+  to talk to.
 
 Full reference: `horde docs orchestration`.

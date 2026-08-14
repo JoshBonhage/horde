@@ -55,7 +55,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Send a message to another agent. Paused while the bus is reworked.
+    /// Send a message to another agent.
     Send {
         /// Agent name, pane name, pane id, or space:tab:pane.
         to: String,
@@ -65,7 +65,7 @@ pub enum Command {
         #[arg(long)]
         now: bool,
     },
-    /// Ask another agent something and wait for its answer. Paused while the bus is reworked.
+    /// Ask another agent something and wait for its answer.
     ///
     /// Unlike `send`, this blocks until the agent replies and prints the reply to stdout, so
     /// it can be captured: `answer=$(horde ask reviewer "is this sound?")`. The recipient is
@@ -78,13 +78,13 @@ pub enum Command {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
     },
-    /// Answer a request you were sent. Paused while the bus is reworked.
+    /// Answer a request you were sent.
     Reply {
         /// Request number, as printed in `[horde] request #N`.
         request: u64,
         body: Vec<String>,
     },
-    /// Send a message to every agent. Paused while the bus is reworked.
+    /// Send a message to every agent.
     Broadcast {
         body: Vec<String>,
         /// Limit to one space.
@@ -102,6 +102,19 @@ pub enum Command {
         /// Where to put it: right, down, left, up.
         #[arg(long, default_value = "right")]
         split: String,
+        /// Give this agent its own git worktree, so it cannot overwrite what its neighbours
+        /// are editing. Takes a name; defaults to the agent's.
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        worktree: Option<String>,
+        /// What it is for: reviewer, builder, docs.
+        #[arg(long)]
+        role: Option<String>,
+        /// Enlist it for board work in this project.
+        #[arg(long)]
+        board: bool,
+        /// A first job, put on the project's board for it to claim.
+        #[arg(long)]
+        task: Option<String>,
     },
     /// Block until an agent reaches a state.
     Wait {
@@ -114,8 +127,7 @@ pub enum Command {
     },
     /// Apply a named layout: solo, duo, trio, dev, quad.
     Layout { preset: String },
-    /// The shared task board agents pull work from. Paused while it is reworked: `list` still
-    /// reads it, and add/claim/done/release are refused.
+    /// The shared task board agents pull work from, one board per project.
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
@@ -155,6 +167,11 @@ pub enum Command {
     Role {
         #[command(subcommand)]
         cmd: RoleCmd,
+    },
+    /// Git worktrees horde made, so agents in one repository do not overwrite each other.
+    Worktree {
+        #[command(subcommand)]
+        cmd: WorktreeCmd,
     },
     /// Tab management.
     Tab {
@@ -256,8 +273,28 @@ pub enum TriggerCmd {
 
 #[derive(Subcommand)]
 pub enum TaskCmd {
-    /// Put work on the board for whoever is free.
-    Add { text: Vec<String> },
+    /// Put work on the board for whoever is free in this project.
+    Add {
+        text: Vec<String>,
+        /// Put it on another project's board, by space name.
+        #[arg(long)]
+        space: Option<String>,
+    },
+    /// Take board work in this project from now on. Without this, nothing is ever offered.
+    Work {
+        /// Stop taking it.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Drop every open task in this project.
+    Clear {
+        /// Every project, not just this one.
+        #[arg(long)]
+        everywhere: bool,
+        /// Also drop tasks an agent is currently holding.
+        #[arg(long)]
+        claimed: bool,
+    },
     /// Take the oldest open task, or a specific one. Prints nothing if the board is empty.
     Claim {
         /// Task number. Omit to take the oldest open one.
@@ -278,11 +315,14 @@ pub enum TaskCmd {
         #[arg(long)]
         drop: bool,
     },
-    /// Show the board.
+    /// Show this project's board.
     List {
         /// Include finished and abandoned tasks.
         #[arg(long)]
         all: bool,
+        /// Every project's board, not just this one.
+        #[arg(long)]
+        everywhere: bool,
         #[arg(long)]
         json: bool,
     },
@@ -341,6 +381,19 @@ pub enum TabCmd {
     New { name: Option<String> },
     Close,
     Rename { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum WorktreeCmd {
+    /// Every worktree horde made for this project, and who is in it.
+    List,
+    /// Remove one. The branch survives: it may hold commits.
+    Remove {
+        name: String,
+        /// Remove it even with uncommitted changes in it.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -634,18 +687,66 @@ pub fn run(cmd: Command) -> Result<()> {
             println!("sent to {n} agent(s)");
         }
 
-        Command::Spawn { cmd, name, split } => {
+        Command::Spawn { cmd, name, split, worktree, role, board, task } => {
+            // `--worktree` with no value means "name it after the agent", which the daemon
+            // resolves because it is the side that knows what the agent ended up called.
+            let worktree = worktree.map(|w| if w.is_empty() { Value::Bool(true) } else { json!(w) });
             let v = call(
                 "agent.spawn",
-                json!({ "cmd": cmd, "name": name, "split": dir_name(&split)? }),
+                json!({
+                    "cmd": cmd, "name": name, "split": dir_name(&split)?,
+                    "worktree": worktree, "role": role, "board": board, "task": task,
+                    // Who asked, so an agent building a fleet is counted against the cap.
+                    "from": self_pane(),
+                }),
             )?;
             println!("pane {} running {cmd}", v.get("pane").unwrap_or(&Value::Null));
+            if let Some(w) = v.get("worktree").and_then(|w| w.as_str()) {
+                println!("  worktree {w}");
+            }
+            if let Some(t) = v.get("task").and_then(|t| t.as_u64()) {
+                println!("  task #{t} on the board for it");
+            }
         }
+        Command::Worktree { cmd } => match cmd {
+            WorktreeCmd::List => {
+                let v = call("worktree.list", json!({}))?;
+                let rows = v.as_array().cloned().unwrap_or_default();
+                if rows.is_empty() {
+                    println!("no worktrees — `horde spawn --cmd claude --name x --worktree`");
+                }
+                for w in rows {
+                    let s = |k: &str| w.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    // Who is in it, because that is what decides whether it can be removed.
+                    let held = match w.get("agent").and_then(|v| v.as_str()) {
+                        Some(a) => format!("  {a}"),
+                        None => String::new(),
+                    };
+                    let dirty = if w.get("dirty").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        "  uncommitted"
+                    } else {
+                        ""
+                    };
+                    println!("{:<16} {:<24}{held}{dirty}", s("name"), s("branch"));
+                }
+            }
+            WorktreeCmd::Remove { name, force } => {
+                let v = call("worktree.remove", json!({ "name": name, "force": force }))?;
+                println!("removed {}", v.get("removed").unwrap_or(&Value::Null));
+                println!("  branch horde/{name} kept — `git branch -D horde/{name}` to drop it");
+            }
+        },
 
         Command::Wait { target, until, timeout } => {
             let want = match until.as_str() {
-                "idle" | "done" | "blocked" | "working" => until.clone(),
-                other => return Err(anyhow!("--until must be idle, done, blocked, or working (got {other:?})")),
+                // `serving` is here for the same reason the rest are: waiting for the dev
+                // server to be up before pointing anything at it is a real thing to want.
+                "idle" | "done" | "blocked" | "working" | "serving" => until.clone(),
+                other => {
+                    return Err(anyhow!(
+                        "--until must be idle, done, blocked, working, or serving (got {other:?})"
+                    ))
+                }
             };
             let deadline = Instant::now() + Duration::from_secs(timeout);
             loop {
@@ -678,10 +779,37 @@ pub fn run(cmd: Command) -> Result<()> {
         }
 
         Command::Task { cmd } => match cmd {
-            TaskCmd::Add { text } => {
+            TaskCmd::Add { text, space } => {
                 let text = text.join(" ");
-                let t = call("task.add", json!({ "text": text, "from": self_pane() }))?;
-                println!("#{} added", t.get("id").and_then(|x| x.as_u64()).unwrap_or(0));
+                let t =
+                    call("task.add", json!({ "text": text, "from": self_pane(), "space": space }))?;
+                let where_ = t.get("space").and_then(|s| s.as_str()).unwrap_or("");
+                println!(
+                    "#{} added{}",
+                    t.get("id").and_then(|x| x.as_u64()).unwrap_or(0),
+                    if where_.is_empty() { String::new() } else { format!(" to {where_}") }
+                );
+            }
+            TaskCmd::Work { off } => {
+                let v = call("task.work", json!({ "from": self_pane(), "on": !off }))?;
+                if v.get("board").and_then(|b| b.as_bool()).unwrap_or(false) {
+                    println!("taking board work — `horde task claim` when you are free");
+                } else {
+                    println!("no longer taking board work");
+                }
+            }
+            TaskCmd::Clear { everywhere, claimed } => {
+                let v = call(
+                    "task.clear",
+                    json!({ "from": self_pane(), "everywhere": everywhere, "claimed": claimed }),
+                )?;
+                let n = v.get("dropped").and_then(|d| d.as_u64()).unwrap_or(0);
+                let scope = v.get("space").and_then(|s| s.as_str()).unwrap_or("every project");
+                match n {
+                    0 => println!("nothing to clear in {scope}"),
+                    1 => println!("1 task dropped from {scope}"),
+                    n => println!("{n} tasks dropped from {scope}"),
+                }
             }
             TaskCmd::Claim { task } => {
                 let v = call("task.claim", json!({ "task": task, "from": self_pane() }))?;
@@ -709,8 +837,11 @@ pub fn run(cmd: Command) -> Result<()> {
                 let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("?");
                 println!("#{task} is now {state}");
             }
-            TaskCmd::List { all, json: as_json } => {
-                let v = call("task.list", json!({}))?;
+            TaskCmd::List { all, everywhere, json: as_json } => {
+                let v = call(
+                    "task.list",
+                    json!({ "from": self_pane(), "everywhere": everywhere }),
+                )?;
                 if as_json {
                     println!("{}", serde_json::to_string_pretty(&v)?);
                     return Ok(());
@@ -720,24 +851,20 @@ pub fn run(cmd: Command) -> Result<()> {
                 let items: Vec<Task> = serde_json::from_value(v)?;
                 let shown: Vec<&Task> =
                     items.iter().filter(|t| all || t.is_open() || t.is_claimed()).collect();
-                // Said before the list, not after: whatever is outstanding here, nobody is
-                // going to pick it up, and reading three open tasks without knowing that
-                // invites waiting for work that will never move.
-                if !crate::daemon::tasks::ENABLED {
-                    println!("the board is paused while it is reworked — nothing can be claimed");
-                }
                 if shown.is_empty() {
-                    if crate::daemon::tasks::ENABLED {
-                        println!("board is empty — add work with `horde task add \"...\"`");
-                    } else {
-                        println!("board is empty");
-                    }
+                    println!("board is empty — add work with `horde task add \"...\"`");
                     return Ok(());
                 }
                 for t in shown {
                     let owner =
                         t.owner.as_ref().map(|o| format!("  [{o}]")).unwrap_or_default();
-                    println!("{} #{:<4} {}{}", t.state.glyph(), t.id, t.text, owner);
+                    // Which project, but only when the list spans more than one. In the
+                    // ordinary case every row would carry the same word, which is noise.
+                    let where_ = match (everywhere, &t.space) {
+                        (true, Some(sp)) => format!("  ({sp})"),
+                        _ => String::new(),
+                    };
+                    println!("{} #{:<4} {}{where_}{owner}", t.state.glyph(), t.id, t.text);
                     if let Some(r) = &t.result {
                         println!("       → {r}");
                     }

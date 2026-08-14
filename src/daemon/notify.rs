@@ -167,13 +167,23 @@ fn reasons(eng: &Engine, since: u64) -> Vec<Reason> {
     out
 }
 
-/// macOS notification, sent from the daemon this time.
+/// Desktop notification, sent from the daemon this time.
+///
+/// Unlike the client's copy of this, a host with no notifier is worth saying out loud. Nobody is
+/// attached — that is the precondition for being here at all — so a silent no-op is
+/// indistinguishable from horde having decided there was nothing to report, and the user is
+/// waiting for a ping that is never coming. Said once per daemon rather than once per alert,
+/// because it is a fact about the machine and will not have changed by the next window.
 fn deliver_system(summary: &str) {
-    let escaped = summary.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("display notification \"{escaped}\" with title \"horde\"");
-    let mut c = Command::new("osascript");
-    c.args(["-e", &script]);
-    run_detached(c, None, None);
+    match crate::platform::system_notify(summary) {
+        Some(c) => run_detached(c, None, None),
+        None => {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::SeqCst) {
+                log_line(crate::platform::no_notifier_hint());
+            }
+        }
+    }
 }
 
 /// The user's own program: summary as `$1`, the full digest as JSON on stdin.
@@ -354,8 +364,8 @@ mod tests {
         let mut e = eng("board", 1);
         assert!(prepare(&mut e, true).is_none(), "nothing has happened yet");
 
-        e.board.add("port the parser", "user").unwrap();
-        e.board.claim("worker0", None).unwrap();
+        e.board.add("port the parser", "user", None).unwrap();
+        e.board.claim("worker0", None, None).unwrap();
         e.board.done("worker0", None, Some("done, 18 tests")).unwrap();
         let a = prepare(&mut e, true).expect("the fleet finishing is worth knowing");
         assert!(a.text.contains("1 task done"), "{}", a.text);
@@ -397,8 +407,14 @@ mod tests {
         deliver_command(&cmd, "1 agent needs you", "{\"needs_you\":[]}");
 
         // Spawned and reaped on a thread, so poll rather than assume it has finished.
+        //
+        // Polling for *content* rather than for the file, because `> path` creates the file when
+        // the shell sets the redirection up — before `cat` has read a byte of stdin. Waiting on
+        // `exists()` therefore races the write and observes an empty file, rarely enough to look
+        // like magic and often enough to redden a CI run. Caught doing exactly that on Linux.
+        let written = || std::fs::read_to_string(&body).is_ok_and(|s| !s.is_empty());
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5) && !body.exists() {
+        while start.elapsed() < Duration::from_secs(5) && !written() {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read_to_string(&arg).unwrap(), "1 agent needs you");

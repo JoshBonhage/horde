@@ -36,6 +36,10 @@ pub struct Ui {
     pub done: Rgb,
     pub idle: Rgb,
     pub unknown: Rgb,
+    /// A dev server or watcher that is up. Its own hue on purpose: a service is background
+    /// texture you want to be able to *not* look at, which it cannot be while it shares a
+    /// colour with an agent mid-turn.
+    pub serving: Rgb,
     pub ok: Rgb,
     pub warn: Rgb,
     pub error: Rgb,
@@ -131,6 +135,7 @@ impl Theme {
                 done: rgb(0x7e, 0xe2, 0xc0),
                 idle: rgb(0x6b, 0x74, 0x82),
                 unknown: rgb(0x55, 0x5d, 0x6a),
+                serving: rgb(0x79, 0xc0, 0xff),
                 ok: rgb(0x7e, 0xe7, 0x87),
                 warn: rgb(0xf0, 0xc6, 0x74),
                 error: rgb(0xff, 0x7b, 0x72),
@@ -179,6 +184,7 @@ impl Theme {
         t.ui.blocked = rgb(0xf7, 0x76, 0x8e);
         t.ui.done = rgb(0x9e, 0xce, 0x6a);
         t.ui.idle = rgb(0x56, 0x5f, 0x89);
+        t.ui.serving = rgb(0x7d, 0xcf, 0xff);
         t.ui.selection = rgb(0x28, 0x34, 0x57);
         t
     }
@@ -221,6 +227,7 @@ impl Theme {
         t.ui.blocked = rgb(0xf3, 0x8b, 0xa8);
         t.ui.done = rgb(0xa6, 0xe3, 0xa1);
         t.ui.idle = rgb(0x6c, 0x70, 0x86);
+        t.ui.serving = rgb(0x89, 0xb4, 0xfa);
         t.ui.selection = rgb(0x41, 0x42, 0x59);
         t
     }
@@ -263,6 +270,7 @@ impl Theme {
         t.ui.blocked = rgb(0xfb, 0x49, 0x34);
         t.ui.done = rgb(0x8e, 0xc0, 0x7c);
         t.ui.idle = rgb(0x92, 0x83, 0x74);
+        t.ui.serving = rgb(0x83, 0xa5, 0x98);
         t.ui.selection = rgb(0x50, 0x49, 0x45);
         t
     }
@@ -318,7 +326,8 @@ impl Theme {
         }
         set!(
             accent, accent_alt, bg, panel_bg, title_bg, text, text_dim, text_faint, border,
-            border_focus, working, blocked, done, idle, unknown, ok, warn, error, selection,
+            border_focus, working, blocked, done, idle, unknown, serving, ok, warn, error,
+            selection,
         );
         if let Some(c) = o.fg.as_deref().and_then(parse_color) {
             self.fg = c;
@@ -482,6 +491,7 @@ pub struct ThemeOverrides {
     pub done: Option<String>,
     pub idle: Option<String>,
     pub unknown: Option<String>,
+    pub serving: Option<String>,
     pub ok: Option<String>,
     pub warn: Option<String>,
     pub error: Option<String>,

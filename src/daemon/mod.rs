@@ -16,6 +16,8 @@ pub mod notify;
 pub mod pane;
 pub mod persist;
 pub mod pty;
+pub mod question;
+pub mod repo;
 pub mod rpc;
 pub mod state;
 pub mod tasks;
@@ -36,7 +38,7 @@ use crate::config::{socket_path, Config};
 use crate::framing;
 use crate::proto::{
     ClientFrame, Cmd, CursorPos, Dir, Event, NoticeLevel, PaneId, Request, Response, RowUpdate,
-    ServerFrame, PROTOCOL_VERSION,
+    ServerFrame, SpaceId, PROTOCOL_VERSION,
 };
 use state::Session;
 
@@ -95,6 +97,9 @@ pub struct Engine {
     /// get back is still the whole story. See [`notify`].
     pub last_alert: u64,
     pub agents: agents::Detector,
+    /// Branch and dirty state per directory, refreshed on its own slow cadence because each
+    /// answer costs a fork. Read by every snapshot, written by nothing else.
+    pub repos: repo::Cache,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
     dirty_shape: bool,
@@ -144,14 +149,10 @@ impl Engine {
 
     /// Deliver anything that was waiting for a busy agent to come free.
     ///
-    /// Parked with the rest of the bus (`bus::ENABLED`). This is the one path that injects into
-    /// a pane without anyone asking *at that moment* — the asking happened earlier — so leaving
-    /// it running would mean a paused bus still typed at agents, which is the whole complaint.
-    /// Anything already queued stays queued, and shows as queued, until the bus is back.
+    /// This is the one path that injects into a pane without anyone asking *at that moment* —
+    /// the asking happened when the message was sent, and this is the delivery finally
+    /// becoming possible.
     fn flush_bus(&mut self) -> Vec<Event> {
-        if !bus::ENABLED {
-            return Vec::new();
-        }
         let Engine { bus, session, cfg, .. } = self;
         bus.flush_queued(session, cfg)
     }
@@ -182,12 +183,33 @@ impl Engine {
     /// Parked for now behind [`tasks::autonomous`]: everything below the gate is intact and
     /// still under test, but nothing tells an agent about the board until the switch is back on.
     fn nudge_for_tasks(&mut self) -> Vec<Event> {
-        if !tasks::autonomous() {
+        if !self.cfg.task_nudge {
             return Vec::new();
         }
-        let open = self.board.open_count();
-        if !self.cfg.task_nudge || open == 0 {
-            return Vec::new();
+
+        // One pass per project, and at most one agent woken in each.
+        //
+        // Per project because that is the unit work belongs to: a task added in one repository
+        // is meaningless to an agent sitting in another, and the first version of this — which
+        // walked every idle agent in the session — handed work across projects constantly. The
+        // symptom was agents "working randomly"; the cause was that the board had no scope and
+        // the nudge had no scope to respect.
+        let spaces: Vec<(SpaceId, String)> =
+            self.session.spaces.iter().map(|s| (s.id, s.name.clone())).collect();
+        let mut events = Vec::new();
+        for (space_id, space_name) in spaces {
+            if let Some(ev) = self.nudge_one(space_id, &space_name) {
+                events.push(ev);
+            }
+        }
+        events
+    }
+
+    /// Tell one enlisted agent in `space` that its project has work waiting.
+    fn nudge_one(&mut self, space: SpaceId, space_name: &str) -> Option<Event> {
+        let open = self.board.offered_to(space_name);
+        if open == 0 {
+            return None;
         }
 
         // An agent already holding a task does not need more.
@@ -204,6 +226,23 @@ impl Engine {
         let board_workers: Vec<String> =
             self.board.all().iter().filter_map(|t| t.owner.clone()).collect();
 
+        // Enlisted agents in this project, and nowhere else.
+        //
+        // Enlistment is the second half of the fix. Scope stops work crossing projects;
+        // this stops it reaching an agent that never volunteered for any. An agent you opened
+        // to think with, sitting idle in the same repository as a fleet, is not a worker.
+        let candidates: Vec<(PaneId, String, std::time::Instant)> = self
+            .session
+            .panes
+            .values()
+            .filter(|p| p.space == space && p.board && p.exited.is_none())
+            .filter_map(|p| p.agent.as_ref().map(|a| (p.id, a)))
+            .filter(|(_, a)| eligible_state(a, &board_workers))
+            .filter(|(_, a)| a.queued.is_empty())
+            .filter(|(_, a)| !holding.contains(&a.name))
+            .map(|(id, a)| (id, a.name.clone(), a.since))
+            .collect();
+
         // Agents told about the board that have not acted yet. They are about to consume
         // tasks, so they count against the work available — otherwise "one per pass" simply
         // wakes every idle agent over successive passes, which is the waste this is meant to
@@ -212,6 +251,7 @@ impl Engine {
             .session
             .panes
             .values()
+            .filter(|p| p.space == space && p.board)
             .filter_map(|p| p.agent.as_ref())
             .filter(|a| eligible_state(a, &board_workers))
             .filter(|a| a.nudged_since == Some(a.since))
@@ -220,39 +260,37 @@ impl Engine {
         // Never wake more agents than there is work for, but do wake several when there is:
         // five tasks and three idle agents should end up with three agents working.
         if open <= holding.len() + already_told {
-            return Vec::new();
+            return None;
         }
 
         // Whoever has been idle longest is the most available, and picking by `since` rather
         // than by pane id spreads successive tasks across the fleet.
-        let pick = self
-            .session
-            .panes
-            .values()
-            .filter_map(|p| p.agent.as_ref().map(|a| (p.id, a)))
-            .filter(|(_, a)| eligible_state(a, &board_workers))
-            .filter(|(_, a)| a.queued.is_empty())
-            .filter(|(_, a)| !holding.contains(&a.name))
-            .filter(|(_, a)| a.nudged_since != Some(a.since))
-            .min_by_key(|(_, a)| a.since)
-            .map(|(id, a)| (id, a.name.clone(), a.since));
+        let (pane, name, since) = candidates
+            .into_iter()
+            .filter(|(id, _, since)| {
+                self.session
+                    .panes
+                    .get(id)
+                    .and_then(|p| p.agent.as_ref())
+                    .is_some_and(|a| a.nudged_since != Some(*since))
+            })
+            .min_by_key(|(_, _, since)| *since)?;
 
-        let Some((pane, name, since)) = pick else { return Vec::new() };
         // Marked before sending, so a failure cannot produce a nudge loop.
         if let Some(a) = self.session.panes.get_mut(&pane).and_then(|p| p.agent.as_mut()) {
             a.nudged_since = Some(since);
         }
 
         let body = format!(
-            "{open} task{} waiting on the board. Run `horde task claim` to take the next one, \
-             do it, then `horde task done --result \"<what happened>\"`. Repeat while it keeps \
-             returning work.",
+            "{open} task{} waiting on the {space_name} board. Run `horde task claim` to take \
+             the next one, do it, then `horde task done --result \"<what happened>\"`. Repeat \
+             while it keeps returning work.",
             if open == 1 { "" } else { "s" }
         );
         let Engine { bus, session, cfg, .. } = self;
         match bus.send(session, cfg, None, &name, &body, false, false, None) {
-            Ok(m) => vec![Event::BusMessage(m)],
-            Err(_) => Vec::new(),
+            Ok(m) => Some(Event::BusMessage(m)),
+            Err(_) => None,
         }
     }
 }
@@ -267,7 +305,16 @@ pub async fn run_imported(cfg: Config, warnings: Vec<String>) -> Result<()> {
     run_inner(cfg, warnings, true).await
 }
 
-async fn run_inner(cfg: Config, warnings: Vec<String>, importing: bool) -> Result<()> {
+async fn run_inner(cfg: Config, mut warnings: Vec<String>, importing: bool) -> Result<()> {
+    // The daemon inherits its working directory from wherever `horde` was launched, which in the
+    // ordinary case is the project you are about to open panes on. Worth one toast: a repository
+    // on a Windows drive is not broken, only slow enough that horde gets the blame for it.
+    if let Ok(cwd) = std::env::current_dir() {
+        if crate::platform::on_windows_drive(&cwd) {
+            warnings.push(crate::platform::windows_drive_hint(&cwd.display().to_string()));
+        }
+    }
+
     // While importing, the predecessor still owns the real socket path, so bind a staging
     // path and move it into place once it says go.
     let socket = if importing { upgrade::staging_socket() } else { socket_path() };
@@ -292,8 +339,22 @@ async fn run_inner(cfg: Config, warnings: Vec<String>, importing: bool) -> Resul
         ));
     }
 
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("could not bind {}", socket.display()))?;
+    // Annotated rather than pre-empted. A Windows drive is the likeliest reason a bind fails on
+    // an otherwise fine path — those filesystems do not carry the socket type — but "likeliest"
+    // is not "certain", and refusing up front would break anyone whose mount happens to work.
+    // So the check costs nothing until something has already gone wrong, and then it names the
+    // one thing the error message never will.
+    let listener = UnixListener::bind(&socket).map_err(|e| {
+        let base = anyhow!("could not bind {}: {e}", socket.display());
+        if crate::platform::on_windows_drive(&socket) {
+            base.context(
+                "that path is on a Windows drive, which cannot host a unix socket — set \
+                 HORDE_SOCKET to a path under your Linux home, e.g. HORDE_SOCKET=$HOME/.horde.sock",
+            )
+        } else {
+            base
+        }
+    })?;
 
     // Take the handoff socket before anything else can consume descriptor 3.
     let import = if importing {
@@ -406,6 +467,7 @@ async fn engine_loop(
         last_seen: 0,
         last_alert: 0,
         agents,
+        repos: repo::Cache::default(),
         cfg,
         clients: HashMap::new(),
         dirty_shape: true,
@@ -851,6 +913,13 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         }
     }
 
+    // Git state, on detection's cadence but with its own much longer staleness window inside
+    // the cache. Piggybacking on `detect_due` rather than taking a timer of its own keeps the
+    // fork-per-directory work on one clock.
+    if detect_due {
+        refresh_repos(eng);
+    }
+
     // A freshly spawned pane gets looked at on the very next tick rather than waiting out
     // the interval, so a new agent appears in the sidebar immediately.
     if detect_due || eng.detect_soon {
@@ -893,11 +962,10 @@ fn tick(eng: &mut Engine, detect_due: bool) {
     // rather than only on detection passes, because a pane can close without detection
     // having a say.
     //
-    // Parked with the rest of the autonomous half (`tasks::autonomous()`): a task moving state
-    // with nobody asking is the behaviour being reworked. Nothing moves on a paused board
-    // anyway — a claim left behind while it is paused stays claimed, visible in `task list`,
-    // and is sorted out when the board comes back.
-    if tasks::autonomous() && eng.board.claimed_count() > 0 {
+    // Unconditional, unlike the nudge: handing a dead agent's task back is correctness, not
+    // autonomy. Nothing new is started by it, and a claim left behind by a closed pane would
+    // otherwise sit there blocking the task forever.
+    if eng.board.claimed_count() > 0 {
         let live: Vec<String> = eng
             .session
             .panes
@@ -962,6 +1030,25 @@ fn eligible_state(a: &state::AgentRuntime, board_workers: &[String]) -> bool {
     }
 }
 
+/// Re-read the branch and dirty state of every directory the session can show.
+///
+/// Space cwds *and* pane cwds, which are not the same question once worktrees exist: two
+/// agents in one project are on two different branches, and only the pane knows which.
+///
+/// The cache decides for itself what is stale, so calling this often is cheap; what it costs
+/// is bounded by the number of distinct directories, not by how often it is asked.
+fn refresh_repos(eng: &mut Engine) {
+    let mut dirs: Vec<std::path::PathBuf> =
+        eng.session.spaces.iter().map(|s| s.cwd.clone()).collect();
+    dirs.extend(eng.session.panes.values().map(|p| p.cwd.clone()));
+    dirs.sort();
+    dirs.dedup();
+    for d in &dirs {
+        eng.repos.get(d);
+    }
+    eng.repos.retain(|k| dirs.iter().any(|d| d == k));
+}
+
 /// Cheap summary of every agent, so a detection pass can tell whether anything the client
 /// can see has changed — including an agent disappearing, which emits no event.
 fn agent_fingerprint(session: &Session) -> Vec<(PaneId, String, crate::proto::AgentState)> {
@@ -1005,7 +1092,7 @@ fn broadcast(eng: &mut Engine) {
     let cfg = eng.cfg.clone();
     let snapshot = if eng.dirty_shape {
         eng.dirty_shape = false;
-        let mut s = eng.session.snapshot(&cfg);
+        let mut s = eng.session.snapshot(&cfg, &eng.repos);
         s.tasks_open = eng.board.open_count();
         s.tasks_claimed = eng.board.claimed_count();
         s.triggers_armed = if eng.cfg.unattended { eng.triggers.armed_count() } else { 0 };
@@ -1258,6 +1345,7 @@ mod tests {
             last_seen: 0,
             last_alert: 0,
             agents,
+            repos: repo::Cache::default(),
             cfg,
             clients: HashMap::new(),
             dirty_shape: true,
@@ -1302,7 +1390,7 @@ mod tests {
         let cfg = eng.cfg.clone();
         let info = eng
             .session
-            .snapshot(&cfg)
+            .snapshot(&cfg, &eng.repos)
             .panes
             .into_iter()
             .find(|p| p.id == pane)
@@ -1325,6 +1413,7 @@ mod tests {
         eng.session.panes.get_mut(&pane).unwrap().agent = Some(state::AgentRuntime {
             kind: "claude".into(),
             name: "builder".into(),
+            class: Default::default(),
             state: crate::proto::AgentState::Idle,
             since: std::time::Instant::now(),
             authority: "screen".into(),
@@ -1332,6 +1421,7 @@ mod tests {
             seen: false,
             session_id: None,
             queued: Vec::new(),
+            question: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
@@ -1403,9 +1493,12 @@ mod tests {
         }
         for (i, id) in ids.iter().enumerate() {
             let pane = eng.session.panes.get_mut(id).unwrap();
+            // Enlisted, because the nudge only ever speaks to volunteers now.
+            pane.board = true;
             pane.agent = Some(state::AgentRuntime {
                 kind: "claude".into(),
                 name: format!("worker{i}"),
+                class: Default::default(),
                 state: crate::proto::AgentState::Idle,
                 // Staggered, so "idle longest" is well defined.
                 since: std::time::Instant::now() - Duration::from_secs(60 - i as u64),
@@ -1414,6 +1507,7 @@ mod tests {
                 seen: false,
                 session_id: None,
                 queued: Vec::new(),
+                question: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
@@ -1421,6 +1515,18 @@ mod tests {
             });
         }
         eng
+    }
+
+    /// The space these fixtures' panes live in. Board work is scoped to a project, so a test
+    /// that adds an unscoped task is testing that nothing happens.
+    pub(super) fn fixture_space(eng: &Engine) -> String {
+        eng.session.spaces[0].name.clone()
+    }
+
+    /// Add work to the fixture's own project.
+    fn add_task(eng: &mut Engine, text: &str) {
+        let space = fixture_space(eng);
+        eng.board.add(text, "user", Some(&space)).unwrap();
     }
 
     fn nudge_bodies(events: &[Event]) -> Vec<(String, String)> {
@@ -1436,7 +1542,7 @@ mod tests {
     #[test]
     fn an_idle_agent_is_told_when_the_board_has_work() {
         let mut eng = engine_with_idle_agents("told", 1);
-        eng.board.add("write the tests", "user").unwrap();
+        add_task(&mut eng, "write the tests");
         let sent = nudge_bodies(&eng.nudge_for_tasks());
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].0, "worker0");
@@ -1449,7 +1555,7 @@ mod tests {
     fn a_burst_of_tasks_produces_one_nudge_not_one_each() {
         let mut eng = engine_with_idle_agents("burst", 1);
         for i in 0..10 {
-            eng.board.add(&format!("job {i}"), "user").unwrap();
+            add_task(&mut eng, &format!("job {i}"));
         }
         let first = nudge_bodies(&eng.nudge_for_tasks());
         assert_eq!(first.len(), 1);
@@ -1464,11 +1570,107 @@ mod tests {
     #[test]
     fn only_one_agent_is_woken_per_pass() {
         let mut eng = engine_with_idle_agents("one-only", 3);
-        eng.board.add("single job", "user").unwrap();
+        add_task(&mut eng, "single job");
         let sent = nudge_bodies(&eng.nudge_for_tasks());
         assert_eq!(sent.len(), 1, "one task, one agent: {sent:?}");
         // The one idle longest is the most available.
         assert_eq!(sent[0].0, "worker0");
+        kill_all(&mut eng);
+    }
+
+    /// The failure that made the board unusable, pinned.
+    ///
+    /// Work added in one project used to be offered to any idle agent anywhere, because the
+    /// board had no scope and the nudge had none to respect. With two projects open the
+    /// symptom is an agent in the wrong repository suddenly working on something you asked
+    /// for somewhere else.
+    #[test]
+    fn work_in_one_project_is_never_offered_to_an_agent_in_another() {
+        let mut eng = engine_with_idle_agents("scope", 1);
+        let cfg = eng.cfg.clone();
+        // A second project, with an enlisted idle agent of its own.
+        let other = eng.session.create_space(&cfg, Some("elsewhere"), &std::env::temp_dir()).unwrap();
+        let other_pane = *eng
+            .session
+            .panes
+            .values()
+            .find(|p| p.space == other)
+            .map(|p| &p.id)
+            .unwrap();
+        {
+            let p = eng.session.panes.get_mut(&other_pane).unwrap();
+            p.board = true;
+            p.agent = Some(state::AgentRuntime {
+                kind: "claude".into(),
+                name: "stranger".into(),
+                class: Default::default(),
+                state: crate::proto::AgentState::Idle,
+                since: std::time::Instant::now() - Duration::from_secs(600),
+                authority: "hook".into(),
+                reason: "t".into(),
+                seen: false,
+                session_id: None,
+                queued: Vec::new(),
+                question: None,
+                activity: Default::default(),
+                touched: Default::default(),
+                nudged_since: None,
+                alerted_since: None,
+            });
+        }
+
+        // Work for the *first* project only. `stranger` has been idle ten times longer, so
+        // under the old "whoever is idle longest" rule it would have won outright.
+        add_task(&mut eng, "port the parser");
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "worker0", "the other project's agent must not be touched");
+        kill_all(&mut eng);
+    }
+
+    /// The other half of it. An agent you opened to think with, sitting idle in the same
+    /// project as a fleet, never volunteered for anything.
+    #[test]
+    fn an_agent_that_never_enlisted_is_left_alone() {
+        let mut eng = engine_with_idle_agents("enlist", 2);
+        // worker1 resigns; worker0 stays enlisted.
+        let ids: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+        for id in ids {
+            let named_worker1 = eng
+                .session
+                .panes
+                .get(&id)
+                .and_then(|p| p.agent.as_ref())
+                .is_some_and(|a| a.name == "worker1");
+            if named_worker1 {
+                eng.session.panes.get_mut(&id).unwrap().board = false;
+            }
+        }
+        add_task(&mut eng, "one");
+        add_task(&mut eng, "two");
+        add_task(&mut eng, "three");
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "only the volunteer: {sent:?}");
+        assert_eq!(sent[0].0, "worker0");
+        kill_all(&mut eng);
+    }
+
+    /// A week-old task is not work waiting for an agent, it is something you forgot about.
+    /// Offering it on the next restart is how a quiet morning turns into archaeology.
+    #[test]
+    fn a_task_old_enough_to_be_forgotten_stops_being_offered() {
+        let mut eng = engine_with_idle_agents("stale", 1);
+        let space = fixture_space(&eng);
+        eng.board.add("from last week", "user", Some(&space)).unwrap();
+        // Wind it back past the threshold.
+        let id = eng.board.all()[0].id;
+        eng.board.backdate_for_test(id, tasks::STALE_AFTER.as_millis() as u64 + 60_000);
+
+        assert_eq!(eng.board.offered_to(&space), 0, "stale work is not offered");
+        assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
+        // Still on the board, still readable, still claimable by name. Stale is not deleted.
+        assert_eq!(eng.board.open_count(), 1);
+        assert!(eng.board.claim("worker0", Some(id), Some(&space)).unwrap().is_some());
         kill_all(&mut eng);
     }
 
@@ -1478,7 +1680,7 @@ mod tests {
     #[test]
     fn one_task_wakes_one_agent_even_across_many_passes() {
         let mut eng = engine_with_idle_agents("across-passes", 4);
-        eng.board.add("the only job", "user").unwrap();
+        add_task(&mut eng, "the only job");
         let mut total = 0;
         for _ in 0..10 {
             total += nudge_bodies(&eng.nudge_for_tasks()).len();
@@ -1492,7 +1694,7 @@ mod tests {
     fn enough_tasks_for_everyone_wakes_everyone() {
         let mut eng = engine_with_idle_agents("all-busy", 3);
         for i in 0..5 {
-            eng.board.add(&format!("job {i}"), "user").unwrap();
+            add_task(&mut eng, &format!("job {i}"));
         }
         let mut told: Vec<String> = Vec::new();
         for _ in 0..10 {
@@ -1516,7 +1718,7 @@ mod tests {
         {
             a.state = crate::proto::AgentState::Done;
         }
-        eng.board.add("job", "user").unwrap();
+        add_task(&mut eng, "job");
         assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
         kill_all(&mut eng);
     }
@@ -1527,9 +1729,9 @@ mod tests {
     #[test]
     fn a_board_worker_that_finished_while_unfocused_is_given_more() {
         let mut eng = engine_with_idle_agents("done-worker", 1);
-        eng.board.add("first", "user").unwrap();
-        eng.board.add("second", "user").unwrap();
-        eng.board.claim("worker0", Some(1)).unwrap();
+        add_task(&mut eng, "first");
+        add_task(&mut eng, "second");
+        eng.board.claim("worker0", Some(1), None).unwrap();
         eng.board.done("worker0", Some(1), Some("finished")).unwrap();
 
         // It finished unfocused, so detection calls that `done`.
@@ -1545,9 +1747,9 @@ mod tests {
     #[test]
     fn an_agent_already_holding_a_task_is_left_to_it() {
         let mut eng = engine_with_idle_agents("holding", 1);
-        eng.board.add("job one", "user").unwrap();
-        eng.board.add("job two", "user").unwrap();
-        eng.board.claim("worker0", Some(1)).unwrap();
+        add_task(&mut eng, "job one");
+        add_task(&mut eng, "job two");
+        eng.board.claim("worker0", Some(1), None).unwrap();
         assert!(
             nudge_bodies(&eng.nudge_for_tasks()).is_empty(),
             "it has work; a second task can wait for someone free"
@@ -1566,7 +1768,7 @@ mod tests {
     fn nudging_can_be_turned_off() {
         let mut eng = engine_with_idle_agents("off", 1);
         eng.cfg.task_nudge = false;
-        eng.board.add("job", "user").unwrap();
+        add_task(&mut eng, "job");
         assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
         kill_all(&mut eng);
     }
@@ -1576,8 +1778,8 @@ mod tests {
     #[test]
     fn a_new_idle_period_earns_a_fresh_nudge() {
         let mut eng = engine_with_idle_agents("fresh", 1);
-        eng.board.add("job one", "user").unwrap();
-        eng.board.add("job two", "user").unwrap();
+        add_task(&mut eng, "job one");
+        add_task(&mut eng, "job two");
         assert_eq!(nudge_bodies(&eng.nudge_for_tasks()).len(), 1);
 
         // It worked and came back to idle: `since` moves, so it is eligible again.

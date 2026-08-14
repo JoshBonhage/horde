@@ -51,11 +51,8 @@ horde trigger rm 1
 ```
 
 **`--task` and `--to` are both parked.** Either is refused for now, both when you try to add the
-rule and if an older one comes due: the board is paused while it is reworked (see
-`daemon::tasks::ENABLED` and `AUTONOMOUS`), and `--to` routes through the message bus, which is
-paused with it (`daemon::bus::ENABLED`). **`--spawn` is the one action still standing** — it
-starts a program rather than typing at one already running. The rest of this section is how the
-other two behave when the switches go back on.
+rule and if an older one comes due.
+
 
 The work lands on the board, and the nudge that already exists finds whichever agent is free.
 That means a rule never has to know who is idle, and the exclusivity guarantee stays where it
@@ -219,7 +216,9 @@ the audit trail and how the one-in-flight guard finds them again.
 The daemon is the only part of horde still awake while you are away, and it can now say so. Two
 sinks, configured under `[notifications]`:
 
-- `delivery = "system"` — a macOS notification, fired from the daemon.
+- `delivery = "system"` — a desktop notification, fired from the daemon: `osascript` on macOS,
+  `notify-send` on Linux. Under WSL there is no such sink, and horde says so in the log once
+  rather than failing silently — use `command` below.
 - `command = "~/bin/horde-ping"` — your own program, with the summary as `$1` and the full
   `horde digest --json` payload on stdin. This is the whole of horde's reach: Pushover, Telegram,
   ntfy, `mail` are a two-line script you own, which is why there is no HTTP client here and

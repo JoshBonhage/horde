@@ -150,6 +150,20 @@ pub struct Pane {
     pub role: Option<String>,
     /// Held at the top of the sidebar's agent list, whichever space it lives in.
     pub pinned: bool,
+    /// The pane whose agent asked for this one, when an agent started it rather than you.
+    ///
+    /// Distinct from `spawned_by`, which records a *trigger*. Both exist to answer "who is
+    /// responsible for this pane", and they have different answers and different caps: one
+    /// bounds what runs with nobody present, this one bounds what an agent in a loop can do
+    /// while you watch.
+    pub spawned_by_pane: Option<PaneId>,
+    /// This agent has enlisted for board work, so the nudge may tell it about waiting tasks.
+    ///
+    /// Opt-in, and on the *pane* rather than the agent, for the same reason `role` is: an
+    /// agent that goes unrecognised for one detection pass must not quietly resign. Before
+    /// this existed every idle agent counted as a volunteer, which is how work added in one
+    /// project reached an agent you had left thinking in another.
+    pub board: bool,
 
     term: Term<EventProxy>,
     parser: Processor,
@@ -248,6 +262,8 @@ impl Pane {
             spawned_by: None,
             role: None,
             pinned: false,
+            board: false,
+            spawned_by_pane: None,
             term,
             parser: Processor::new(),
             master,
@@ -601,6 +617,8 @@ impl Pane {
                 spawned_by: self.spawned_by,
                 role: self.role.clone(),
                 pinned: self.pinned,
+                board: self.board,
+                spawned_by_pane: self.spawned_by_pane,
                 screen: self.mirror.clone(),
                 pending,
                 cursor_x: cursor.x,
@@ -649,9 +667,14 @@ impl Pane {
             spawned_by: saved.spawned_by,
             role: saved.role.clone(),
             pinned: saved.pinned,
+            board: saved.board,
+            spawned_by_pane: saved.spawned_by_pane,
             agent: saved.agent.as_ref().map(|a| super::state::AgentRuntime {
                 kind: a.kind.clone(),
                 name: a.name.clone(),
+                // Not persisted: the next scan reads it back off the manifest, and guessing
+                // here would outlive a manifest the user has since changed.
+                class: Default::default(),
                 state: a.state,
                 // The clock restarts; the alternative is serialising a monotonic instant,
                 // which is meaningless in another process.
@@ -661,6 +684,7 @@ impl Pane {
                 seen: a.seen,
                 session_id: a.session_id.clone(),
                 queued: a.queued.clone(),
+                question: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
@@ -823,6 +847,40 @@ fn build_command(cmd: &str) -> CommandBuilder {
     }
 }
 
+/// The shell to open a pane with when nothing else says.
+///
+/// `$SHELL` answers this in any session a human started, so the fallback only fires for a daemon
+/// launched with a thin environment — which is precisely where guessing wrong is unrecoverable,
+/// because there is no prompt to report the error to. `/bin/zsh` is the right guess on macOS,
+/// where it is the login default, and the wrong one everywhere else: a stock Ubuntu — including
+/// every WSL distro — does not ship it, and the pane dies with `ENOENT` instead of opening.
+/// `/bin/sh` is the only shell POSIX actually promises, so it is what the guess falls back to.
+///
+/// An empty `$SHELL` is treated as unset. It is not a path, and `CommandBuilder` would fail on
+/// it the same way a missing zsh does.
 pub fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+    match std::env::var("SHELL") {
+        Ok(s) if !s.is_empty() => s,
+        _ if cfg!(target_os = "macos") => "/bin/zsh".to_string(),
+        _ => "/bin/sh".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Whatever this resolves to has to be something the OS can actually exec.
+    ///
+    /// Asserted against the filesystem rather than against a literal, because the bug this
+    /// replaces was not a wrong string — it was a string that named nothing. Deliberately does
+    /// not set `$SHELL`: tests run in parallel and the environment is shared, so this checks
+    /// whichever branch the host lands on, and CI runs one job with `$SHELL` unset to cover the
+    /// fallback that no developer machine ever takes.
+    #[test]
+    fn the_default_shell_is_a_program_that_exists() {
+        let sh = super::default_shell();
+        assert!(
+            std::path::Path::new(&sh).exists(),
+            "default_shell() returned {sh:?}, which is not on this filesystem"
+        );
+    }
 }

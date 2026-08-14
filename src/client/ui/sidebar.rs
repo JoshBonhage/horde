@@ -83,13 +83,6 @@ impl Widget for Sidebar<'_> {
         if let Some((open, claimed)) = self.board {
             match (open, claimed) {
                 (0, 0) => {}
-                // A paused board reported as "3 tasks open" reads as work waiting for an agent,
-                // when in fact nothing can be claimed until it comes back. Both numbers together,
-                // because the distinction between open and claimed stops meaning anything the
-                // moment neither can change.
-                (o, c) if !crate::daemon::tasks::ENABLED => {
-                    summary.push(("◇", o + c, "tasks paused", AgentState::Unknown))
-                }
                 (0, c) => summary.push(("◇", c, "tasks claimed", AgentState::Unknown)),
                 (o, _) => summary.push(("◇", o, "tasks open", AgentState::Unknown)),
             }
@@ -143,10 +136,26 @@ impl Widget for Sidebar<'_> {
                 } else {
                     crate::theme::mix(t.space_accent(space.accent), t.ui.panel_bg, 0.45)
                 };
-                let badge = if space.agent_count > 0 {
-                    space.agent_count.to_string()
-                } else {
-                    String::new()
+                // The branch, and the agent count only where both fit.
+                //
+                // The branch wins the narrow case because the count is already said twice
+                // over — the AGENTS group header below carries a rollup for this same space —
+                // whereas which branch a project is on is said nowhere else, and is the one
+                // thing here that changes without anyone touching horde.
+                //
+                // Budgeted to a third of the panel because `row` pays for the detail out of
+                // the label: an unbounded branch name would eat the project's own name, which
+                // is the one thing on the row that must always be readable.
+                let badge = match (&space.repo, space.agent_count) {
+                    (Some(r), n) if d != Density::Tight => {
+                        let budget = (inner_w as usize / 3).clamp(4, 14);
+                        let dirty = if r.dirty { "*" } else { "" };
+                        let count =
+                            if n > 0 && d == Density::Wide { format!(" {n}") } else { String::new() };
+                        format!("{}{dirty}{count}", truncate(&r.branch, budget))
+                    }
+                    (_, n) if n > 0 => n.to_string(),
+                    _ => String::new(),
                 };
                 row(
                     buf,
@@ -360,6 +369,7 @@ impl Widget for Sidebar<'_> {
                     AgentState::Blocked => t.ui.blocked,
                     AgentState::Done => t.ui.done,
                     AgentState::Working => t.ui.working,
+                    AgentState::Serving => t.ui.serving,
                     _ => t.ui.idle,
                 };
                 put_line(
@@ -530,6 +540,21 @@ fn rule(buf: &mut Buffer, x: u16, y: u16, w: u16, t: &Theme) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The project's own name must survive a long branch. `row` pays for the detail out of
+    /// the label, so an unbudgeted branch is a project called `Hal`.
+    #[test]
+    fn a_long_branch_never_eats_the_project_name() {
+        let mut snap = crate::client::roster::tests::snap();
+        snap.spaces[0].name = "Halo Suite".into();
+        snap.spaces[0].repo = Some(crate::proto::RepoInfo {
+            branch: "horde/a-very-long-branch-name".into(),
+            dirty: true,
+            worktree: false,
+        });
+        let (out, _) = render(&snap, 24, 30);
+        assert!(out.contains("Halo Suite"), "{out}");
+    }
     use super::*;
     use crate::client::roster::tests::{pane, snap};
     use crate::proto::PaneInfo;

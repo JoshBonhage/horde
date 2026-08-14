@@ -371,6 +371,38 @@ mod tests {
         child.kill();
     }
 
+    /// A pane whose program has exited must end its reader, on either kernel's terms.
+    ///
+    /// The two disagree about how a PTY master reports the far end going away. macOS gives a
+    /// zero-length read — ordinary EOF. Linux gives **`EIO`**, an error, once the last slave
+    /// descriptor closes. `spawn_reader` treats both as "stop", but only because `Err(_) => break`
+    /// happens to sit next to `Ok(0) => break`; nothing said that was deliberate, and narrowing
+    /// that arm to specific error kinds — an entirely reasonable-looking tidy-up — would leave
+    /// every exited pane on Linux spinning in a reader that never finishes.
+    ///
+    /// Asserted through the channel rather than the thread: the sender is dropped when the loop
+    /// ends, so a closed channel *is* the reader having stopped.
+    #[test]
+    fn a_dead_child_ends_the_reader_whether_the_kernel_calls_it_eof_or_eio() {
+        let (master, mut child) = open_pty();
+        let mut reader = spawn_reader(&master, "eof".into()).unwrap();
+        child.kill();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match reader.rx.try_recv() {
+                // Closed: the loop broke and dropped the sender, which is the whole assertion.
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                // Still draining whatever the shell wrote on its way out.
+                _ => assert!(
+                    Instant::now() < deadline,
+                    "the reader outlived its child — an exited pane would never be reaped"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn pausing_the_reader_is_acknowledged_and_stops_consuming() {
         let (master, mut child) = open_pty();

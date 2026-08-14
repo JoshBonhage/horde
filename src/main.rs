@@ -11,6 +11,7 @@ mod client;
 mod config;
 mod daemon;
 mod framing;
+mod platform;
 mod proto;
 mod theme;
 

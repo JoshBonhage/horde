@@ -135,6 +135,8 @@ struct RawAgents {
     force_inject: Option<bool>,
     /// Tell an idle agent when work is waiting on the task board.
     task_nudge: Option<bool>,
+    /// Live panes agents may have started between them.
+    max_fleet: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -192,6 +194,14 @@ pub struct Config {
     pub force_inject: bool,
     /// Tell an idle agent when the board has work. Parked: see `daemon::tasks::AUTONOMOUS`.
     pub task_nudge: bool,
+    /// How many live panes agents may have started between them.
+    ///
+    /// Separate from `triggers.max_spawned`, which bounds what horde starts with nobody
+    /// present. This bounds what an agent starts while you are sitting there, which is a
+    /// different risk: not "is anyone watching" but "an agent in a loop opens panes until the
+    /// machine gives up". A lead agent building a fleet is the intended use, so the number is
+    /// a working team rather than a token allowance.
+    pub max_fleet: usize,
     /// Whether triggers may fire at all. Off by default: acting with nobody watching is a
     /// different promise from running side by side, and has to be asked for.
     pub unattended: bool,
@@ -291,6 +301,7 @@ impl Default for Config {
             // Off while the board's autonomous half is parked; see `daemon::tasks::AUTONOMOUS`.
             // Turning it on in config.toml does nothing until that switch is back too.
             task_nudge: false,
+            max_fleet: 6,
             unattended: false,
             max_spawned: 2,
             notify: Notify::Horde,
@@ -416,6 +427,7 @@ impl Config {
         cfg.detection_lines = raw.agents.detection_lines.unwrap_or(cfg.detection_lines).clamp(5, 200);
         cfg.force_inject = raw.agents.force_inject.unwrap_or(cfg.force_inject);
         cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
+        cfg.max_fleet = raw.agents.max_fleet.unwrap_or(cfg.max_fleet);
         cfg.unattended = raw.triggers.unattended.unwrap_or(cfg.unattended);
         // Clamped rather than trusted: this bounds how many full-permission agents can run
         // unwatched, and a typo'd 200 should not be taken at face value.
@@ -623,6 +635,8 @@ pub enum Action {
     TogglePin,
     /// Open the full-screen roster.
     Roster,
+    /// Open the approval queue: every agent blocked on a decision, in one list.
+    Approvals,
     /// Step the agent list's filter.
     CycleLens,
 }
@@ -686,6 +700,9 @@ impl Default for Keymap {
             ("sidebar_focus", Trigger::Prefix(d("E")), Action::SidebarFocus),
             ("toggle_pin", Trigger::Prefix(d("P")), Action::TogglePin),
             ("roster", Trigger::Prefix(d("o")), Action::Roster),
+            // Next to `a`, which jumps to the next agent that needs you. Lower case goes to
+            // one of them, upper case shows you all of them at once.
+            ("approvals", Trigger::Prefix(d("A")), Action::Approvals),
             ("cycle_lens", Trigger::Prefix(d("f")), Action::CycleLens),
             ("toggle_bus", Trigger::Prefix(d("b")), Action::Cmd(ToggleBus)),
             ("jump_attention", Trigger::Prefix(d("a")), Action::Cmd(JumpAttention)),

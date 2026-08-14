@@ -75,6 +75,7 @@ pub struct Roll {
     pub working: usize,
     pub done: usize,
     pub idle: usize,
+    pub serving: usize,
 }
 
 impl Roll {
@@ -84,22 +85,24 @@ impl Roll {
             AgentState::Working => self.working += 1,
             AgentState::Done => self.done += 1,
             AgentState::Idle => self.idle += 1,
+            AgentState::Serving => self.serving += 1,
             AgentState::Unknown => {}
         }
     }
 
     /// The non-zero counts, in urgency order, with the state each belongs to.
     ///
-    /// Urgency order — blocked, working, done, idle — matches the status bar's own count
-    /// ordering. It matters here because `Density` truncates this list, so the order decides
-    /// what survives a narrow panel: what you might have to act on, never what is merely
-    /// resting.
+    /// Urgency order — blocked, working, done, idle, serving — matches the status bar's own
+    /// count ordering. It matters here because `Density` truncates this list, so the order
+    /// decides what survives a narrow panel: what you might have to act on, never what is
+    /// merely resting, and least of all a dev server doing exactly what it always does.
     pub fn parts(&self) -> Vec<(AgentState, usize)> {
         [
             (AgentState::Blocked, self.blocked),
             (AgentState::Working, self.working),
             (AgentState::Done, self.done),
             (AgentState::Idle, self.idle),
+            (AgentState::Serving, self.serving),
         ]
         .into_iter()
         .filter(|(_, n)| *n > 0)
@@ -488,11 +491,13 @@ pub mod tests {
             agent: agent.map(|(n, s)| AgentInfo {
                 kind: "claude".into(),
                 name: n.into(),
+                class: Default::default(),
                 state: s,
                 elapsed: 138,
                 authority: "hook".into(),
                 reason: "t".into(),
                 activity: Default::default(),
+                question: None,
             }),
             spawned_by: None,
             exited: false,
@@ -501,6 +506,8 @@ pub mod tests {
             bracketed_paste: false,
             role: None,
             pinned: false,
+            board: false,
+            repo: None,
         }
     }
 
@@ -526,6 +533,7 @@ pub mod tests {
                     attention_count: 1,
                     accent: 0,
                     collapsed: false,
+                    repo: None,
                 },
                 SpaceInfo {
                     id: 2,
@@ -537,6 +545,7 @@ pub mod tests {
                     attention_count: 0,
                     accent: 1,
                     collapsed: false,
+                    repo: None,
                 },
             ],
             tabs: vec![
@@ -575,7 +584,7 @@ pub mod tests {
     fn a_group_header_rolls_up_the_states_of_its_agents() {
         let rows = filtered_rows(&snap(), Density::Normal, &Lens::All);
         let RowKind::Group { roll, .. } = rows[0].kind else { panic!("{:?}", rows[0]) };
-        assert_eq!(roll, Roll { blocked: 1, working: 1, done: 0, idle: 0 });
+        assert_eq!(roll, Roll { blocked: 1, working: 1, done: 0, idle: 0, serving: 0 });
     }
 
     /// A space with no agents already appears in SPACES; a second empty row here would spend
@@ -614,7 +623,7 @@ pub mod tests {
 
     #[test]
     fn the_rollup_orders_counts_by_urgency_and_a_tight_panel_keeps_the_first() {
-        let roll = Roll { blocked: 1, working: 2, done: 3, idle: 4 };
+        let roll = Roll { blocked: 1, working: 2, done: 3, idle: 4, serving: 0 };
         let order: Vec<AgentState> = roll.parts().into_iter().map(|(s, _)| s).collect();
         assert_eq!(
             order,
@@ -630,7 +639,7 @@ pub mod tests {
     /// that grew with its group would push the space name out of a panel that has none spare.
     #[test]
     fn a_large_count_is_abbreviated_rather_than_widening_the_header() {
-        let roll = Roll { blocked: 12, working: 40, done: 0, idle: 0 };
+        let roll = Roll { blocked: 12, working: 40, done: 0, idle: 0, serving: 0 };
         let parts = roll.compact(Density::Normal);
         assert_eq!(parts[0].1, "9+");
         assert_eq!(parts[1].1, "9+");
@@ -696,7 +705,7 @@ pub mod tests {
         s.spaces[0].collapsed = true;
         let rows = filtered_rows(&s, Density::Normal, &Lens::All);
         let RowKind::Group { roll, .. } = rows[0].kind else { panic!() };
-        assert_eq!(roll, Roll { blocked: 1, working: 1, done: 0, idle: 0 });
+        assert_eq!(roll, Roll { blocked: 1, working: 1, done: 0, idle: 0, serving: 0 });
     }
 
     #[test]
@@ -729,7 +738,7 @@ pub mod tests {
             .expect("api-refactor still has a header");
         assert_eq!(
             g,
-            Roll { blocked: 1, working: 1, done: 0, idle: 0 },
+            Roll { blocked: 1, working: 1, done: 0, idle: 0, serving: 0 },
             "the rollup counts the pinned agent too"
         );
     }
@@ -945,7 +954,7 @@ pub mod tests {
     /// roster has thirty-odd and gets words.
     #[test]
     fn the_rollup_has_a_prose_form_for_where_there_is_room() {
-        let r = Roll { blocked: 1, working: 2, done: 0, idle: 0 };
+        let r = Roll { blocked: 1, working: 2, done: 0, idle: 0, serving: 0 };
         assert_eq!(r.prose(), "1 needs you · 2 working");
         assert_eq!(Roll::default().prose(), "no agents");
     }

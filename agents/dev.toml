@@ -1,0 +1,96 @@
+# Dev servers, watchers and tunnels: the long-running processes a project needs up.
+#
+# `class = "service"` is the whole point of this manifest. horde treats a service as
+# something that runs rather than something you talk to: it never becomes `done`, it is
+# never handed board work, and it is counted separately from the agents so three panes of
+# `npm run dev` cannot make a quiet session read as a busy one.
+#
+# Its states are `serving` and `blocked`, and nothing else. `working` is deliberately absent:
+# a compile that takes 300ms cannot be seen by a detector that looks every 640ms, so a
+# "compiling" state would be a flicker you cannot read rather than a signal you can.
+
+name = "dev"
+class = "service"
+
+# Foreground process names. These are the launchers people actually start dev servers with —
+# deliberately not `node`, `npx`, `deno` or `python`, which run anything at all and would
+# claim a pane on no evidence.
+#
+# `ps` reports what the process calls itself, and node tooling rewrites its own title: a Next
+# dev server shows up as `npm run dev`, so matching is against the first word.
+processes = [
+  # package managers running a script
+  "npm", "pnpm", "yarn", "bun",
+  # bundlers and dev servers that run under their own name
+  "vite", "next", "next-server", "nuxt", "astro", "remix", "parcel", "rollup", "esbuild",
+  "webpack", "webpack-dev-server", "turbo", "tsc", "ng", "expo", "metro", "storybook",
+  # watchers and reloaders
+  "nodemon", "watchexec", "watchman", "air", "entr",
+  # other ecosystems
+  "rails", "puma", "uvicorn", "gunicorn", "hugo", "jekyll", "mix", "sbt", "wrangler",
+  # tunnels, which are the same shape of thing: up until you stop them
+  "ngrok", "cloudflared", "localtunnel",
+]
+
+# Screen patterns, for a dev server started some way the process list does not name. Reached
+# only after every agent manifest has failed on both process and screen, so a pane that looks
+# like an agent is never taken for a server on the strength of a log line.
+detect = [
+  'Local:\s+https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)',
+  'ready in \d+',
+  'listening on (port )?\d+',
+  'server running at',
+  'webpack compiled',
+  'watching for file changes',
+  'started server on',
+]
+
+# --- what needs you --------------------------------------------------------------------
+#
+# A service earns `blocked` on the two failures you have to go and fix by hand. Everything
+# else it prints is traffic, and traffic is not news.
+
+# The port is taken, usually by the copy of this server you forgot was running. Scanned over a
+# wide region: this is printed once at startup and then never again, so a few page loads would
+# push it out of a narrow one, and the server is just as dead ten lines later.
+[[rules]]
+id = "port_in_use"
+state = "blocked"
+priority = 900
+region = "bottom_non_empty_lines(20)"
+any = [
+  { contains = ["eaddrinuse"] },
+  { contains = ["address already in use"] },
+  { contains = ["port is already in use"] },
+]
+
+# The build is broken. Narrow region on purpose: the next successful compile prints over it,
+# and a rule that kept firing from scrollback would leave the pane red after you fixed it.
+[[rules]]
+id = "build_failed"
+state = "blocked"
+priority = 800
+region = "bottom_non_empty_lines(6)"
+any = [
+  { contains = ["failed to compile"] },
+  { contains = ["build failed"] },
+  { contains = ["compilation failed"] },
+  { contains = ["module not found"] },
+]
+
+# --- up --------------------------------------------------------------------------------
+#
+# Not strictly needed — a service with no matching rule rests at `serving` — but it makes
+# `horde agent explain` say *why* rather than "no rule matched", which is the difference
+# between a manifest you can debug and one you have to guess at.
+[[rules]]
+id = "listening"
+state = "serving"
+priority = 500
+region = "whole_recent"
+any = [
+  { contains = ["localhost:"] },
+  { contains = ["ready in"] },
+  { contains = ["listening on"] },
+  { contains = ["compiled"] },
+]

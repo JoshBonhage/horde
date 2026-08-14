@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -174,6 +174,14 @@ pub enum AgentState {
     Done,
     Idle,
     Unknown,
+    /// A long-running process that is up and holding: a dev server, a watcher, a tunnel.
+    ///
+    /// Deliberately not `working`. Both mean "busy", but they mean opposite things to a
+    /// person reading the sidebar: `working` is a turn that will end and produce something,
+    /// and its count is how much of your fleet is mid-thought. A dev server is never going
+    /// to finish, so counting it there is how three panes of `npm run dev` make a quiet
+    /// session look busy. Appended rather than inserted — see `cmd_variants_are_append_only`.
+    Serving,
 }
 
 impl AgentState {
@@ -186,6 +194,9 @@ impl AgentState {
             AgentState::Done => "●",
             AgentState::Idle => "○",
             AgentState::Unknown => "◌",
+            // A diamond rather than another circle: the circles are one agent's turn moving
+            // through its states, and a service is not in that cycle at all.
+            AgentState::Serving => "◆",
         }
     }
 
@@ -196,6 +207,7 @@ impl AgentState {
             AgentState::Done => "done",
             AgentState::Idle => "idle",
             AgentState::Unknown => "unknown",
+            AgentState::Serving => "serving",
         }
     }
 
@@ -203,6 +215,57 @@ impl AgentState {
     pub fn needs_attention(&self) -> bool {
         matches!(self, AgentState::Blocked | AgentState::Done)
     }
+}
+
+/// What git says about a pane's directory, or a project's.
+///
+/// Present only when the directory is a repository. The client never sees a path, so
+/// `worktree` has to be decided daemon-side: it is the difference between "this agent is
+/// isolated" and "this agent is editing the same files as its neighbour".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoInfo {
+    pub branch: String,
+    /// Tracked files differ from HEAD. Untracked files do not count, or a build directory
+    /// would leave every project permanently marked.
+    pub dirty: bool,
+    /// One of horde's own agent worktrees, made by `horde spawn --worktree`.
+    pub worktree: bool,
+}
+
+/// A question a blocked agent is waiting on, lifted off its screen.
+///
+/// On the wire because only the daemon can see it: the client renders the panes in the
+/// focused tab and nothing else, so the six agents blocked in other tabs are exactly the ones
+/// it could never read for itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub text: String,
+    /// What can be pressed to answer, in the order the agent listed them.
+    pub options: Vec<Choice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    /// The key that picks it: a digit for a menu, `y`/`n` for a plain prompt.
+    pub key: String,
+    pub label: String,
+}
+
+/// What kind of thing horde recognised in a pane.
+///
+/// The states are shared — a dev server that cannot bind its port is `blocked` in exactly the
+/// sense an agent waiting on a permission prompt is — but almost everything horde does *with*
+/// an agent (deliver a bus message, hand it board work, derive `done` from a finish it did not
+/// watch) is meaningless for a service, so the two have to be distinguishable at the point
+/// those decisions are made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentClass {
+    /// Something you can talk to and give work to.
+    #[default]
+    Agent,
+    /// Something that runs until you stop it: `npm run dev`, `vite`, a watcher, a tunnel.
+    Service,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +303,19 @@ pub struct PaneInfo {
     /// Held at the top of the sidebar's agent list, whichever space it lives in.
     #[serde(default)]
     pub pinned: bool,
+    /// This agent takes work from its project's board, so the nudge may interrupt it.
+    ///
+    /// On the wire because "why did that agent start doing something" has to be answerable
+    /// from the UI. An agent that is not enlisted is never told about the board at all.
+    #[serde(default)]
+    pub board: bool,
+    /// The branch this pane's directory is on, when it is in a repository at all.
+    ///
+    /// Per pane rather than only per space, because that is the whole point of a worktree:
+    /// two agents in one project are on two different branches, and a project-level answer
+    /// would report the main tree's branch for both of them.
+    #[serde(default)]
+    pub repo: Option<RepoInfo>,
 }
 
 /// What an agent has actually been doing, counted from its lifecycle hooks.
@@ -286,6 +362,9 @@ pub struct AgentInfo {
     pub kind: String,
     /// Addressable name used by `horde send`. Defaults to the kind, uniquified.
     pub name: String,
+    /// Whether this is something you talk to or something that just runs.
+    #[serde(default)]
+    pub class: AgentClass,
     pub state: AgentState,
     /// Seconds in the current state.
     pub elapsed: u64,
@@ -296,6 +375,9 @@ pub struct AgentInfo {
     /// Counted from lifecycle hooks; empty when no integration is installed.
     #[serde(default)]
     pub activity: Activity,
+    /// What it is waiting on, when it is blocked and the prompt could be read.
+    #[serde(default)]
+    pub question: Option<Question>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +410,10 @@ pub struct SpaceInfo {
     /// The sidebar folds this space's agents away.
     #[serde(default)]
     pub collapsed: bool,
+    /// What git says about the project directory. The main tree's branch, which is a
+    /// different question from what any one agent is working on: see `PaneInfo::repo`.
+    #[serde(default)]
+    pub repo: Option<RepoInfo>,
 }
 
 /// Everything the client needs to draw a frame apart from cell contents.
@@ -801,6 +887,6 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 3, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 7, "bump this whenever a wire struct or enum changes");
     }
 }

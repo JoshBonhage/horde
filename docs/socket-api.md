@@ -139,15 +139,10 @@ Spawns or closes panes to match the preset's pane count.
 |---|---|---|
 | `agent.list` (alias `roster`) | — | every agent, ordered as the sidebar shows them |
 | `agent.explain` | `pane?` | the detection snapshot and which rule fired |
-| `agent.spawn` | `cmd?`, `name?`, `split?` | `cmd` defaults to `claude` |
+| `agent.spawn` | `cmd?`, `name?`, `split?`, `role?`, `worktree?`, `board?`, `task?`, `from?` | `cmd` defaults to `claude`. `worktree` is `true` (name it after the agent) or a name. `from` is the calling pane, and a spawn from one counts against `agents.max_fleet` |
 | `agent.wait` | — | **not implemented server-side.** Waiting would stall the single-threaded engine, so the CLI's `horde wait` polls `agent.list` instead. Calling it returns an error saying so. |
 
 ### Bus
-
-**Paused.** Every method here except `bus.tail` and `bus.reply_for` currently answers
-`failed: the message bus is paused while it is reworked`. Both exceptions only read the log —
-neither can put text into a pane, which is the thing being paused. The table is what they do
-when it is back on.
 
 | Method | Params | Notes |
 |---|---|---|
@@ -162,16 +157,18 @@ when it is back on.
 
 ### Tasks
 
-**Paused.** Every method here except `task.list` currently answers `failed: the task board is
-paused while it is reworked`. The table is what they do when it is back on.
+Every task belongs to a project, taken from the calling pane's space unless `space` says
+otherwise. `task.claim` without an id only ever returns work from the caller's own project.
 
 | Method | Params | Notes |
 |---|---|---|
-| `task.add` | `text`, `from?` | returns the new `Task` |
-| `task.claim` | `from?`, `task?` | omit `task` to take the oldest open one |
+| `task.add` | `text`, `from?`, `space?` | returns the new `Task`. `space` defaults to the caller's |
+| `task.work` | `from?`, `on?` | enlist this pane for board work. Nothing is offered to a pane that has not |
+| `task.claim` | `from?`, `task?` | omit `task` to take the oldest open one **in this project** |
+| `task.clear` | `from?`, `everywhere?`, `claimed?` | drop this project's open tasks |
 | `task.done` | `from?`, `task?`, `result?` | omit `task` to finish the one you hold |
 | `task.release` | `task`, `drop?` | back on the board, or abandoned |
-| `task.list` | — | every task, including finished ones |
+| `task.list` | `from?`, `everywhere?` | this project's tasks, including finished ones |
 
 `task.claim` returns `null` — not an error — when the board is empty, so a worker loop can
 tell "no work" from "broken". Claiming a specific task that someone else already holds *is*

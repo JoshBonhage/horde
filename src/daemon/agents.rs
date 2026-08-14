@@ -12,11 +12,10 @@
 //! at it is `done` until you do look, which is what makes the sidebar worth glancing at.
 
 use std::collections::HashMap;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::proto::{AgentState, Event, PaneId};
+use crate::proto::{AgentClass, AgentState, Event, PaneId};
 
 use super::manifest::{self, Manifest, Screen, Verdict};
 use super::state::{AgentRuntime, Session};
@@ -103,6 +102,9 @@ impl Detector {
         let agent = pane_ref.agent.get_or_insert_with(|| AgentRuntime {
             name: unique_name(&kind, &names),
             kind: kind.clone(),
+            // Only an agent has lifecycle hooks to report through, so a pane that reports is
+            // one by definition.
+            class: AgentClass::Agent,
             state,
             since: Instant::now(),
             authority: "hook".into(),
@@ -110,6 +112,7 @@ impl Detector {
             seen: focused,
             session_id: None,
             queued: Vec::new(),
+            question: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
@@ -120,6 +123,7 @@ impl Detector {
         }
         agent.authority = "hook".into();
         agent.reason = "reported by integration".into();
+        agent.class = AgentClass::Agent;
         apply_transition(agent, state, focused)
             .map(|(from, to)| Event::AgentStateChanged { pane, name: agent.name.clone(), from, to })
     }
@@ -226,6 +230,7 @@ impl Detector {
 
             let names = self.taken_names(session, id);
             let is_focused = focused == Some(id);
+            let class = self.class_of(&kind);
             let Some(pane) = session.panes.get_mut(&id) else { continue };
 
             // An explicit pane name is what the user asked to address this agent by, so it
@@ -236,6 +241,7 @@ impl Detector {
             let agent = pane.agent.get_or_insert_with(|| AgentRuntime {
                 name: explicit.clone().unwrap_or(auto),
                 kind: kind.clone(),
+                class,
                 state: AgentState::Unknown,
                 since: Instant::now(),
                 authority: if hook_fresh { "hook".into() } else { "screen".into() },
@@ -243,6 +249,7 @@ impl Detector {
                 seen: is_focused,
                 session_id: None,
                 queued: Vec::new(),
+                question: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
@@ -254,6 +261,7 @@ impl Detector {
                 agent.kind = kind.clone();
                 agent.name = explicit.clone().unwrap_or_else(|| unique_name(&kind, &names));
             }
+            agent.class = class;
             // A later `horde pane rename` re-addresses the agent too.
             if let Some(name) = explicit {
                 if agent.name != name {
@@ -275,35 +283,62 @@ impl Detector {
             } else {
                 agent.authority = "hook".into();
             }
+
+            // What it is waiting on, while it is waiting. After the transition, not before:
+            // the tick an agent *becomes* blocked is the tick its prompt appears, and reading
+            // the old state here would leave the queue one scan behind the screen.
+            //
+            // Read here rather than on demand because this is the one place holding both the
+            // screen and the state. By the time a snapshot is built the lines are gone, and
+            // re-reading them per client would parse the same screen once per attached client
+            // per frame.
+            //
+            // Cleared for every other state, so a question can never outlive the prompt that
+            // asked it — answering a question the agent has moved past is the one failure
+            // this feature could cause that reading the pane by hand could not.
+            agent.question = match agent.state {
+                AgentState::Blocked => super::question::extract(&lines),
+                _ => None,
+            };
         }
 
         events
     }
 
-    /// Work out which agent is in a pane, in order of how much the signal can be trusted.
+    /// Work out what is in a pane, in order of how much the signal can be trusted.
     ///
-    /// 1. the foreground process name — a definite answer from `ps`
+    /// 1. an agent's foreground process name — a definite answer from `ps`
     /// 2. the command the pane was started with — what we were asked to run
-    /// 3. screen patterns — a guess, and the only ambiguous one
+    /// 3. an agent's screen patterns — a guess, and the only ambiguous one
+    /// 4. a service's process name, then its screen patterns
     ///
     /// The order matters and the iteration is sorted, because several agents share phrases
     /// in their UIs. Letting a screen guess outrank `ps`, or letting HashMap order pick
     /// between two matching manifests, is how a Claude pane ends up labelled `codex` on one
     /// scan and `gemini` on the next.
-    fn identify(
-        &self,
-        process: Option<&str>,
-        cmd: Option<&str>,
-        screen: &str,
-    ) -> Option<String> {
+    ///
+    /// Services come last, after even an agent's screen guess, because a service manifest
+    /// names launchers rather than programs: `npm` and `bun` run whatever you ask them to,
+    /// including an agent. "A service is what a pane is when it is not an agent" costs
+    /// nothing — a dev server has never matched an agent's `detect` patterns — and it means
+    /// a broad process list can never quietly relabel something you were talking to.
+    fn identify(&self, process: Option<&str>, cmd: Option<&str>, screen: &str) -> Option<String> {
         let mut names: Vec<&String> = self.manifests.keys().collect();
         names.sort();
+        let of_class = |c: AgentClass| -> Vec<&String> {
+            names.iter().copied().filter(|n| self.manifests[*n].class == c).collect()
+        };
+        let agents = of_class(AgentClass::Agent);
 
-        for n in &names {
+        for n in &agents {
             if self.manifests[*n].matches_process(process) {
                 return Some((*n).clone());
             }
         }
+        // Before the shell guard, because this tier is not a guess: it is the command horde
+        // was asked to run in this pane. A dev script that is itself a shell script reports
+        // as `sh` in the foreground, and `horde spawn --cmd "npm run dev"` should still be a
+        // dev server rather than nothing at all.
         if let Some(cmd) = cmd {
             if let Some(n) = names.iter().find(|n| n.as_str() == cmd) {
                 return Some((*n).clone());
@@ -314,12 +349,35 @@ impl Detector {
                 }
             }
         }
-        for n in &names {
+        // Everything below this line is inference from what is on screen, and a shell prompt
+        // is where that inference goes wrong: the pane is showing you scrollback, not a
+        // running program. See `manifest::is_shell`.
+        if manifest::is_shell(process) {
+            return None;
+        }
+        for n in &agents {
+            if self.manifests[*n].matches_screen(screen) {
+                return Some((*n).clone());
+            }
+        }
+        let services = of_class(AgentClass::Service);
+        for n in &services {
+            if self.manifests[*n].matches_process(process) {
+                return Some((*n).clone());
+            }
+        }
+        for n in &services {
             if self.manifests[*n].matches_screen(screen) {
                 return Some((*n).clone());
             }
         }
         None
+    }
+
+    /// What class of thing a manifest name describes. An unknown name is an agent: that is
+    /// what every manifest was before services existed.
+    fn class_of(&self, kind: &str) -> AgentClass {
+        self.manifests.get(kind).map(|m| m.class).unwrap_or_default()
     }
 
     /// Names already in use, excluding `except` so a pane does not collide with itself.
@@ -393,6 +451,7 @@ impl Detector {
             "current": p.agent.as_ref().map(|a| serde_json::json!({
                 "kind": a.kind,
                 "name": a.name,
+                "class": a.class,
                 "state": a.state.label(),
                 "reason": a.reason,
                 "seen": a.seen,
@@ -414,10 +473,12 @@ fn apply_transition(
     focused: bool,
 ) -> Option<(AgentState, AgentState)> {
     // Finishing while unobserved is what `done` means. If you are already looking at the
-    // pane there is nothing to flag, so it goes straight to idle.
+    // pane there is nothing to flag, so it goes straight to idle. A service has no finish to
+    // flag — it stops when you stop it, and that is a pane exiting, not a result to read.
     let resolved = if next == AgentState::Idle
         && agent.state == AgentState::Working
         && !focused
+        && agent.class == AgentClass::Agent
     {
         AgentState::Done
     } else {
@@ -459,17 +520,11 @@ fn unique_name(kind: &str, taken: &[String]) -> String {
 }
 
 /// Name of the process leading a process group.
+///
+/// The routes differ per kernel and the choice between them is a platform question, so it lives
+/// in [`crate::platform::process_name`] with the rest of them.
 fn process_name(pgid: i32) -> Option<String> {
-    let out = Command::new("ps").args(["-o", "comm=", "-p", &pgid.to_string()]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    crate::platform::process_name(pgid)
 }
 
 #[cfg(test)]
@@ -480,6 +535,7 @@ mod tests {
         AgentRuntime {
             kind: "claude".into(),
             name: "claude".into(),
+            class: AgentClass::Agent,
             state,
             since: Instant::now(),
             authority: "screen".into(),
@@ -487,6 +543,7 @@ mod tests {
             seen,
             session_id: None,
             queued: Vec::new(),
+            question: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
@@ -578,5 +635,74 @@ mod tests {
         let d = Detector::new(&cfg);
         assert!(d.manifest_names().contains(&"claude".to_string()));
         assert!(d.warnings.is_empty(), "{:?}", d.warnings);
+    }
+
+    /// Bundled manifests only, so a stray override in the developer's own config directory
+    /// cannot change what these tests mean.
+    fn bundled() -> Detector {
+        let (manifests, warnings) = manifest::load_all(std::path::Path::new("/nonexistent"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        Detector {
+            manifests,
+            warnings,
+            processes: HashMap::new(),
+            hook_reports: HashMap::new(),
+            hook_kinds: HashMap::new(),
+            last_process_probe: None,
+        }
+    }
+
+    /// The bug this guard exists for: a shell that has merely *mentioned* an agent kept
+    /// matching its `detect` patterns, so a plain terminal sat in the roster as a live agent
+    /// forever — one that could then be handed board work it would never do.
+    #[test]
+    fn a_shell_prompt_is_not_an_agent_however_much_scrollback_mentions_one() {
+        let d = bundled();
+        let scrollback = "❯ gh pr view 41\n  🤖 Generated with Claude Code\n\
+                          ❯ ";
+        assert_eq!(d.identify(Some("/bin/zsh"), Some("zsh"), scrollback), None);
+        // The same screen with the agent actually in the foreground is still the agent.
+        assert_eq!(d.identify(Some("claude"), Some("zsh"), scrollback).as_deref(), Some("claude"));
+    }
+
+    /// The guard is on inference, not on everything: `--cmd "npm run dev"` is a fact about
+    /// the pane, and a dev script that happens to be a shell script must not vanish because
+    /// `ps` says `sh`.
+    #[test]
+    fn what_the_pane_was_asked_to_run_survives_the_shell_guard() {
+        let d = bundled();
+        assert_eq!(d.identify(Some("/bin/sh"), Some("npm"), "").as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn a_dev_server_is_recognised_as_a_service() {
+        let d = bundled();
+        assert_eq!(d.identify(Some("npm run dev"), Some("zsh"), "").as_deref(), Some("dev"));
+        assert_eq!(d.class_of("dev"), AgentClass::Service);
+        assert_eq!(d.class_of("claude"), AgentClass::Agent);
+        // And an unknown kind is an agent, which is what every manifest was before services.
+        assert_eq!(d.class_of("something-else"), AgentClass::Agent);
+    }
+
+    /// A service manifest names launchers, and a launcher runs anything you ask it to. So a
+    /// pane that looks like an agent stays that agent even when `ps` says `npm` — otherwise a
+    /// broad process list could quietly relabel the thing you were talking to.
+    #[test]
+    fn an_agent_on_screen_outranks_a_launcher_in_the_foreground() {
+        let d = bundled();
+        let screen = "Claude Code\n? for shortcuts";
+        assert_eq!(d.identify(Some("npm"), None, screen).as_deref(), Some("claude"));
+    }
+
+    /// A dev server has no finish to report: `done` is "you have not read this yet", and
+    /// nobody is going to read a page-load log.
+    #[test]
+    fn a_service_never_derives_done() {
+        let mut a = agent(AgentState::Working, false);
+        a.class = AgentClass::Service;
+        assert_eq!(
+            apply_transition(&mut a, AgentState::Idle, false),
+            Some((AgentState::Working, AgentState::Idle))
+        );
     }
 }
