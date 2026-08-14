@@ -150,6 +150,11 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             // not — which looks like triggers firing at random rather than like a wrong clock.
             // Printing it is the cheapest way for that to be noticed before it matters.
             "local_time": super::triggers::local_clock(super::now_millis()),
+            // Three descriptors per pane, and `horde upgrade` briefly needs one more each. When
+            // that fails it fails as `Too many open files` during a handoff, with the process
+            // that could have been measured already gone — so the number is reported while
+            // things are working, not looked for afterwards.
+            "open_files": crate::platform::file_limit(),
         })),
 
         // -- session -----------------------------------------------------

@@ -306,6 +306,17 @@ pub async fn run_imported(cfg: Config, warnings: Vec<String>) -> Result<()> {
 }
 
 async fn run_inner(cfg: Config, mut warnings: Vec<String>, importing: bool) -> Result<()> {
+    // Before anything opens a descriptor. A daemon that inherits macOS's 256 runs a session
+    // fine and then dies during `horde upgrade`, which needs a dup per pane simultaneously —
+    // failing the one operation whose whole promise is that it is safe.
+    let (before, after) = crate::platform::raise_file_limit();
+    log_line(&format!("open file limit: {before} -> {after}"));
+    if after < 512 {
+        warnings.push(format!(
+            "this system caps horde at {after} open files; a large session may fail to upgrade"
+        ));
+    }
+
     // The daemon inherits its working directory from wherever `horde` was launched, which in the
     // ordinary case is the project you are about to open panes on. Worth one toast: a repository
     // on a Windows drive is not broken, only slow enough that horde gets the blame for it.

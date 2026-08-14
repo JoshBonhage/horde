@@ -196,6 +196,70 @@ fn base64(data: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+/// What horde asks for, when the hard limit allows it.
+///
+/// Each pane costs three descriptors — the pty master, a dup for the writer, a dup for the
+/// reader thread — plus one per attached client, the socket, and the append logs. A large
+/// session is therefore in the low hundreds, and `horde upgrade` briefly *doubles* the pane
+/// share because the handoff dups every master before sending any of them. Asking for far more
+/// than needed costs nothing; a descriptor limit is a ceiling, not an allocation.
+const WANT_FILES: u64 = 16_384;
+
+/// Raise this process's open-file limit, returning `(before, after)`.
+///
+/// macOS launches processes with a soft limit of **256** — `launchctl limit maxfiles` — while
+/// the hard limit is effectively unbounded. A daemon that inherits 256 runs a normal session
+/// fine and then fails at exactly the wrong moment: `horde upgrade` needs a dup per pane all at
+/// once, so a fleet that has been running for hours dies with `Too many open files` while handing
+/// over, which is the one operation that is supposed to be safe. Every multiplexer raises this
+/// for the same reason.
+///
+/// Best effort. The value is clamped to the hard limit, and macOS additionally refuses anything
+/// above `kern.maxfilesperproc` with `EINVAL` — so a refused request steps down rather than
+/// giving up, and a host that will not raise it at all simply keeps what it had.
+pub fn raise_file_limit() -> (u64, u64) {
+    // SAFETY: `getrlimit` writes only the `rlimit` handed to it.
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return (0, 0);
+    }
+    let before = lim.rlim_cur as u64;
+    let hard = lim.rlim_max as u64;
+    // `RLIM_INFINITY` as a target is what macOS rejects, so an unbounded hard limit means
+    // "ask for what we want" rather than "ask for everything".
+    let ceiling = if hard == libc::RLIM_INFINITY { WANT_FILES } else { hard.min(WANT_FILES) };
+    if ceiling <= before {
+        return (before, before);
+    }
+
+    // Step down on refusal: the kernel's real per-process cap is not visible from here, so the
+    // only way to find it is to ask for less until one is accepted.
+    let mut target = ceiling;
+    while target > before {
+        lim.rlim_cur = target as libc::rlim_t;
+        // SAFETY: raising our own soft limit, never above the hard limit we just read.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
+            return (before, target);
+        }
+        target /= 2;
+    }
+    (before, before)
+}
+
+/// The current soft open-file limit, for reporting.
+pub fn file_limit() -> u64 {
+    // SAFETY: `getrlimit` writes only the `rlimit` handed to it.
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return 0;
+    }
+    lim.rlim_cur as u64
+}
+
+// ---------------------------------------------------------------------------
 // Filesystems
 // ---------------------------------------------------------------------------
 
@@ -381,6 +445,22 @@ mod tests {
             Some(c) => assert!(!c.get_program().is_empty()),
             None => assert!(no_notifier_hint().contains("notify_command")),
         }
+    }
+
+    /// The limit must come out at least as high as it went in, and normally higher.
+    ///
+    /// Not asserted against a fixed number: CI, a container and a developer Mac all start from
+    /// different soft limits, and the property that matters is "raising it never lowers it".
+    #[test]
+    fn raising_the_file_limit_never_lowers_it() {
+        let (before, after) = raise_file_limit();
+        assert!(after >= before, "raised {before} to {after}");
+        assert_eq!(file_limit(), after, "the reported limit is the one now in force");
+
+        // Idempotent: a second call finds the work already done and changes nothing.
+        let (again_before, again_after) = raise_file_limit();
+        assert_eq!(again_before, after);
+        assert_eq!(again_after, after);
     }
 
     /// A real WSL2 mount table, trimmed to the lines that matter.
