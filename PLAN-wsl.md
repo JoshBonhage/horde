@@ -186,9 +186,24 @@ Two distinct failures:
 
 ## Phases
 
-**Phase 0 — prove it.** No code. A Windows 11 machine, WSL2, and the matrix below filled in. If
-the daemon does not survive closing every terminal window, everything after this changes shape
-and the honest answer to a Windows user is different. Also settles the DrvFs errno.
+**Phase 0 — prove it — outstanding, and blocked on hardware.** No code. A Windows 11 machine,
+WSL2, and the matrix below filled in. If the daemon does not survive closing every terminal
+window, everything after this changes shape and the honest answer to a Windows user is different.
+Also settles the DrvFs errno.
+
+> **Do not try this in a VMware Fusion VM on an Apple Silicon Mac.** WSL2 is itself a Hyper-V
+> VM, so it needs nested virtualization. Apple exposes that on M3 and later, and Parallels uses
+> it — Fusion does not, as of 13.6.4 (July 2025), and
+> [Broadcom lists WSL2 among the features that will not function](https://knowledge.broadcom.com/external/article/315602).
+> The symptom is a loop: installing a distro reports that virtualization is not enabled and
+> suggests `wsl --install --no-distribution`, which reports success and changes nothing. The
+> confirming tell is `systeminfo` reporting **`VM Monitor Mode Extensions: No`**. An hour was
+> spent finding this out; that hour is what this note exists to save.
+>
+> Workable routes, cheapest first: a cloud Windows VM on an instance type permitting nested
+> virtualization — also x86_64, which matches real WSL users better than an ARM VM — covers every
+> row except sleep and hibernate, which are laptop-hardware behaviours. A physical Windows PC
+> covers all of them. Parallels on an M3+ Mac works but costs a subscription.
 
 **Phase 1 — Linux CI — shipped.** `.github/workflows/ci.yml`, four jobs, no third-party actions
 beyond `actions/checkout`:
