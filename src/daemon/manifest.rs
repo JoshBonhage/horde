@@ -564,6 +564,54 @@ mod tests {
         },
     ];
 
+    /// Real screens from opencode 1.18.15 on OpenRouter.
+    ///
+    /// Captured rather than composed. The previous manifest was written from guesswork, shipped
+    /// with a comment saying so, and matched nothing — a running opencode showed in the roster
+    /// as an agent whose state was permanently "no rule matched".
+    const OPENCODE: &[Fixture] = &[
+        Fixture {
+            label: "idle",
+            body: include_str!("../../tests/fixtures/opencode-idle.txt"),
+            title: "",
+            want: AgentState::Idle,
+        },
+        Fixture {
+            // Note the footer: at this width "esc to interrupt" is wrapped to `in/te/rr/up/t`
+            // down five lines. The old rule looked for it as one string and never fired, which
+            // is why the working signal is the spinner label instead.
+            label: "working",
+            body: include_str!("../../tests/fixtures/opencode-working.txt"),
+            title: "",
+            want: AgentState::Working,
+        },
+    ];
+
+    #[test]
+    fn opencode_reads_its_real_screens_correctly() {
+        let (all, w) = load_all(Path::new("/nonexistent"));
+        assert!(w.is_empty(), "{w:?}");
+        let oc = &all["opencode"];
+        for f in OPENCODE {
+            let lines = to_lines(f.body);
+            let v = oc
+                .evaluate(&screen(&lines, f.title))
+                .unwrap_or_else(|| panic!("{}: a rule suppressed the state", f.label));
+            assert_eq!(v.state, f.want, "{}: decided by {}", f.label, v.reason);
+        }
+    }
+
+    /// A screen carrying both signals is working, not idle. Getting this backwards shows an
+    /// agent as free while it is mid-edit, which is when a message would land worst.
+    #[test]
+    fn the_spinner_outranks_the_composer_for_opencode() {
+        let (all, _) = load_all(Path::new("/nonexistent"));
+        let oc = &all["opencode"];
+        let both = to_lines("  ⠴ Thinking\n  ┃  Ask anything... \"Fix a TODO\"\n  tab agents");
+        let v = oc.evaluate(&screen(&both, "")).expect("a state");
+        assert_eq!(v.state, AgentState::Working, "decided by {}", v.reason);
+    }
+
     #[test]
     fn claude_reads_every_real_screen_correctly() {
         let (all, w) = load_all(Path::new("/nonexistent"));

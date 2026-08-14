@@ -1,4 +1,8 @@
-# opencode detection manifest. Untested locally.
+# opencode detection manifest.
+#
+# Written against opencode 1.18.15 running on OpenRouter, by reading a real pane rather than
+# guessing — an earlier version of this file was marked "untested" and none of its rules ever
+# matched, so a running opencode sat in the roster as an agent with no state.
 #
 # A bare `opencode` is deliberately absent from `detect`: it would match any pane that merely
 # mentioned the word, including one running a different agent.
@@ -11,6 +15,10 @@ detect = [
   'opencode v',
   'opencode --',
   'OpenCode',
+  # The composer placeholder and the footer, both of which are on screen the whole time opencode
+  # is running and neither of which any other agent shows.
+  'Ask anything',
+  'tab agents',
 ]
 
 [[rules]]
@@ -20,16 +28,34 @@ priority = 900
 region = "whole_recent"
 any = [{ contains = ["y/n"] }, { contains = ["do you want to"], any = [{ line_regex = ['^\\s*❯?\\s*\\d+\\.\\s*yes\\b'] }] }]
 
+# The spinner label, which is what actually distinguishes working from idle.
+#
+# `whole_recent` rather than the bottom few lines: the label sits above the composer, not in the
+# footer. The footer *does* say "esc to interrupt", but opencode wraps it hard in a narrow pane —
+# at 26 columns it arrives as `in/te/rr/up/t` across five lines, matching nothing. Observed, not
+# assumed, which is why the old rule never fired.
 [[rules]]
-id = "status_line_working"
+id = "spinner_working"
 state = "working"
-priority = 600
-region = "bottom_non_empty_lines(3)"
-any = [{ contains = ["esc to interrupt"] }, { contains = ["working"] }]
+priority = 700
+region = "whole_recent"
+any = [
+  { contains = ["Thinking"] },
+  { contains = ["esc to interrupt"] },
+]
 
+# Empty composer. Only shown when opencode is waiting for you — it is replaced by the spinner
+# while a turn is running, which is what makes it a usable idle signal rather than chrome.
+#
+# Lower priority than the spinner so a screen still carrying both resolves to working: a turn in
+# progress is the more urgent fact, and the wrong answer here would show an agent as free while
+# it is mid-edit.
 [[rules]]
 id = "composer_idle"
 state = "idle"
 priority = 500
-region = "prompt_box_body"
-line_regex = ['^\\s*[>❯]']
+region = "whole_recent"
+any = [
+  { contains = ["Ask anything"] },
+  { line_regex = ['^\\s*[>❯]\\s*$'] },
+]

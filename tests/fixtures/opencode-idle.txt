@@ -1,0 +1,22 @@
+
+
+                             ▄
+ █▀▀█ █▀▀█ █▀▀▄ █▀▀▀ █▀▀█ █▀▀█
+ █  █ █▀▀▀ █  █ █    █  █ █  █
+ █▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀
+
+
+  ┃
+  ┃  Ask anything... "Fix
+  ┃  a TODO in the
+  ┃  codebase"
+  ┃
+  ┃  Bui ·North Mini Code ( O
+  ┃  ld   free)             p
+  ┃                         e
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  tab agents  ctrl+p commands
+
+
+  ~/Documents/dev/    1.18.15
+  horde:main
