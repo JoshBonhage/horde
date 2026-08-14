@@ -598,7 +598,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 .split_in(&cfg, None, dir, Some(&cmd), worktree.as_deref())
                 .map_err(|e| failed(e.to_string()))?;
             if let Some(p) = eng.session.panes.get_mut(&id) {
-                if let Some(n) = name {
+                if let Some(n) = name.clone() {
                     p.name = Some(n);
                 }
                 // The job it is for, so a fleet reads as a team rather than as claude-2..7.
@@ -617,6 +617,14 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             // the agent is still booting and has no prompt to type at yet, and the board is
             // the thing that survives it not being ready.
             let task = match str_arg(req, "task") {
+                // A third route to the board, and the RPC gate does not cover it — `agent.spawn`
+                // is not a `task.*` method. Same hole as the trigger path, same fix.
+                Some(_) if !cfg.board => {
+                    return Err(failed(
+                        "the task board is off (agents.board) — use --brief to give the new agent \
+                         its first instruction instead",
+                    ))
+                }
                 Some(text) => {
                     let space = eng
                         .session
@@ -634,9 +642,29 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 None => None,
             };
 
+            // A first instruction, held until the agent is actually there to read it.
+            //
+            // Not sent: a pane one millisecond old has no agent, so the bus would type the text
+            // into a booting TUI without a newline. Holding it as an orphan means it lands the
+            // moment detection names the agent and it reaches its prompt — which is what the
+            // board was doing for `--task`, without needing a board.
+            let brief = match str_arg(req, "brief") {
+                Some(text) if !text.trim().is_empty() => {
+                    // Addressed by the name it will answer to once detection runs; the pane id
+                    // is the fallback for a spawn that was not given one.
+                    let to = name.clone().unwrap_or_else(|| id.to_string());
+                    let by = super::bus::Bus::sender_name(&eng.session, from);
+                    Some(eng.bus.hold_for(&to, text, &by).id)
+                }
+                _ => None,
+            };
+
             eng.touch();
             eng.detect_now();
             let mut out = json!({ "pane": id, "cmd": cmd });
+            if let Some(b) = brief {
+                out["brief"] = json!(b);
+            }
             if let Some(w) = worktree {
                 out["worktree"] = json!(w.to_string_lossy());
             }
@@ -1126,6 +1154,67 @@ mod tests {
     /// count runs away without anyone noticing. The cap is on live panes agents opened, so
     /// closing one frees a slot — a lifetime counter would retire a fleet that had merely
     /// been busy.
+    /// A brief must survive the gap between spawning a pane and an agent existing in it.
+    ///
+    /// That gap is the whole reason `--task` used the board: for a second or two the pane has no
+    /// agent, and the bus would type the text into a booting TUI without a newline. The brief
+    /// waits instead, and arrives once the agent is named and at its prompt.
+    #[test]
+    fn a_brief_waits_for_the_agent_to_exist_and_then_arrives() {
+        let mut eng = super::super::tests::engine();
+        eng.cfg.board = false;
+
+        let r = handle(
+            &mut eng,
+            &req("agent.spawn", json!({ "cmd": "cat", "name": "builder", "brief": "start here" })),
+        )
+        .unwrap();
+        assert!(r.get("brief").is_some(), "the brief was accepted: {r}");
+        assert_eq!(eng.bus.orphan_count(), 1, "and is waiting rather than delivered");
+
+        // The pane exists but has no agent yet, so a flush changes nothing.
+        let cfg = eng.cfg.clone();
+        let Engine { bus, session, .. } = &mut eng;
+        bus.flush_queued(session, &cfg);
+        assert_eq!(eng.bus.orphan_count(), 1, "nothing to deliver to yet");
+
+        // Detection names the agent; now it lands.
+        let pane = *eng
+            .session
+            .panes
+            .iter()
+            .find(|(_, p)| p.name.as_deref() == Some("builder"))
+            .map(|(id, _)| id)
+            .expect("the spawned pane");
+        super::super::tests::give_agent_named(&mut eng.session, pane, "builder");
+        let cfg = eng.cfg.clone();
+        let Engine { bus, session, .. } = &mut eng;
+        bus.flush_queued(session, &cfg);
+        assert_eq!(eng.bus.orphan_count(), 0, "the brief found its agent");
+
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    /// `--task` reaches the board directly from the spawn path, so the RPC gate does not cover
+    /// it — the same shape of hole as the trigger path.
+    #[test]
+    fn spawning_with_a_task_is_refused_when_the_board_is_closed() {
+        let mut eng = super::super::tests::engine();
+        eng.cfg.board = false;
+        let e = handle(
+            &mut eng,
+            &req("agent.spawn", json!({ "cmd": "cat", "name": "w", "task": "do it" })),
+        )
+        .unwrap_err();
+        assert!(e.message.contains("agents.board"), "{}", e.message);
+        assert!(e.message.contains("--brief"), "it should say what to use instead: {}", e.message);
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
     /// The board and the bus are separate switches, and turning one off must not touch the other.
     #[test]
     fn the_board_can_be_closed_while_the_bus_stays_open() {

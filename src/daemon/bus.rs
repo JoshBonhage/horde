@@ -241,6 +241,42 @@ impl Bus {
         }
     }
 
+    /// Hold a message for an agent that does not exist yet.
+    ///
+    /// A freshly spawned pane has no agent for a second or two — detection has not run, and the
+    /// program inside is still drawing its first frame. `gate` sees a pane with no agent and
+    /// returns `TextOnly`, so a brief sent immediately after spawning is typed into a booting
+    /// TUI without a newline, or dropped. That is why the first job has historically gone on the
+    /// board instead: the board survives the recipient not being ready.
+    ///
+    /// This is the same idea without the board. The message waits as an orphan and is re-homed
+    /// by name the moment an agent answering to it exists — the mechanism that already recovers
+    /// queued messages across a daemon restart, pointed at a recipient that is arriving rather
+    /// than returning.
+    pub fn hold_for(&mut self, to: &str, body: &str, from: &str) -> Message {
+        let msg = Message {
+            id: self.next_id,
+            ts: super::now_millis(),
+            from: from.to_string(),
+            to: to.to_string(),
+            body: body.to_string(),
+            delivery: Delivery::Queued,
+            broadcast: false,
+            expects_reply: false,
+            reply_to: None,
+        };
+        self.next_id += 1;
+        self.append_log(&msg);
+        self.messages.push_back(msg.clone());
+        while self.messages.len() > RING {
+            self.messages.pop_front();
+        }
+        // Recorded as an orphan *and* on disk as queued, so a daemon restart between the spawn
+        // and the agent appearing recovers it the same way any other undelivered message is.
+        self.orphaned.push(msg.clone());
+        msg
+    }
+
     /// Route one message. Delivers now if the target is at its prompt, else queues it.
     #[allow(clippy::too_many_arguments)]
     pub fn send(

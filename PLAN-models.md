@@ -203,7 +203,38 @@ horde cannot obtain. Two honest paths instead:
 Build both. The cooperative path carries the good handover; the observational one guarantees
 *something* happens.
 
-### The handover is the whole problem
+### Who writes the handover, and when
+
+The first design here had horde detect the death and compose the brief. A better shape is for
+the **dying agent to spawn its own successor and hand over directly**, while it still can:
+
+```bash
+horde spawn --profile fallback --name builder-2 --worktree \
+  --brief "You are taking over from me. The parser port is half done: src/parse.rs compiles,
+           tests not written. I ran out of usage. Read the diff before changing anything."
+```
+
+That is better for the reason that matters most — **the agent knows what it was doing, and horde
+only knows what it could see.** A self-written brief beats any reconstruction from diffs and
+scrollback.
+
+`--brief` is built (Phase 4a below). It exists because a freshly spawned pane has no agent for a
+second or two, so a brief sent immediately would be typed into a booting TUI without a newline —
+which is why `--task` went through the board. The brief waits as an orphan and is re-homed by
+name the moment detection finds the agent, reusing the mechanism that already recovers queued
+messages across a restart.
+
+**The two paths are complementary, not alternatives:**
+
+| | Written by | Quality | Works when |
+|---|---|---|---|
+| Agent-driven | the dying agent | high — it knows the plan | it noticed in time |
+| horde-driven | horde, from what it watched | adequate | the agent died mid-sentence |
+
+Build the agent-driven path first; it needs no detection at all, only an agent that knows to do
+it. The horde-driven one is the net.
+
+### What horde can reconstruct when nobody handed over
 
 Spawning a successor is trivial — `agent.spawn` already does it, with the worktree, role, space
 and name of the pane it replaces. What is hard is that a fresh agent knows nothing.
@@ -269,6 +300,15 @@ Not because free models are good. Because the alternative to a weaker agent fini
 usually **nothing happening for eight hours**, and horde's entire premise is that the hours
 nobody is watching should not be dead time. A rate limit at 2am currently costs a night. It
 should cost a downgrade.
+
+## Phase 4a — `--brief` — **shipped**
+
+`horde spawn --brief "..."` gives a new agent its first instruction with no board involved. The
+message is held until an agent answering to that name exists and reaches its prompt.
+
+This closes a gap that `agents.board = false` opened: with the board closed, `--task` is refused,
+and there was no other way to tell a spawned agent what it was for. It is also the primitive
+succession needs.
 
 ## Risks worth stating before building
 

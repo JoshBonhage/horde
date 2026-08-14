@@ -103,6 +103,7 @@ horde spawn --cmd "claude --model opus" --name parser \
 | `--task` | a first job, put on the board for it to claim |
 | `--cmd` | the whole command, so the model goes here: `"claude --model opus"` |
 | `--profile` | start on a named model list from config instead of `--cmd` — see below |
+| `--brief` | its first instruction, delivered once it is up. Works with the board closed |
 
 **Use `--worktree` whenever you start more than one agent in the same repository.** Without
 it they share one working tree, and two agents editing the same file is not a merge conflict
@@ -111,8 +112,11 @@ you can resolve — it is one agent's work silently overwritten.
 There is a cap on how many panes agents may have open at once (`agents.max_fleet`, six by
 default). Hitting it is an error that says so. Do not work around it; tell your human.
 
-After spawning, brief each agent with `horde send`, or put the work on the board and let them
-claim it. The board is better for more than two agents: it self-balances, and you never have
+Brief each agent as you spawn it with `--brief`. Do not `horde send` to a pane you just made:
+for a second or two it has no agent yet, so the message is typed into a still-booting TUI
+instead of being queued. `--brief` waits for it to come up.
+
+After that, `horde send` works normally, or put the work on the board and let them claim it. The board is better for more than two agents: it self-balances, and you never have
 to track who is free.
 
 ## Models

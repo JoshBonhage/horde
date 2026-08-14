@@ -101,6 +101,12 @@ pub enum Command {
         /// Wins over `--cmd` when both are given.
         #[arg(long)]
         profile: Option<String>,
+        /// A first instruction, delivered once the new agent is up and at its prompt.
+        ///
+        /// Unlike `--task` this needs no board: it waits for the agent to exist, then arrives
+        /// as an ordinary bus message.
+        #[arg(long)]
+        brief: Option<String>,
         /// Addressable name for the new agent.
         #[arg(long)]
         name: Option<String>,
@@ -691,14 +697,14 @@ pub fn run(cmd: Command) -> Result<()> {
             println!("sent to {n} agent(s)");
         }
 
-        Command::Spawn { cmd, profile, name, split, worktree, role, board, task } => {
+        Command::Spawn { cmd, profile, brief, name, split, worktree, role, board, task } => {
             // `--worktree` with no value means "name it after the agent", which the daemon
             // resolves because it is the side that knows what the agent ended up called.
             let worktree = worktree.map(|w| if w.is_empty() { Value::Bool(true) } else { json!(w) });
             let v = call(
                 "agent.spawn",
                 json!({
-                    "cmd": cmd, "profile": profile, "name": name, "split": dir_name(&split)?,
+                    "cmd": cmd, "profile": profile, "brief": brief, "name": name, "split": dir_name(&split)?,
                     "worktree": worktree, "role": role, "board": board, "task": task,
                     // Who asked, so an agent building a fleet is counted against the cap.
                     "from": self_pane(),
@@ -712,6 +718,9 @@ pub fn run(cmd: Command) -> Result<()> {
             }
             if let Some(t) = v.get("task").and_then(|t| t.as_u64()) {
                 println!("  task #{t} on the board for it");
+            }
+            if let Some(b) = v.get("brief").and_then(|b| b.as_u64()) {
+                println!("  brief #{b} waiting for it to come up");
             }
         }
         Command::Worktree { cmd } => match cmd {

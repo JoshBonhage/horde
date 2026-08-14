@@ -1491,6 +1491,27 @@ mod tests {
         );
     }
 
+    /// Put a named, idle agent into a pane, standing in for a detection pass.
+    pub(super) fn give_agent_named(session: &mut Session, pane: PaneId, name: &str) {
+        session.panes.get_mut(&pane).unwrap().agent = Some(crate::daemon::state::AgentRuntime {
+            kind: "claude".into(),
+            name: name.to_string(),
+            class: Default::default(),
+            state: crate::proto::AgentState::Idle,
+            since: std::time::Instant::now(),
+            authority: "test".into(),
+            reason: "t".into(),
+            seen: false,
+            session_id: None,
+            queued: Vec::new(),
+            question: None,
+            activity: Default::default(),
+            touched: Default::default(),
+            nudged_since: None,
+            alerted_since: None,
+        });
+    }
+
     fn kill_all(eng: &mut Engine) {
         for p in eng.session.panes.values_mut() {
             p.kill();
