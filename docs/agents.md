@@ -2,7 +2,7 @@
 
 horde works out what each agent is doing so the sidebar can tell you which ones need you.
 
-## The five states
+## The six states
 
 | State | Glyph | Meaning |
 |---|---|---|
@@ -11,6 +11,7 @@ horde works out what each agent is doing so the sidebar can tell you which ones 
 | `done` | `●` | finished, and you have not looked yet |
 | `idle` | `○` | at its prompt, and you have seen it |
 | `unknown` | `◌` | horde cannot tell confidently |
+| `serving` | `◆` | a dev server or watcher, up and holding — see [Services](#services) |
 
 `blocked` is deliberately strict. It is set only when a visible approval, question, or
 permission UI is matched. **Silence is never treated as blocked** — an agent that has gone
@@ -20,6 +21,69 @@ attention count useless.
 `done` is derived, not reported. A `working → idle` transition while you are not looking at
 the pane becomes `done`, and focusing or typing in the pane clears it back to `idle`. That is
 the "finished while you were away" signal.
+
+## Services
+
+Not everything in a pane is an agent. A manifest declaring `class = "service"` describes
+something that *runs* rather than something you talk to: `npm run dev`, `vite`, a file
+watcher, a tunnel. The bundled `dev` manifest covers the common ones.
+
+A service uses two states and no others — `serving` when it is up, `blocked` when it needs
+you (the port is taken, the build is broken) — and horde treats it differently in the places
+where agent behaviour would be nonsense:
+
+- it is **counted separately**, so three panes of `npm run dev` cannot make a quiet session
+  read as a busy one, and it does not appear in a project's agent count
+- it **never becomes `done`**: `done` means "you have not read this yet", and nobody is going
+  to read a page-load log
+- it is **never handed board work** and never receives a bus message
+
+`working` is deliberately not one of its states. A compile that finishes in 300ms cannot be
+seen by a detector that looks every 640ms, so a "compiling" state would be a flicker you
+cannot read rather than a signal you can.
+
+The colour is its own — `theme.custom.serving` — for the same reason: a dev server is
+background texture you want to be able to *not* look at, which it cannot be while it shares a
+colour with an agent mid-turn.
+
+### A shell prompt is neither
+
+If the pane's foreground process is a shell, horde detects nothing there, whatever the screen
+still shows. Scrollback is not evidence: a terminal that has merely *mentioned* an agent — a
+`claude --help`, a PR body with a "Generated with Claude Code" footer, a `git log` — used to
+keep matching that agent's `detect` patterns and sit in the roster as an agent that was not
+running.
+
+## Answering them all in one place
+
+`ctrl+b A` opens the approval queue: every agent that is `blocked`, longest wait first, with
+the question read off its screen and answerable from there.
+
+```
+◍ reviewer   Halo Suite   waiting 12m
+  Do you want to make this edit to src/mux.rs?
+    1  Yes
+    2  Yes, and don't ask again
+    3  No, and tell Claude what to do differently
+```
+
+Detection already knows *that* an agent is waiting. This works out *what it asked*, which is
+the difference between a sidebar saying six agents need you and one place that shows you the
+six questions.
+
+The parse is a heuristic, and deliberately generic rather than per-agent: every agent draws a
+question the same way, as a line ending in `?` above a numbered list, because that is what a
+terminal makes easy. One parser covers Claude, Codex, Gemini and Cursor without six manifests
+having to agree on a region. It handles a plain `(y/n)` prompt too, and a prompt box wrapped
+by a narrow pane.
+
+It will not guess. Nothing matched means no question, and the queue lists the agent with
+"open the pane" rather than inventing a prompt. A wrong parse here costs a question you go and
+read in its own pane; that is why it is allowed to be a heuristic at all, where a wrong
+*state* would be a lie the whole UI repeats.
+
+See [keys](keys.md#the-approval-queue) for what each key does and why the queue is as narrow
+as it is.
 
 ## Two tiers, one authority per pane
 
@@ -59,9 +123,18 @@ Without hooks, horde identifies the foreground process and matches rules against
 **Which agent is in a pane** is decided in order of how much the signal can be trusted:
 
 1. a fresh **hook report** — the agent said so itself
-2. the **foreground process name** from `ps` — a definite answer
+2. an agent's **foreground process name** from `ps` — a definite answer
 3. the **command the pane was started with** — what we were asked to run
-4. **screen patterns** — a guess, and the only ambiguous signal
+4. an agent's **screen patterns** — a guess, and the only ambiguous signal
+5. a **service's** process name, then its screen patterns
+
+Services come last, after even an agent's screen guess, because a service manifest names
+launchers rather than programs: `npm` and `bun` run whatever you ask them to, including an
+agent. "A service is what a pane is when it is not an agent" costs nothing, and means a broad
+process list can never quietly relabel something you were talking to.
+
+`ps` reports what a process calls itself, and node tooling rewrites its own title — a Next dev
+server shows up as `npm run dev` — so matching is against the first word of it.
 
 The order matters because agent UIs share phrases. `esc to interrupt` appears in Claude Code,
 Codex, and Cursor Agent alike, so a `detect` list containing it makes several manifests claim

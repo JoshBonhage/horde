@@ -82,14 +82,6 @@ An empty roster means no agents are running. You are probably alone.
 
 ## 3. Sending a message
 
-> **Paused.** The bus is switched off while it is reworked, so `send`, `ask`, `reply` and
-> `broadcast` are all refused by the daemon — nothing is injected into any pane, by hand, by a
-> trigger, or by the board's nudge. `horde bus tail` still reads the log. Sections 3, 4 and 5's
-> reply half describe how it works when it is back on; §2, §6, §7 and the digest are unaffected,
-> because none of them type at anyone.
->
-> Anything already sitting queued when the switch went off stays queued and is not delivered.
-
 ```sh
 horde send reviewer "schema migration is applied, please review src/db/*.rs"
 ```
@@ -296,11 +288,10 @@ too, and is simpler.
 
 ## 8. The shared task board
 
-> **Paused.** The board is switched off while it is reworked. `horde task list` still shows what
-> is on it, but `add`, `claim`, `done` and `release` are refused by the daemon — if you are an
-> agent, there is no work for you here and nothing to poll. The bus is paused too (§3), so there
-> is no hand-off route to fall back on: work reaches an agent from the human in its pane.
-> Everything below is how the board works when it is back on.
+> **One board per project.** A task belongs to the space it was added in, and is only ever
+> offered to agents in that space. `horde task list` shows this project's board; `--everywhere`
+> shows all of them. Without this the board inverts as soon as you have two projects open:
+> work added in one repository gets handed to an idle agent sitting in another.
 
 The bus pushes work at a named agent. The board is the other direction: work sits there and
 whoever is free takes it. Use it when you have more jobs than you want to hand out one at a
@@ -339,16 +330,26 @@ horde task release <id> --drop    # abandon it; the attempt stays on the record
 ```
 
 **You never have to release on exit.** If your pane goes away while holding a task, horde
-puts it back on the board automatically and tells the human why. (That sweep is parked with the
-board: while it is paused nothing moves either way, and a claim left mid-flight is sorted out
-when the board comes back.)
+puts it back on the board automatically and tells the human why.
 
-### You will be told when there is work — not right now
+### Enlisting, and being told when there is work
 
-**Parked**, along with the board and the `--task` trigger action, so nothing will tell you work
-is waiting. What follows is how it behaves when it is back on.
+**Nothing is offered to you until you enlist.**
 
-When the board has open tasks and you are free, horde sends you one line:
+```sh
+horde task work            # I will take board work in this project
+horde task work --off      # stop
+```
+
+That is the rule to know, because without it a quiet board looks like a broken one. Enlistment
+is opt-in for a reason: before it existed, every idle agent counted as a volunteer, so an agent
+someone had opened to think with would be handed work it was never meant to do.
+
+`--board` at spawn does the same thing for an agent you are starting, which is how a lead agent
+builds a fleet that will work a queue.
+
+Once enlisted, when your project's board has open tasks and you are free, horde sends you one
+line:
 
 ```
 [horde] message from user: 2 tasks waiting on the board. Run `horde task claim` ...
@@ -367,6 +368,7 @@ This is the pattern the board exists for. Every agent runs the same loop, so add
 adds throughput without anyone scheduling anything:
 
 ```sh
+horde task work
 while work=$(horde task claim); [ -n "$work" ]; do
   # do $work
   horde task done --result "<what happened>"
@@ -410,10 +412,34 @@ done
 horde bus tail --limit 20        # read what they all reported
 ```
 
+### Building a fleet
+
+An agent can start agents. The flags exist because a fleet needs more than names:
+
+```sh
+horde spawn --cmd "claude --model opus" --name parser \
+  --role builder --worktree --board --task "port the old parser"
+```
+
+| Flag | Why |
+|---|---|
+| `--name` | how you address it in `horde send`. Always pass it |
+| `--role` | what it is for. Six panes called `claude-4` is not a team |
+| `--worktree` | its own git worktree and branch |
+| `--board` | enlist it, so the queue reaches it |
+| `--task` | a first job, put on the board for it to claim |
+
+**Use `--worktree` whenever you start more than one agent in a repository.** Two agents editing
+one working tree is not a merge conflict you can resolve, it is one agent's work silently
+overwritten. See `horde docs worktrees`.
+
+`agents.max_fleet` bounds how many panes agents may have open at once, six by default. It is a
+guard against a loop, not a budget to spend: hitting it is an error, and the answer is to tell
+your human rather than to work around it.
+
 ### Work a queue instead of dispatching
 
-Ten jobs, three agents, and you do not want to decide who does what. (Needs the board, which is
-paused — see §8.)
+Ten jobs, three agents, and you do not want to decide who does what.
 
 ```sh
 for f in src/*.rs; do horde task add "review $f and report anything broken"; done
@@ -509,7 +535,7 @@ horde roster --json                # the same, machine-readable
 horde pane current                 # your own pane id
 horde status                       # daemon health, counts, paths
 
-# message  — paused: only `bus tail` works, see §3
+# message
 horde send <name> "text"           # to one agent
 horde send <name> "text" --now     # bypass the state gate (rarely correct)
 horde broadcast "text"             # to every agent but you
@@ -520,10 +546,12 @@ horde bus tail -f                  # follow
 # coordinate
 horde wait <name> --until idle --timeout 300
 horde pane read <name> --source detection --lines 40
-horde ask <name> "question"        # send and block until they answer  (paused)
+horde ask <name> "question"        # send and block until they answer
 
-# the shared board  — paused: only `task list` works, see §8
-horde task add "text"              # put work up for whoever is free
+# the shared board — one per project
+horde task work                    # enlist: I will take board work
+horde task add "text"              # put work up for whoever is free here
+horde task clear                   # drop every open task in this project
 horde task claim                   # take the oldest open task (exclusive)
 horde task claim <id>              # take a specific one
 horde task done --result "text"    # finish the one you hold

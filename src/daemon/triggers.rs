@@ -29,10 +29,8 @@
 //! already exists find a free agent, which means a trigger never has to know who is idle and the
 //! exclusivity guarantee stays where it already is — in `Board::claim`'s compare-and-set.
 //!
-//! That action is parked for now, along with the nudge it depends on: see
-//! [`super::tasks::autonomous`]. [`What::Send`] is parked too, with the bus it routes through
-//! (see [`super::bus::ENABLED`]). [`What::Spawn`] is the one action still standing — it starts a
-//! program rather than typing at one that is already running.
+//! A `--task` rule is scoped to the space it was created in, so scheduled work lands on the
+//! right project's board rather than being offered to whichever agent happens to be idle.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -165,6 +163,12 @@ pub struct Trigger {
     pub created: u64,
     /// Who added it — `user`, or the agent that did.
     pub by: String,
+    /// Which project the rule belongs to, by space name.
+    ///
+    /// Carried so a `--task` rule puts its work on the right project's board. A rule with no
+    /// space predates this and scopes nothing, which is how it already behaved.
+    #[serde(default)]
+    pub space: Option<String>,
     pub last_fired: Option<u64>,
     pub fire_count: u64,
     /// Shell condition. The rule acts only when this exits 0.
@@ -294,6 +298,7 @@ impl Store {
         what: What,
         by: &str,
         only_if: Option<String>,
+        space: Option<String>,
     ) -> Result<Trigger> {
         if let When::Every { secs } = when {
             if secs < MIN_INTERVAL_SECS {
@@ -315,6 +320,7 @@ impl Store {
             enabled: true,
             created: super::now_millis(),
             by: by.to_string(),
+            space,
             last_fired: None,
             fire_count: 0,
             only_if: only_if.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
@@ -621,31 +627,15 @@ pub fn owner_tag(id: u64) -> String {
 fn perform(eng: &mut Engine, t: &Trigger) -> Result<(String, Vec<Event>)> {
     match &t.what {
         What::Task { text } => {
-            // Parked with the rest of the board's autonomous half (`tasks::autonomous()`): a rule
-            // that feeds agents work is the behaviour being reworked. Refused loudly rather than
-            // skipped quietly, and it counts as a firing, so a rule left over from before this
-            // switch complains once an interval instead of every tick.
-            if !super::tasks::autonomous() {
-                return Err(anyhow!(
-                    "the --task action is parked while the task board is reworked — delete this \
-                     rule, or point it at an agent with --to"
-                ));
-            }
-            let task = eng.board.add(text, &owner_tag(t.id))?;
+            // Scoped to the space the rule was created in, so a scheduled task lands in the
+            // project it was written for rather than being offered to whoever is idle.
+            let space = t.space.clone();
+            let task = eng.board.add(text, &owner_tag(t.id), space.as_deref())?;
             // The sidebar carries the open count, so it has to be told.
             eng.touch();
             Ok((format!("put task #{} on the board: {}", task.id, task.text), Vec::new()))
         }
         What::Send { to, body } => {
-            // Parked with the bus itself (`bus::ENABLED`). Refused loudly rather than skipped
-            // quietly, and it counts as a firing, so a rule left over from before this switch
-            // complains once an interval instead of every tick.
-            if !super::bus::ENABLED {
-                return Err(anyhow!(
-                    "the --to action is parked while the message bus is reworked — delete this \
-                     rule, or use --spawn"
-                ));
-            }
             let cfg = eng.cfg.clone();
             let Engine { bus, session, .. } = eng;
             let m = bus.send(session, &cfg, None, to, body, false, false, None)?;
@@ -706,6 +696,37 @@ fn last_occurrence(now: u64, hour: u32, min: u32) -> u64 {
         // Yesterday's. A day is not always 86_400s — twice a year a DST shift makes this an
         // hour out, which for "review the diff each morning" is not worth a date library.
         target.saturating_sub(86_400_000)
+    }
+}
+
+/// The local clock as a person reads it, with the offset that produced it.
+///
+/// Exists so `horde status` can show the time triggers will actually fire on. The offset is the
+/// half that matters: `09:00` alone looks right whatever the timezone, and `09:00 UTC+00` on a
+/// machine whose owner is in London in June is the tell that the distro's timezone was never
+/// set — the failure this is here to make visible.
+pub fn local_clock(ms: u64) -> String {
+    let (h, m, _, _) = local_parts(ms);
+    let t = (ms / 1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: as `local_parts` — `localtime_r` writes only the `tm` passed to it.
+    unsafe {
+        libc::localtime_r(&t, &mut tm);
+    }
+    format_clock(h, m, tm.tm_gmtoff as i64)
+}
+
+/// The formatting half of [`local_clock`], split out because the other half is the machine's
+/// timezone and cannot be varied from a test without racing every other test that reads it.
+///
+/// `gmtoff` is seconds east of UTC, as `tm_gmtoff` gives it.
+fn format_clock(h: u32, m: u32, gmtoff: i64) -> String {
+    let off_min = gmtoff / 60;
+    // Sign taken before the magnitude, so `-03:30` does not come out as `-03:-30`.
+    let (sign, off_min) = if off_min < 0 { ('-', -off_min) } else { ('+', off_min) };
+    match off_min % 60 {
+        0 => format!("{h:02}:{m:02} UTC{sign}{:02}", off_min / 60),
+        r => format!("{h:02}:{m:02} UTC{sign}{:02}:{r:02}", off_min / 60),
     }
 }
 
@@ -883,9 +904,9 @@ mod tests {
     #[test]
     fn triggers_are_numbered_and_enabled_when_added() {
         let mut s = store("add");
-        let a = s.add(When::Every { secs: 1800 }, task_what(), "user", None).unwrap();
+        let a = s.add(When::Every { secs: 1800 }, task_what(), "user", None, None).unwrap();
         let at9 = When::At { hour: 9, min: 0, days: EVERY_DAY };
-        let b = s.add(at9, task_what(), "builder", None).unwrap();
+        let b = s.add(at9, task_what(), "builder", None, None).unwrap();
         assert_eq!((a.id, b.id), (1, 2));
         assert!(a.enabled);
         assert_eq!(b.by, "builder");
@@ -896,7 +917,7 @@ mod tests {
     fn an_interval_below_the_floor_is_refused() {
         let mut s = store("floor");
         let err =
-            s.add(When::Every { secs: 1 }, task_what(), "user", None).unwrap_err().to_string();
+            s.add(When::Every { secs: 1 }, task_what(), "user", None, None).unwrap_err().to_string();
         assert!(err.contains("shortest interval"), "{err}");
         assert!(parse_every("5s").is_err(), "and at the parsing boundary too");
         assert!(parse_every("60s").is_ok());
@@ -905,7 +926,7 @@ mod tests {
     #[test]
     fn removing_a_trigger_hides_it_without_losing_the_record() {
         let mut s = store("rm");
-        s.add(When::Every { secs: 3600 }, task_what(), "user", None).unwrap();
+        s.add(When::Every { secs: 3600 }, task_what(), "user", None, None).unwrap();
         s.remove(1).unwrap();
         assert_eq!(s.count(), 0);
         assert!(s.get(1).is_none());
@@ -915,8 +936,8 @@ mod tests {
     #[test]
     fn everything_can_be_turned_off_at_once() {
         let mut s = store("offall");
-        s.add(When::Every { secs: 3600 }, task_what(), "user", None).unwrap();
-        s.add(When::Every { secs: 7200 }, task_what(), "user", None).unwrap();
+        s.add(When::Every { secs: 3600 }, task_what(), "user", None, None).unwrap();
+        s.add(When::Every { secs: 7200 }, task_what(), "user", None, None).unwrap();
         assert_eq!(s.armed_count(), 2);
         assert_eq!(s.disable_all().len(), 2);
         assert_eq!(s.armed_count(), 0);
@@ -929,8 +950,8 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         {
             let mut s = Store::new(p.clone());
-            s.add(When::Every { secs: 1800 }, task_what(), "user", None).unwrap();
-            s.add(When::At { hour: 9, min: 30, days: EVERY_DAY }, task_what(), "user", None)
+            s.add(When::Every { secs: 1800 }, task_what(), "user", None, None).unwrap();
+            s.add(When::At { hour: 9, min: 30, days: EVERY_DAY }, task_what(), "user", None, None)
                 .unwrap();
             s.set_enabled(1, false).unwrap();
         }
@@ -939,7 +960,7 @@ mod tests {
         assert!(!s.get(1).unwrap().enabled, "off has to survive too, or a restart re-arms it");
         assert_eq!(s.get(2).unwrap().when, When::At { hour: 9, min: 30, days: EVERY_DAY });
         // Ids do not restart, so a replayed log cannot collide with a new rule.
-        assert_eq!(s.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap().id, 3);
+        assert_eq!(s.add(When::Every { secs: 60 }, task_what(), "user", None, None).unwrap().id, 3);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -956,6 +977,7 @@ mod tests {
             enabled: true,
             created: super::super::now_millis(),
             by: "user".into(),
+            space: None,
             last_fired: None,
             fire_count: 0,
             only_if: None,
@@ -982,6 +1004,7 @@ mod tests {
             enabled: true,
             created: now,
             by: "user".into(),
+            space: None,
             last_fired: None,
             fire_count: 0,
             only_if: None,
@@ -1008,6 +1031,7 @@ mod tests {
             enabled: true,
             created: now - 86_400_000,
             by: "user".into(),
+            space: None,
             last_fired: None,
             fire_count: 0,
             only_if: None,
@@ -1048,6 +1072,7 @@ mod tests {
             enabled: true,
             created: now - 86_400_000,
             by: "user".into(),
+            space: None,
             last_fired: None,
             fire_count: 0,
             only_if: None,
@@ -1106,7 +1131,7 @@ mod tests {
     fn nothing_fires_until_unattended_is_turned_on() {
         let mut e = eng("switch");
         e.cfg.unattended = false;
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None, None).unwrap();
         wind_back(&mut e, 1, 120_000);
         assert!(fire_due(&mut e).is_empty());
         assert!(fired(&e).is_empty());
@@ -1116,7 +1141,7 @@ mod tests {
     #[test]
     fn a_due_trigger_puts_its_work_on_the_board() {
         let mut e = eng("board");
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None, None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
 
@@ -1135,7 +1160,7 @@ mod tests {
     #[test]
     fn a_trigger_does_not_stack_work_it_has_already_queued() {
         let mut e = eng("stack");
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None, None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
         assert_eq!(e.board.open_count(), 1);
@@ -1146,7 +1171,7 @@ mod tests {
         assert_eq!(e.board.open_count(), 1, "one in flight, not two");
 
         // Claimed still counts as in flight — an agent is working on it.
-        e.board.claim("worker0", None).unwrap();
+        e.board.claim("worker0", None, None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
         assert_eq!(e.board.all().len(), 1);
@@ -1162,7 +1187,7 @@ mod tests {
     #[test]
     fn work_still_outstanding_delays_a_firing_without_consuming_it() {
         let mut e = eng("nospend");
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None, None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
 
@@ -1174,7 +1199,7 @@ mod tests {
         assert_eq!(e.triggers.get(1).unwrap().last_fired, before, "a skip is not a firing");
 
         // So the moment the work clears, it goes — without waiting out another interval.
-        e.board.claim("worker0", None).unwrap();
+        e.board.claim("worker0", None, None).unwrap();
         e.board.done("worker0", None, None).unwrap();
         fire_due(&mut e);
         assert_eq!(e.board.all().len(), 2);
@@ -1183,7 +1208,7 @@ mod tests {
     #[test]
     fn a_disabled_trigger_stays_quiet() {
         let mut e = eng("disabled");
-        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None).unwrap();
+        e.triggers.add(When::Every { secs: 60 }, task_what(), "user", None, None).unwrap();
         e.triggers.set_enabled(1, false).unwrap();
         wind_back(&mut e, 1, 120_000);
         assert!(fire_due(&mut e).is_empty());
@@ -1201,6 +1226,7 @@ mod tests {
                     When::Every { secs: 60 },
                     What::Task { text: format!("job {i}") },
                     "user",
+                    None,
                     None,
                 )
                 .unwrap();
@@ -1235,6 +1261,7 @@ mod tests {
                 What::Send { to: "nobody".into(), body: "hello".into() },
                 "user",
                 None,
+                    None,
             )
             .unwrap();
         wind_back(&mut e, 1, 120_000);
@@ -1252,6 +1279,7 @@ mod tests {
                 What::Send { to: "worker0".into(), body: "status?".into() },
                 "user",
                 None,
+                    None,
             )
             .unwrap();
         wind_back(&mut e, 1, 120_000);
@@ -1276,7 +1304,7 @@ mod tests {
     fn a_spawn_trigger_starts_an_agent_and_stamps_where_it_came_from() {
         let mut e = eng("spawn");
         let before = e.session.panes.len();
-        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None).unwrap();
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None, None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
 
@@ -1295,7 +1323,7 @@ mod tests {
     fn the_spawn_cap_refuses_loudly_rather_than_quietly() {
         let mut e = eng("cap");
         e.cfg.max_spawned = 1;
-        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None).unwrap();
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None, None).unwrap();
 
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
@@ -1317,7 +1345,7 @@ mod tests {
     fn a_departed_agent_frees_its_slot() {
         let mut e = eng("slot");
         e.cfg.max_spawned = 1;
-        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None).unwrap();
+        e.triggers.add(When::Every { secs: 60 }, spawn_what(), "user", None, None).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
         assert_eq!(live_spawned(&e), 1);
@@ -1358,11 +1386,36 @@ mod tests {
         panic!("the condition never came back");
     }
 
+    /// The offset is the half that carries the information — `09:00` looks correct in every
+    /// timezone, and `UTC+00` on a machine whose owner is not on UTC is the tell.
+    #[test]
+    fn the_local_clock_shows_the_offset_that_produced_it() {
+        assert_eq!(format_clock(9, 0, 0), "09:00 UTC+00");
+        assert_eq!(format_clock(14, 30, 3600), "14:30 UTC+01");
+        assert_eq!(format_clock(7, 5, -5 * 3600), "07:05 UTC-05");
+        // Zones off the hour boundary keep their minutes.
+        assert_eq!(format_clock(12, 0, 5 * 3600 + 1800), "12:00 UTC+05:30");
+        // And a negative one takes its sign before its magnitude, or the minutes come out
+        // negative too: `-03:-30`.
+        assert_eq!(format_clock(12, 0, -(3 * 3600 + 1800)), "12:00 UTC-03:30");
+    }
+
+    /// Whatever this machine's timezone is, the shape has to be readable.
+    #[test]
+    fn the_local_clock_reads_as_a_time_and_an_offset() {
+        let s = local_clock(super::super::now_millis());
+        let (hm, off) = s.split_once(' ').expect("a time then an offset");
+        assert_eq!(hm.len(), 5, "{s}");
+        assert!(hm[..2].parse::<u32>().is_ok_and(|h| h < 24), "{s}");
+        assert!(hm[3..].parse::<u32>().is_ok_and(|m| m < 60), "{s}");
+        assert!(off.starts_with("UTC+") || off.starts_with("UTC-"), "{s}");
+    }
+
     #[test]
     fn a_met_condition_lets_the_rule_act() {
         let mut e = eng("cond-yes");
         e.triggers
-            .add(When::Every { secs: 60 }, task_what(), "user", Some("true".into()))
+            .add(When::Every { secs: 60 }, task_what(), "user", Some("true".into()), None)
             .unwrap();
         wind_back(&mut e, 1, 120_000);
         settle(&mut e);
@@ -1376,7 +1429,7 @@ mod tests {
     fn an_unmet_condition_holds_the_rule_and_spends_the_interval() {
         let mut e = eng("cond-no");
         e.triggers
-            .add(When::Every { secs: 60 }, task_what(), "user", Some("false".into()))
+            .add(When::Every { secs: 60 }, task_what(), "user", Some("false".into()), None)
             .unwrap();
         wind_back(&mut e, 1, 120_000);
         settle(&mut e);
@@ -1397,7 +1450,7 @@ mod tests {
     fn a_condition_still_running_is_not_launched_again() {
         let mut e = eng("cond-once");
         e.triggers
-            .add(When::Every { secs: 60 }, task_what(), "user", Some("sleep 5".into()))
+            .add(When::Every { secs: 60 }, task_what(), "user", Some("sleep 5".into()), None)
             .unwrap();
         wind_back(&mut e, 1, 120_000);
 
@@ -1416,7 +1469,7 @@ mod tests {
     fn a_condition_that_never_answers_is_abandoned_with_a_warning() {
         let mut e = eng("cond-hang");
         e.triggers
-            .add(When::Every { secs: 60 }, task_what(), "user", Some("sleep 60".into()))
+            .add(When::Every { secs: 60 }, task_what(), "user", Some("sleep 60".into()), None)
             .unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);

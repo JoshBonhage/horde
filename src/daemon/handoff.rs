@@ -15,6 +15,7 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,15 @@ pub const HANDOFF_VERSION: u32 = 1;
 /// Descriptors per `sendmsg`. Well under the kernel's per-message limit, so a session with
 /// many panes just takes several messages.
 const FDS_PER_MSG: usize = 32;
+
+/// How long to keep retrying a `sendmsg` the socket has no room for, and how long to wait
+/// between tries.
+///
+/// Generous, because the alternative to waiting is failing the handoff: the receiver is a
+/// process we just started whose only job is to drain this, so the wait is bounded by how
+/// fast it can read rather than by anything that might never happen.
+const SEND_FD_TIMEOUT: Duration = Duration::from_secs(5);
+const SEND_FD_RETRY: Duration = Duration::from_millis(10);
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -108,6 +118,12 @@ pub struct HPane {
     pub role: Option<String>,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub board: bool,
+    /// Carried for the same reason `spawned_by` is: a fleet cap you can reset by upgrading is
+    /// not a cap. An agent that had opened its six workers would otherwise be handed six more.
+    #[serde(default)]
+    pub spawned_by_pane: Option<crate::proto::PaneId>,
     /// The pane's visible grid, replayed into the successor's emulator so the screen does
     /// not go blank. Programs that own the alternate screen (`nvim`, `htop`) come back
     /// looking approximate until they next redraw — their processes are untouched either way.
@@ -220,9 +236,33 @@ fn send_fds(sock: RawFd, fds: &[RawFd]) -> Result<()> {
         (*cmsg).cmsg_len = libc::CMSG_LEN((std::mem::size_of::<RawFd>() * n) as u32) as _;
         std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg) as *mut RawFd, n);
 
-        let sent = libc::sendmsg(sock, &msg, 0);
-        if sent < 0 {
-            return Err(std::io::Error::last_os_error()).context("sendmsg with SCM_RIGHTS");
+        // A full socket buffer does not make `sendmsg` block when it is carrying ancillary
+        // data: it fails outright with `EMSGSIZE`, because the control message has to fit
+        // alongside whatever is already queued. The manifest is written immediately before
+        // this, so a session big enough to fill the buffer with its own manifest would fail
+        // the handoff on the very next call — and "big enough" is a few dozen panes, not a
+        // pathological number.
+        //
+        // Found by the descriptor test starting to flake after two fields were added to
+        // `HPane`, which is to say: by making the manifest slightly bigger. The fix is to
+        // wait for the receiver to drain and try again, because that is exactly what the
+        // caller would want and precisely what the kernel will not do for us.
+        let mut waited = Duration::ZERO;
+        loop {
+            let sent = libc::sendmsg(sock, &msg, 0);
+            if sent >= 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            let transient = matches!(
+                err.raw_os_error(),
+                Some(libc::EMSGSIZE) | Some(libc::ENOBUFS) | Some(libc::EAGAIN) | Some(libc::EINTR)
+            );
+            if !transient || waited >= SEND_FD_TIMEOUT {
+                return Err(err).context("sendmsg with SCM_RIGHTS");
+            }
+            std::thread::sleep(SEND_FD_RETRY);
+            waited += SEND_FD_RETRY;
         }
     }
     Ok(())
@@ -342,6 +382,8 @@ mod tests {
                     spawned_by: None,
                     role: None,
                     pinned: false,
+                    board: false,
+                    spawned_by_pane: None,
                     screen: vec![],
                     pending: vec![],
                     cursor_x: 0,

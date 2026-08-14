@@ -9,60 +9,41 @@
 //! task would duplicate work silently, so a claim is a compare-and-set: it succeeds only from
 //! `Open`, and the daemon's single-threaded engine serialises the attempts.
 //!
-//! The whole board is paused for now — see [`ENABLED`] and [`AUTONOMOUS`].
+//! # Scope, which is what made this unusable the first time
+//!
+//! A task belongs to a **project**, and is only ever offered to agents in that project. The
+//! board shipped without this, and with more than one project open it does not degrade, it
+//! inverts: work added in one repository is handed to an idle agent sitting in another, which
+//! claims it and starts editing the wrong tree. With a single project the flaw is invisible,
+//! which is exactly why it survived.
+//!
+//! The scope is the space's **name**, not its id. Ids are persisted by position and are not
+//! stable across a restart, so a task holding one would point at a different project the next
+//! morning. A rename orphans a task, which is rarer and far more visible than a restart.
+//!
+//! # Staleness
+//!
+//! An open task is replayed from the log forever. That is right for a board you are working
+//! and wrong for one you walked away from: a week-old task is not work waiting for an agent,
+//! it is something you forgot about, and offering it to a fleet on the next restart is how a
+//! quiet morning turns into three agents doing archaeology. Past [`STALE_AFTER`] a task stops
+//! being offered and says so, rather than vanishing — the record is still the record.
 
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-/// Master switch for the board itself. Off: the board is paused.
-///
-/// Every method that moves a task — add, claim, done, release — is refused at the socket while
-/// this is off, so no agent can take work off the board however it was told to. `task.list` is
-/// deliberately still allowed: reading the record changes nothing, and what is stranded on it is
-/// exactly what you want to see. The log on disk is left alone, so pausing costs no history.
-///
-/// TODO(task-queue): turning this back on restores the board by hand. [`AUTONOMOUS`] is a second
-/// switch, so the pull-based half can be tried on its own before the machinery that acts unasked
-/// comes back with it.
-#[cfg(not(test))]
-pub const ENABLED: bool = false;
-
-/// Whether the board also works itself, on top of being usable by hand:
-///
-/// - the idle-agent nudge ([`super::Engine::nudge_for_tasks`]),
-/// - the tick's sweep that hands a departed agent's tasks back ([`Board::reclaim_absent`]),
-/// - the `--task` trigger action ([`super::triggers::What::Task`]), refused both when a rule is
-///   created and if a persisted one comes due.
-///
-/// This is the half that was buggy enough to mislead. It means nothing without [`ENABLED`] —
-/// read it through [`autonomous`] rather than on its own.
-///
-/// TODO(task-queue): re-arm by flipping this to `true` and putting the `agents.task_nudge`
-/// default back to `true` in [`crate::config`]. Every gate is an early return in front of code
-/// left intact, so there is nothing else to put back.
-#[cfg(not(test))]
-pub const AUTONOMOUS: bool = false;
-
-/// Both switches are on under `cfg(test)`, so the paused machinery goes on being exercised
-/// instead of rotting while it waits. What the gates add is a single early return each; what the
-/// suites are worth running for is everything behind them.
-#[cfg(test)]
-pub const ENABLED: bool = true;
-#[cfg(test)]
-pub const AUTONOMOUS: bool = true;
-
-/// Whether the board may act on its own.
-///
-/// Autonomy over a paused board would be a contradiction — the nudge would send agents at a
-/// `claim` the socket refuses — so the two switches are only ever read together.
-pub const fn autonomous() -> bool {
-    ENABLED && AUTONOMOUS
-}
-
 /// Tasks kept in memory. Beyond this the oldest done ones are forgotten.
 const CAP: usize = 2000;
+
+/// How long an open task goes on being offered.
+///
+/// A day, because that is the span of "I was working on this" — anything older outlived the
+/// session that created it, and the person who added it is not expecting an agent to pick it
+/// up unannounced. It is a threshold on *offering*, not on the record: a stale task still
+/// lists, still reads, and can still be claimed by name.
+pub const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +85,12 @@ pub struct Task {
     pub created: u64,
     /// Who added it. `user` when it came from outside a pane.
     pub by: String,
+    /// Which project it belongs to, by space *name*.
+    ///
+    /// `None` only for tasks written before the board carried scope; those are claimable by
+    /// anyone, which is the behaviour they were added under. Everything new is scoped.
+    #[serde(default)]
+    pub space: Option<String>,
     /// Agent holding it, once claimed.
     pub owner: Option<String>,
     pub claimed_at: Option<u64>,
@@ -120,6 +107,20 @@ impl Task {
     /// Open and claimed together are "outstanding" — what the board is for.
     pub fn is_claimed(&self) -> bool {
         self.state == TaskState::Claimed
+    }
+
+    /// Too old to go on being offered. See [`STALE_AFTER`].
+    pub fn is_stale(&self, now: u64) -> bool {
+        self.is_open() && now.saturating_sub(self.created) > STALE_AFTER.as_millis() as u64
+    }
+
+    /// Work this task is available for: its own project, or any when it has no scope.
+    pub fn open_to(&self, space: Option<&str>) -> bool {
+        match (&self.space, space) {
+            (None, _) => true,
+            (Some(mine), Some(theirs)) => mine == theirs,
+            (Some(_), None) => false,
+        }
     }
 }
 
@@ -153,7 +154,7 @@ impl Board {
         self.tasks.iter().filter(|t| t.state == TaskState::Claimed).count()
     }
 
-    pub fn add(&mut self, text: &str, by: &str) -> Result<Task> {
+    pub fn add(&mut self, text: &str, by: &str, space: Option<&str>) -> Result<Task> {
         let text = text.trim();
         if text.is_empty() {
             return Err(anyhow!("a task needs a description"));
@@ -164,6 +165,7 @@ impl Board {
             state: TaskState::Open,
             created: super::now_millis(),
             by: by.to_string(),
+            space: space.map(|s| s.to_string()),
             owner: None,
             claimed_at: None,
             done_at: None,
@@ -174,11 +176,17 @@ impl Board {
         Ok(task)
     }
 
-    /// Take the oldest open task, or a specific one.
+    /// Take the oldest open task in `space`, or a specific one by id.
     ///
     /// Returning `None` for "nothing to do" rather than an error is deliberate: an agent
     /// looping on the board should be able to tell "empty" from "broken".
-    pub fn claim(&mut self, owner: &str, id: Option<u64>) -> Result<Option<Task>> {
+    ///
+    /// Scope binds the unnamed claim only. Naming an id is you pointing at one task, and
+    /// refusing that because of which pane you happened to run it from would be obstruction
+    /// rather than safety — the mistake this guards against is the *automatic* pickup.
+    /// Staleness works the same way: too old to be offered, never too old to be asked for.
+    pub fn claim(&mut self, owner: &str, id: Option<u64>, space: Option<&str>) -> Result<Option<Task>> {
+        let now = super::now_millis();
         let idx = match id {
             Some(id) => {
                 let i = self
@@ -197,10 +205,16 @@ impl Board {
                 }
                 i
             }
-            None => match self.tasks.iter().position(|t| t.is_open()) {
-                Some(i) => i,
-                None => return Ok(None),
-            },
+            None => {
+                match self
+                    .tasks
+                    .iter()
+                    .position(|t| t.is_open() && t.open_to(space) && !t.is_stale(now))
+                {
+                    Some(i) => i,
+                    None => return Ok(None),
+                }
+            }
         };
 
         let t = &mut self.tasks[idx];
@@ -262,6 +276,57 @@ impl Board {
         Ok(out)
     }
 
+    /// Drop every open task, optionally only one project's.
+    ///
+    /// The thing the board was missing. `release --drop` is one task at a time, which is no
+    /// use against a board that accumulated forty of them over a week, and "I have stopped
+    /// caring about all of this" is a real and frequent intention. Recorded as `dropped`
+    /// rather than deleted, because the log is the record and a task that quietly vanished
+    /// would be indistinguishable from one that was never added.
+    /// `space` of `None` means *every* project, which is the opposite of what `None` means to
+    /// [`Task::open_to`]. The two readings are genuinely different questions: claiming asks
+    /// "may this task come to me", where an unknown scope must not sweep up other projects'
+    /// work, and clearing asks "which of these am I throwing away", where naming no project is
+    /// how you say all of them. Sharing one predicate between them made `clear --everywhere`
+    /// drop nothing at all, which is worse than either reading.
+    pub fn clear(&mut self, space: Option<&str>, claimed_too: bool) -> Vec<Task> {
+        let mut dropped = Vec::new();
+        for t in self.tasks.iter_mut() {
+            let matches_state = t.is_open() || (claimed_too && t.is_claimed());
+            let matches_space = match space {
+                None => true,
+                // An unscoped task is nobody's project and everybody's mess, so it clears
+                // with whichever project you happen to be standing in.
+                Some(want) => t.space.as_deref() == Some(want) || t.space.is_none(),
+            };
+            if matches_state && matches_space {
+                t.state = TaskState::Dropped;
+                t.done_at = Some(super::now_millis());
+                dropped.push(t.clone());
+            }
+        }
+        for t in &dropped {
+            self.append(t);
+        }
+        dropped
+    }
+
+    /// Open, fresh tasks belonging to `space` and to no other reading of the word.
+    ///
+    /// Stricter than [`Task::open_to`] on purpose. Claiming is permissive — an unscoped task
+    /// can be taken by anyone, which is how unscoped tasks already behaved — but *offering* is
+    /// the operation that goes and interrupts an agent, so it demands the project be named.
+    /// An unscoped task therefore sits there until somebody asks for it, which is exactly what
+    /// should happen to work nobody said where to do.
+    pub fn offered_to(&self, space: &str) -> usize {
+        let now = super::now_millis();
+        self.tasks
+            .iter()
+            .filter(|t| t.is_open() && !t.is_stale(now))
+            .filter(|t| t.space.as_deref() == Some(space))
+            .count()
+    }
+
     /// Hand back any task whose owner is no longer among the live claimants.
     ///
     /// Without this a crashed agent's work would sit claimed forever and the board would
@@ -286,6 +351,14 @@ impl Board {
             self.append(t);
         }
         released
+    }
+
+    /// Age a task, so staleness can be tested without waiting a day.
+    #[cfg(test)]
+    pub fn backdate_for_test(&mut self, id: u64, by_millis: u64) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
+            t.created = t.created.saturating_sub(by_millis);
+        }
     }
 
     fn record(&mut self, task: Task) {
@@ -336,6 +409,65 @@ fn read_log(path: &PathBuf) -> Vec<Task> {
 mod tests {
     use super::*;
 
+
+    /// The failure that made the board unusable: work is offered to one project only.
+    #[test]
+    fn a_task_is_only_ever_offered_to_its_own_project() {
+        let mut b = board("scope");
+        b.add("api work", "user", Some("api")).unwrap();
+        b.add("docs work", "user", Some("docs")).unwrap();
+        assert_eq!(b.offered_to("api"), 1);
+        assert_eq!(b.offered_to("docs"), 1);
+        assert_eq!(b.offered_to("something-else"), 0);
+        // And an unnamed claim takes only its own project's.
+        let got = b.claim("worker", None, Some("docs")).unwrap().unwrap();
+        assert_eq!(got.text, "docs work");
+    }
+
+    /// An unscoped task predates scoping. It may be claimed by anyone, which is how it already
+    /// behaved, but it is never *offered* — nothing should be interrupted for work that never
+    /// said where it belongs.
+    #[test]
+    fn an_unscoped_task_is_claimable_but_never_offered() {
+        let mut b = board("unscoped");
+        b.add("from before", "user", None).unwrap();
+        assert_eq!(b.offered_to("anywhere"), 0);
+        assert!(b.claim("worker", None, Some("anywhere")).unwrap().is_some());
+    }
+
+    /// `None` means "every project" here and "no project named" to `open_to`. Sharing one
+    /// predicate between them made `--everywhere` drop nothing at all.
+    #[test]
+    fn clearing_everywhere_really_does_clear_everywhere() {
+        let mut b = board("clear-all");
+        b.add("a", "user", Some("api")).unwrap();
+        b.add("b", "user", Some("docs")).unwrap();
+        b.add("c", "user", None).unwrap();
+        assert_eq!(b.clear(None, false).len(), 3);
+        assert_eq!(b.open_count(), 0);
+    }
+
+    #[test]
+    fn clearing_one_project_leaves_the_others_alone() {
+        let mut b = board("clear-one");
+        b.add("a", "user", Some("api")).unwrap();
+        b.add("b", "user", Some("docs")).unwrap();
+        assert_eq!(b.clear(Some("api"), false).len(), 1);
+        assert_eq!(b.offered_to("docs"), 1);
+        assert_eq!(b.open_count(), 1);
+    }
+
+    /// Clearing is for open work. An agent is holding a claimed task right now, and dropping
+    /// it out from under them is a different and louder intention.
+    #[test]
+    fn clearing_leaves_claimed_work_alone_unless_asked() {
+        let mut b = board("clear-claimed");
+        b.add("a", "user", Some("api")).unwrap();
+        b.claim("worker", None, Some("api")).unwrap();
+        assert_eq!(b.clear(Some("api"), false).len(), 0);
+        assert_eq!(b.clear(Some("api"), true).len(), 1);
+    }
+
     fn board(name: &str) -> Board {
         let p = std::env::temp_dir().join(format!("horde-tasks-{name}.jsonl"));
         let _ = std::fs::remove_file(&p);
@@ -345,21 +477,21 @@ mod tests {
     #[test]
     fn tasks_are_added_open_and_numbered() {
         let mut b = board("add");
-        let a = b.add("write the tests", "user").unwrap();
-        let c = b.add("review the diff", "builder").unwrap();
+        let a = b.add("write the tests", "user", None).unwrap();
+        let c = b.add("review the diff", "builder", None).unwrap();
         assert_eq!((a.id, c.id), (1, 2));
         assert!(a.is_open());
         assert_eq!(c.by, "builder");
         assert_eq!(b.open_count(), 2);
-        assert!(b.add("   ", "user").is_err(), "an empty task is not a task");
+        assert!(b.add("   ", "user", None).is_err(), "an empty task is not a task");
     }
 
     #[test]
     fn claiming_takes_the_oldest_open_task() {
         let mut b = board("fifo");
-        b.add("first", "user").unwrap();
-        b.add("second", "user").unwrap();
-        let got = b.claim("worker", None).unwrap().unwrap();
+        b.add("first", "user", None).unwrap();
+        b.add("second", "user", None).unwrap();
+        let got = b.claim("worker", None, None).unwrap().unwrap();
         assert_eq!(got.text, "first");
         assert_eq!(got.owner.as_deref(), Some("worker"));
         assert_eq!(b.open_count(), 1);
@@ -371,31 +503,31 @@ mod tests {
     #[test]
     fn a_task_cannot_be_claimed_twice() {
         let mut b = board("race");
-        b.add("only one", "user").unwrap();
-        let first = b.claim("a", Some(1)).unwrap().unwrap();
+        b.add("only one", "user", None).unwrap();
+        let first = b.claim("a", Some(1), None).unwrap().unwrap();
         assert_eq!(first.owner.as_deref(), Some("a"));
 
-        let err = b.claim("b", Some(1)).unwrap_err().to_string();
+        let err = b.claim("b", Some(1), None).unwrap_err().to_string();
         assert!(err.contains("already"), "{err}");
         assert!(err.contains("by a"), "the error should name the holder: {err}");
 
         // And a blind claim finds nothing rather than stealing it.
-        assert!(b.claim("b", None).unwrap().is_none());
+        assert!(b.claim("b", None, None).unwrap().is_none());
     }
 
     #[test]
     fn an_empty_board_reports_nothing_to_do_rather_than_an_error() {
         // An agent looping on the board has to tell "empty" from "broken".
         let mut b = board("empty");
-        assert!(b.claim("worker", None).unwrap().is_none());
+        assert!(b.claim("worker", None, None).unwrap().is_none());
     }
 
     #[test]
     fn finishing_defaults_to_your_own_claimed_task() {
         let mut b = board("done");
-        b.add("x", "user").unwrap();
-        b.add("y", "user").unwrap();
-        b.claim("worker", None).unwrap();
+        b.add("x", "user", None).unwrap();
+        b.add("y", "user", None).unwrap();
+        b.claim("worker", None, None).unwrap();
         let done = b.done("worker", None, Some("all green")).unwrap();
         assert_eq!(done.id, 1);
         assert_eq!(done.state, TaskState::Done);
@@ -409,13 +541,13 @@ mod tests {
     #[test]
     fn releasing_returns_a_task_to_the_board_and_dropping_retires_it() {
         let mut b = board("release");
-        b.add("x", "user").unwrap();
-        b.claim("worker", None).unwrap();
+        b.add("x", "user", None).unwrap();
+        b.claim("worker", None, None).unwrap();
         let back = b.release(1, false).unwrap();
         assert!(back.is_open());
         assert!(back.owner.is_none());
 
-        b.claim("worker", None).unwrap();
+        b.claim("worker", None, None).unwrap();
         let dropped = b.release(1, true).unwrap();
         assert_eq!(dropped.state, TaskState::Dropped);
         assert_eq!(b.open_count(), 0, "a dropped task is not back on the board");
@@ -425,10 +557,10 @@ mod tests {
     #[test]
     fn tasks_held_by_a_departed_agent_return_to_the_board() {
         let mut b = board("reclaim");
-        b.add("held", "user").unwrap();
-        b.add("also held", "user").unwrap();
-        b.claim("gone", Some(1)).unwrap();
-        b.claim("still-here", Some(2)).unwrap();
+        b.add("held", "user", None).unwrap();
+        b.add("also held", "user", None).unwrap();
+        b.claim("gone", Some(1), None).unwrap();
+        b.claim("still-here", Some(2), None).unwrap();
 
         let released = b.reclaim_absent(&["still-here".to_string()]);
         assert_eq!(released.len(), 1);
@@ -441,8 +573,8 @@ mod tests {
     #[test]
     fn a_task_the_user_claimed_is_never_reclaimed() {
         let mut b = board("reclaim-user");
-        b.add("mine", "user").unwrap();
-        b.claim("user", Some(1)).unwrap();
+        b.add("mine", "user", None).unwrap();
+        b.claim("user", Some(1), None).unwrap();
         assert!(b.reclaim_absent(&[]).is_empty());
         assert_eq!(b.get(1).unwrap().state, TaskState::Claimed);
     }
@@ -453,9 +585,9 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         {
             let mut b = Board::new(p.clone());
-            b.add("first", "user").unwrap();
-            b.add("second", "user").unwrap();
-            b.claim("worker", None).unwrap();
+            b.add("first", "user", None).unwrap();
+            b.add("second", "user", None).unwrap();
+            b.claim("worker", None, None).unwrap();
             b.done("worker", None, Some("finished")).unwrap();
         }
         let b = Board::new(p.clone());
@@ -465,7 +597,7 @@ mod tests {
         assert_eq!(b.get(2).unwrap().state, TaskState::Open);
         // Ids do not restart, so a replayed log cannot collide with new work.
         let mut b = Board::new(p.clone());
-        assert_eq!(b.add("third", "user").unwrap().id, 3);
+        assert_eq!(b.add("third", "user", None).unwrap().id, 3);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -493,13 +625,13 @@ mod tests {
             let mut b = Board::new(p.clone());
             // A tiny limit, so the next size check rotates.
             b.log = crate::daemon::logfile::AppendLog::with_max(p.clone(), 1);
-            b.add("still open", "user").unwrap();
-            b.add("will finish", "user").unwrap();
-            b.claim("worker", Some(2)).unwrap();
+            b.add("still open", "user", None).unwrap();
+            b.add("will finish", "user", None).unwrap();
+            b.claim("worker", Some(2), None).unwrap();
             b.done("worker", Some(2), Some("all green")).unwrap();
             // Enough appends to trigger the periodic check.
             for i in 0..300 {
-                b.add(&format!("filler {i}"), "user").unwrap();
+                b.add(&format!("filler {i}"), "user", None).unwrap();
             }
         }
         assert!(archive.exists(), "history should have been archived");

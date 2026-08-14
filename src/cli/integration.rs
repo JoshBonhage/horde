@@ -363,28 +363,31 @@ mod tests {
     }
 
     /// The skill is how an agent learns what horde offers, so it has to track what horde
-    /// actually answers. While the bus and the board are paused (`daemon::bus::ENABLED`,
-    /// `daemon::tasks::ENABLED`) a skill that still reads as "message the reviewer" spends the
-    /// agent's turn on a command the daemon refuses — and, worse, invites it to go looking for
-    /// the bug. Both halves are pinned: that the pause is stated, and that the refused commands
-    /// are not presented as things to run.
+    /// actually answers. A skill that describes a command the daemon refuses spends the
+    /// agent's turn on it and then invites it to go looking for the bug, which is exactly what
+    /// went wrong while the bus and the board were switched off.
+    ///
+    /// Now that both are back, the thing worth pinning is the opposite: that the skill teaches
+    /// the two rules an agent cannot infer from the command names, because getting either
+    /// wrong is what made the board unusable the first time.
     #[test]
-    fn the_skill_says_the_bus_and_the_board_are_paused() {
+    fn the_skill_teaches_the_rules_an_agent_cannot_infer() {
         let lower = SKILL.to_lowercase();
-        assert!(lower.contains("paused"), "the skill must say the bus and board are off");
-        // In the frontmatter too: the description is all that is read when deciding whether
-        // the skill is even relevant, so the pause has to survive that trim.
-        let front = SKILL.split("---").nth(1).expect("frontmatter");
+        // Enlistment. An agent that does not know it has to opt in concludes the board is
+        // broken when nothing ever arrives.
+        assert!(lower.contains("horde task work"), "the skill must teach enlisting");
         assert!(
-            front.to_lowercase().contains("paused"),
-            "the description must carry the pause, or the skill loads for delegating work"
+            lower.contains("enlist"),
+            "the skill must say that work is not offered until you enlist"
         );
-        // The old skill's instruction to answer a request. Nothing can send one now, so an
-        // agent told to watch for them is watching for something that cannot arrive.
+        // Isolation. Several agents in one repository without worktrees is the failure that
+        // loses work silently, and it is not visible from any command's name.
         assert!(
-            !SKILL.contains("[horde] request"),
-            "no request can be delivered while the bus is paused"
+            lower.contains("--worktree"),
+            "the skill must teach worktrees before it teaches spawning a fleet"
         );
+        // Nothing may claim the pause is still on.
+        assert!(!lower.contains("paused"), "the bus and the board are back on");
     }
 
     #[test]

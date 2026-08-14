@@ -52,6 +52,48 @@ authoritative version — this page describes the defaults.
 `ctrl+b a` is the one that earns its keep once you have more than two agents: it walks the
 queue of agents that are `blocked` or `done`, so you never hunt for the one waiting on you.
 
+### The approval queue
+
+`ctrl+b A` is the other half of that: rather than walking to each blocked agent in turn, it
+shows every pending question in one list and lets you answer from there.
+
+```
+◍ reviewer   Halo Suite   waiting 12m
+  Do you want to make this edit to src/mux.rs?
+    1  Yes
+    2  Yes, and don't ask again
+    3  No, and tell Claude what to do differently
+
+◍ builder    horde        waiting 4m
+  Allow npm test to run?
+```
+
+| Key | Action |
+|---|---|
+| `j` / `k` | move between waiting agents |
+| `1`–`9`, `y`, `n` | answer the highlighted one |
+| `enter` | open its pane instead |
+| `esc` | close |
+
+Three things about it are deliberate:
+
+- **Options are shown only for the agent under the cursor.** Six agents' choices at once
+  would be thirty lines with no way to tell which digit belongs to which agent, which is the
+  mistake that would make answering from here dangerous.
+- **A key the agent did not offer does nothing.** A `4` where the agent listed three options
+  is ignored rather than forwarded. This window shows you a menu; a keystroke that means
+  nothing in it must not mean something in the pane.
+- **It stays open after an answer.** Answering one of six is the case it exists for, and the
+  agent you answered drops out of the list on the next pass.
+
+The question is read off the agent's screen, which is a heuristic — it handles a numbered
+menu and a plain `(y/n)` prompt, box-drawn or not, wrapped or not. When it cannot read one,
+the agent is still listed and still says it is waiting, with `enter` to go and look. It will
+not guess.
+
+horde only ever sends the key you pressed, to the pane you were pointing at. There is no path
+here for typing free text into an agent.
+
 ### Walking the sidebar
 
 `ctrl+b E` hands the keyboard to the sidebar so its list can be walked with single keys. The
@@ -175,4 +217,4 @@ most prominent thing on the bar.
 ## Not implemented
 
 Dragging pane borders to resize — use `H J K L`. Text selection in copy mode — right-click →
-copy visible text instead. OSC 52 clipboard forwarding.
+copy visible text instead.

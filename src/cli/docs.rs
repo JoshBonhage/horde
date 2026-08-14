@@ -24,7 +24,13 @@ pub const PAGES: &[(&str, &str, &str)] = &[
         "triggers, and how horde reaches you when nothing is attached",
         include_str!("../../docs/unattended.md"),
     ),
+    (
+        "worktrees",
+        "one git worktree per agent, so a fleet in one repo cannot overwrite itself",
+        include_str!("../../docs/worktrees.md"),
+    ),
     ("keys", "keybindings, mouse, right-click menus", include_str!("../../docs/keys.md")),
+    ("wsl", "running horde on Windows, under WSL2", include_str!("../../docs/wsl.md")),
     ("troubleshooting", "when something looks wrong", include_str!("../../docs/troubleshooting.md")),
 ];
 

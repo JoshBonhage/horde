@@ -43,7 +43,8 @@ accent = "#7ee2c0"
 blocked = "#ff7b72"
 working = "#f0c674"
 # any of: accent accent_alt bg panel_bg title_bg text text_dim text_faint border
-#         border_focus working blocked done idle unknown ok warn error selection fg cursor
+#         border_focus working blocked done idle unknown serving ok warn error selection
+#         fg cursor
 # accepts #rgb, #rrggbb, rgb(r,g,b), or an ANSI colour name
 
 # Roles you have named, and how each is drawn. Declaring one styles it; it does not permit
@@ -151,16 +152,8 @@ answers its open permission prompt. See [orchestration §4](orchestration.md).
 
 ## `agents.task_nudge`
 
-**Parked, and so is the board it nudges about.** Off by default, and setting it to `true`
-currently does nothing. Two switches in `daemon::tasks` hold this:
-
-- `ENABLED` — the board itself. While it is off the board is **paused**: `task.add`, `task.claim`,
-  `task.done` and `task.release` are refused at the socket, so no agent can take work off it
-  however it was told to. `horde task list` still reads it, and the log on disk is left alone.
-- `AUTONOMOUS` — the half that acts unasked: this nudge, the sweep that reclaims a departed
-  agent's tasks, and the `--task` trigger action.
-
-The rest of this section describes the nudge as it will be when both go back on.
+**Off by default.** The board works by hand without it; this is the half that acts unasked,
+and it is worth watching a board behave for a day before switching it on.
 
 The task board is pull-based — nobody assigns work, whoever is free claims it.
 But an idle agent has no reason to look at a board it was never told about, so horde tells one:
@@ -170,8 +163,16 @@ when there are open tasks and an agent is free, it receives a single `[horde]` l
 It stays a nudge, not an assignment. `claim` is still first-come-first-served, so nothing about
 who ends up with which task depends on who got told.
 
-Three limits keep it from wasting turns, and each exists because the obvious version did:
+Five limits keep it from wasting turns or reaching the wrong agent, and each exists because
+the obvious version did not have it:
 
+- **One project at a time.** A task belongs to the space it was added in, and is only offered
+  to agents in that space. Without this the board inverts the moment you have two projects
+  open: work added in one repository is handed to an idle agent sitting in another, which
+  claims it and starts editing the wrong tree.
+- **Volunteers only.** An agent is offered work after `horde task work`, or if it was spawned
+  with `--board`, and never otherwise. Before this every idle agent counted as a worker,
+  including the one you opened to think with.
 - **Never more agents than there is work.** One task wakes one agent, five tasks wake up to
   five. The first version woke one agent *per detection pass*, which over a few seconds meant
   every idle agent was told about a single task.
@@ -183,8 +184,23 @@ Three limits keep it from wasting turns, and each exists because the obvious ver
   and then went quiet.
 
 Turn it off with `task_nudge = false`, or from the settings page under Agents, and the board
-becomes purely manual: agents only find work when they look. Today it is neither — the board is
-paused outright, whatever this setting says.
+becomes purely manual: agents only find work when they look.
+
+Open tasks stop being offered after a day (`tasks::STALE_AFTER`). A week-old task is not work
+waiting for an agent, it is something you forgot about, and offering it to a fleet on the next
+restart is how a quiet morning turns into archaeology. It stays on the board, still readable
+and still claimable by id — stale is not deleted. `horde task clear` wipes a project's open
+work outright.
+
+## `agents.max_fleet`
+
+How many live panes agents may have started between them. Six by default.
+
+Separate from `triggers.max_spawned`, which bounds what horde starts with nobody present. This
+bounds what an agent starts while you are sitting there, which is a different risk: not "is
+anyone watching" but "an agent in a loop opens panes until the machine gives up". A lead agent
+building a team is the intended use, so the number is a working team rather than a token
+allowance. It survives `horde upgrade`, because a cap you can reset by restarting is not a cap.
 
 ## `notifications.command`
 
@@ -237,9 +253,26 @@ The report waiting when you get back is still the whole story.
 Every alert is recorded in the journal, so "was I told, and when" is answerable afterwards
 rather than a matter of trusting that it worked.
 
-`delivery = "system"` now also fires from the daemon while you are detached. That works because
-the daemon inherits your GUI session; if you started horde over SSH with no such session,
-macOS has nowhere to post a notification and `command` is the sink that still works.
+`delivery = "system"` now also fires from the daemon while you are detached. It resolves to
+`osascript` on macOS and `notify-send` on Linux, and to nothing at all under WSL, where every
+candidate costs a dependency worth more than the setting. It also needs a GUI session to post
+into, which horde over SSH does not have.
+
+Where there is no sink, the daemon logs the reason once rather than failing quietly on every
+alert — and `command` is what still works. Under WSL that is the route, because any Windows
+executable on `$PATH` is reachable from the command hook and `$1` is the summary:
+
+```toml
+[notifications]
+# Whichever Windows-side toaster you have. Both of these need installing first —
+# BurntToast is a PowerShell module, wsl-notify-send is a single .exe.
+command = 'powershell.exe -NoProfile -Command "New-BurntToastNotification -Text horde, \"$1\""'
+# command = 'wsl-notify-send.exe --category horde "$1"'
+```
+
+Neither ships with Windows, which is the whole reason horde does not try to pick one for you.
+`interop.appendWindowsPath` must also still be on in `wsl.conf`, or no `.exe` is on `$PATH` at
+all.
 
 ## `triggers.unattended`
 

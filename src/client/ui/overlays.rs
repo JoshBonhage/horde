@@ -14,7 +14,7 @@ use crate::client::settings::{self, Kind};
 use crate::client::{App, Mode, PickKind};
 use crate::config::{Action, Trigger};
 use crate::proto::Snapshot;
-use crate::proto::{AgentLine, AgentState, Delivery, Digest, NoticeLevel, Rgb};
+use crate::proto::{AgentLine, AgentState, Choice, Delivery, Digest, NoticeLevel, PaneId, Question, Rgb};
 use crate::theme::Theme;
 
 /// A bordered panel with a title, used by every overlay so they read as one family.
@@ -123,6 +123,7 @@ fn describe_action(name: &str, action: &Action) -> String {
         Action::SidebarFocus => "walk the sidebar with j/k".into(),
         Action::TogglePin => "pin this agent to the top of the sidebar".into(),
         Action::Roster => "every project and agent, full screen".into(),
+        Action::Approvals => "answer every agent waiting on you".into(),
         Action::CycleLens => "filter the agent list".into(),
         // The generic name-to-words fallback would render this as bare "digest", which does
         // not say what it does.
@@ -793,6 +794,7 @@ fn state_color(s: AgentState, t: &Theme) -> Rgb {
         AgentState::Blocked => t.ui.warn,
         AgentState::Working => t.ui.accent,
         AgentState::Done => t.ui.ok,
+        AgentState::Serving => t.ui.serving,
         _ => t.ui.text_dim,
     }
 }
@@ -855,6 +857,79 @@ mod tests {
     use super::*;
     use crate::config::Keymap;
     use crate::proto::TaskLine;
+
+    // -- the approval queue ------------------------------------------------------------
+
+    /// A session of nothing but blocked agents, in one space.
+    fn blocked_snap(agents: &[(PaneId, &str, u64, Option<Question>)]) -> Snapshot {
+        let mut snap = crate::client::roster::tests::snap();
+        snap.spaces.truncate(1);
+        snap.panes = agents
+            .iter()
+            .map(|(id, name, elapsed, q)| {
+                let mut p = crate::client::roster::tests::pane(*id, 1, 1, Some((name, AgentState::Blocked)));
+                if let Some(a) = p.agent.as_mut() {
+                    a.elapsed = *elapsed;
+                    a.question = q.clone();
+                }
+                p
+            })
+            .collect();
+        snap
+    }
+
+    fn menu(text: &str, keys: &[&str]) -> Question {
+        Question {
+            text: text.into(),
+            options: keys
+                .iter()
+                .map(|k| Choice { key: (*k).into(), label: format!("option {k}") })
+                .collect(),
+        }
+    }
+
+    /// Longest wait first. A queue is worked from the top, and elapsed only ever grows — any
+    /// other ordering reshuffles under the cursor as agents block and unblock.
+    #[test]
+    fn the_queue_puts_the_longest_wait_first() {
+        let snap = blocked_snap(&[
+            (1, "quick", 5, Some(menu("a?", &["1", "2"]))),
+            (2, "stuck", 900, Some(menu("b?", &["1", "2"]))),
+            (3, "middling", 60, Some(menu("c?", &["1", "2"]))),
+        ]);
+        let names: Vec<String> = pending(&snap).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["stuck", "middling", "quick"]);
+    }
+
+    /// Only blocked agents. A working one is not waiting on you, and a queue that listed it
+    /// would be a list of everything rather than a list of decisions.
+    #[test]
+    fn only_agents_that_are_actually_blocked_are_queued() {
+        let mut snap = blocked_snap(&[(1, "waiting", 10, Some(menu("a?", &["1", "2"])))]);
+        let busy = crate::client::roster::tests::pane(2, 1, 1, Some(("busy", AgentState::Working)));
+        snap.panes.push(busy);
+        let q = pending(&snap);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].name, "waiting");
+    }
+
+    /// A blocked agent whose prompt could not be read still belongs in the queue: it is still
+    /// waiting on you, and the pane is one keypress away.
+    #[test]
+    fn an_unreadable_prompt_still_earns_a_place_in_the_queue() {
+        let snap = blocked_snap(&[(1, "mystery", 30, None)]);
+        let q = pending(&snap);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].question, None);
+    }
+
+    /// A digit is a menu selection, which agents act on the moment it arrives. A letter is an
+    /// answer to a `(y/n)` prompt, read as a line, and needs the Enter that submits it.
+    #[test]
+    fn a_menu_digit_is_sent_bare_and_a_yes_no_answer_is_submitted() {
+        assert_eq!(answer_bytes(&Choice { key: "2".into(), label: "No".into() }), b"2".to_vec());
+        assert_eq!(answer_bytes(&Choice { key: "y".into(), label: "yes".into() }), b"y\r".to_vec());
+    }
 
     #[test]
     fn every_binding_gets_a_non_empty_description() {
@@ -1122,12 +1197,21 @@ pub fn roster_cards(snap: &Snapshot, width: usize) -> Vec<Card> {
                 _ => info.state.label().to_string(),
             };
             let role = p.role.as_deref().map(|r| format!(" [{r}]")).unwrap_or_default();
+            // Its own branch, for an agent horde isolated in a worktree. The card has the
+            // width the sidebar does not, and "which tree is this one in" is exactly the
+            // question a full-screen roster is for.
+            let tree = p
+                .repo
+                .as_ref()
+                .filter(|r| r.worktree)
+                .map(|r| format!(" ⑂{}{}", r.branch, if r.dirty { "*" } else { "" }))
+                .unwrap_or_default();
             // `horde` marks a pane horde started rather than you — the same fact `agent.list`
             // exposes and nothing else in the UI has ever shown.
             let by = if p.spawned_by.is_some() { " · horde" } else { "" };
             focuses.push((lines.len(), Focus::Agent(a.pane)));
             lines.push(truncate(
-                &format!("{} {}{role}  {detail}{by}", info.state.glyph(), info.name),
+                &format!("{} {}{role}{tree}  {detail}{by}", info.state.glyph(), info.name),
                 width,
             ));
             // Only while it is actually doing something — a finished turn's counts are stale
@@ -1228,6 +1312,211 @@ pub fn roster(f: &mut Frame, area: TRect, app: &mut App) {
     }
 
     let hint = "enter jumps · j/k move · p pin · esc closes";
+    put_line(
+        f.buffer_mut(),
+        inner.x,
+        bottom - 1,
+        inner.width,
+        Line::from(vec![Span::styled(
+            hint.to_string(),
+            Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.panel_bg)),
+        )]),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The approval queue
+// ---------------------------------------------------------------------------
+
+/// One agent waiting on you, and what it asked.
+///
+/// Separate from drawing it for the same reason `digest_lines` and `roster_cards` are: the
+/// content is then assertable without standing up a terminal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub pane: PaneId,
+    pub name: String,
+    pub space: String,
+    /// Seconds it has been waiting. The one number that decides the order.
+    pub elapsed: u64,
+    /// What it asked, when the prompt could be read off its screen.
+    pub question: Option<Question>,
+}
+
+/// Every agent blocked on a decision, longest wait first.
+///
+/// Longest first because a queue is worked from the top and the agent that has been stuck for
+/// twelve minutes has cost you the most. That is also the only ordering that does not
+/// reshuffle under you as agents block and unblock: elapsed only ever grows.
+pub fn pending(snap: &Snapshot) -> Vec<Pending> {
+    let mut out: Vec<Pending> = Vec::new();
+    for space in &snap.spaces {
+        for p in snap.panes.iter().filter(|p| p.space == space.id) {
+            let Some(a) = p.agent.as_ref() else { continue };
+            if a.state != AgentState::Blocked {
+                continue;
+            }
+            out.push(Pending {
+                pane: p.id,
+                name: a.name.clone(),
+                space: space.name.clone(),
+                elapsed: a.elapsed,
+                question: a.question.clone(),
+            });
+        }
+    }
+    out.sort_by(|a, b| b.elapsed.cmp(&a.elapsed).then(a.pane.cmp(&b.pane)));
+    out
+}
+
+/// What pressing an option sends to the pane.
+///
+/// A digit is a menu selection, which agents act on the moment it arrives — the same as
+/// pressing it with the pane focused, because that is exactly what this is. A letter is an
+/// answer to a `(y/n)` prompt, which is read as a line and needs the Enter that submits it.
+///
+/// Deliberately raw input rather than a bus message: this is you answering, not an agent
+/// talking to another agent, and the bus would rightly refuse to type at a blocked pane.
+pub fn answer_bytes(choice: &Choice) -> Vec<u8> {
+    let mut b = choice.key.as_bytes().to_vec();
+    if !choice.key.chars().all(|c| c.is_ascii_digit()) {
+        b.push(b'\r');
+    }
+    b
+}
+
+/// Every pending question in one place, answerable without leaving it.
+pub fn approvals(f: &mut Frame, area: TRect, app: &mut App) {
+    let theme = app.cfg.theme.clone();
+    let Some(snap) = app.snapshot.clone() else { return };
+    let items = pending(&snap);
+    let sel = match app.mode {
+        Mode::Approvals { sel } => sel.min(items.len().saturating_sub(1)),
+        _ => 0,
+    };
+
+    let outer = centered(area, area.width.saturating_sub(8).min(84), area.height.saturating_sub(4));
+    let inner = panel(f, outer, "needs you", &theme);
+    if inner.width < 24 || inner.height < 4 {
+        return;
+    }
+    let bottom = inner.y + inner.height;
+    let w = inner.width as usize;
+    let mut y = inner.y;
+
+    if items.is_empty() {
+        // An empty queue is the good outcome, so it says so rather than looking broken.
+        put_line(
+            f.buffer_mut(),
+            inner.x,
+            y,
+            inner.width,
+            Line::from(vec![Span::styled(
+                "nothing is waiting on you".to_string(),
+                Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.panel_bg)),
+            )]),
+        );
+        return;
+    }
+
+    for (i, item) in items.iter().enumerate() {
+        if y >= bottom.saturating_sub(1) {
+            break;
+        }
+        let on = i == sel;
+        let bg = if on { theme.ui.title_bg } else { theme.ui.panel_bg };
+
+        // Who, where, and how long — the line you decide from before reading the question.
+        let head = format!(
+            "{} {}  {}  waiting {}",
+            AgentState::Blocked.glyph(),
+            item.name,
+            item.space,
+            fmt_elapsed(item.elapsed)
+        );
+        put_line(
+            f.buffer_mut(),
+            inner.x,
+            y,
+            inner.width,
+            Line::from(vec![Span::styled(
+                format!("{:<w$}", truncate(&head, w)),
+                Style::default()
+                    .fg(color(if on { theme.ui.text } else { theme.ui.text_dim }))
+                    .bg(color(bg))
+                    .add_modifier(if on { Modifier::BOLD } else { Modifier::empty() }),
+            )]),
+        );
+        y += 1;
+
+        match &item.question {
+            Some(q) => {
+                if y < bottom.saturating_sub(1) {
+                    put_line(
+                        f.buffer_mut(),
+                        inner.x,
+                        y,
+                        inner.width,
+                        Line::from(vec![Span::styled(
+                            format!("{:<w$}", truncate(&format!("  {}", q.text), w)),
+                            Style::default().fg(color(theme.ui.blocked)).bg(color(bg)),
+                        )]),
+                    );
+                    y += 1;
+                }
+                // Options only for the row under the cursor. All of them at once would be
+                // thirty lines of choices with no way to tell which digit belongs to which
+                // agent — which is the mistake that would make answering from here dangerous.
+                if on {
+                    for c in &q.options {
+                        if y >= bottom.saturating_sub(1) {
+                            break;
+                        }
+                        put_line(
+                            f.buffer_mut(),
+                            inner.x,
+                            y,
+                            inner.width,
+                            Line::from(vec![
+                                Span::styled(
+                                    format!("    {}  ", c.key),
+                                    Style::default()
+                                        .fg(color(theme.ui.accent))
+                                        .bg(color(bg))
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    format!("{:<rest$}", truncate(&c.label, w.saturating_sub(7)), rest = w.saturating_sub(7)),
+                                    Style::default().fg(color(theme.ui.text)).bg(color(bg)),
+                                ),
+                            ]),
+                        );
+                        y += 1;
+                    }
+                }
+            }
+            // Nothing was parsed off the screen. Say so plainly instead of pretending: the
+            // pane is one keypress away and still has the real thing on it.
+            None => {
+                if y < bottom.saturating_sub(1) {
+                    put_line(
+                        f.buffer_mut(),
+                        inner.x,
+                        y,
+                        inner.width,
+                        Line::from(vec![Span::styled(
+                            format!("{:<w$}", "  question could not be read — enter opens the pane"),
+                            Style::default().fg(color(theme.ui.text_faint)).bg(color(bg)),
+                        )]),
+                    );
+                    y += 1;
+                }
+            }
+        }
+        y += 1;
+    }
+
+    let hint = "1-9 answers · j/k moves · enter opens the pane · esc closes";
     put_line(
         f.buffer_mut(),
         inner.x,

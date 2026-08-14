@@ -25,6 +25,27 @@ struct Err_ {
 
 type R = Result<Value, Err_>;
 
+/// The project a call belongs to, by space name: the calling pane's, else the focused one.
+///
+/// Board work is scoped to a project, and this is where the scope comes from. Taking it from
+/// the caller rather than from an argument is what makes `horde task add` do the obvious thing
+/// from inside a pane, which is where agents run it.
+fn caller_space(eng: &Engine, req: &Request) -> Option<String> {
+    let pane = pane_arg(eng, req, "from").or_else(|| eng.session.focused_pane())?;
+    let space = eng.session.panes.get(&pane)?.space;
+    eng.session.space(space).map(|s| s.name.clone())
+}
+
+/// Which directory worktree commands act on: the focused pane's, so `horde worktree list`
+/// answers about the project you are looking at rather than wherever the daemon started.
+fn worktree_origin(eng: &Engine) -> Result<std::path::PathBuf, Err_> {
+    eng.session
+        .focused_pane()
+        .and_then(|p| eng.session.panes.get(&p))
+        .map(|p| p.cwd.clone())
+        .ok_or_else(|| failed("no pane to take a directory from"))
+}
+
 fn bad(msg: impl Into<String>) -> Err_ {
     Err_ { code: "bad_request", message: msg.into() }
 }
@@ -93,38 +114,6 @@ fn dir_arg(req: &Request, key: &str, default: Dir) -> Dir {
 }
 
 fn handle(eng: &mut Engine, req: &Request) -> R {
-    // The board is paused (see `tasks::ENABLED`), so nothing may move a task. Checked once in
-    // front of dispatch rather than once per method: this is the choke point every agent goes
-    // through however it was told to claim, and a `task.*` method added later cannot slip past a
-    // guard that names none of them.
-    //
-    // `task.list` is let through on purpose. Reading the record moves nothing, and while the
-    // board is paused what is stranded on it is the thing worth being able to see.
-    if !super::tasks::ENABLED && req.method.starts_with("task.") && req.method != "task.list" {
-        return Err(failed(
-            "the task board is paused while it is reworked — no task can be added, claimed, \
-             finished, or released. `horde task list` still shows what is on it.",
-        ));
-    }
-
-    // The bus is paused too (see `bus::ENABLED`), and for the same reason: this is the choke
-    // point every message goes through, so a `bus.*` method added later cannot slip past a
-    // guard that names none of them.
-    //
-    // `bus.tail` and `bus.reply_for` are let through on purpose. Both only read the log —
-    // neither can put text into a pane, which is the thing being paused — and the history is
-    // what you want to be able to look back over while it is off.
-    if !super::bus::ENABLED
-        && req.method.starts_with("bus.")
-        && !matches!(req.method.as_str(), "bus.tail" | "bus.reply_for")
-    {
-        return Err(failed(
-            "the message bus is paused while it is reworked — nothing can be sent, replied to, \
-             or broadcast, so no message can be injected into a pane. `horde bus tail` still \
-             shows the log.",
-        ));
-    }
-
     match req.method.as_str() {
         // -- server ------------------------------------------------------
         "ping" => Ok(json!({ "type": "pong", "protocol": crate::proto::PROTOCOL_VERSION })),
@@ -156,18 +145,23 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             "socket": crate::config::socket_path().to_string_lossy(),
             "theme": eng.cfg.theme.name,
             "agent_manifests": eng.agents.manifest_names(),
+            // The clock triggers actually fire on. `--at 09:00` means nine *here*, and a distro
+            // whose timezone was never set sits on UTC while the person setting the trigger does
+            // not — which looks like triggers firing at random rather than like a wrong clock.
+            // Printing it is the cheapest way for that to be noticed before it matters.
+            "local_time": super::triggers::local_clock(super::now_millis()),
         })),
 
         // -- session -----------------------------------------------------
         "session.snapshot" => {
             let cfg = eng.cfg.clone();
-            serde_json::to_value(eng.session.snapshot(&cfg)).map_err(|e| failed(e.to_string()))
+            serde_json::to_value(eng.session.snapshot(&cfg, &eng.repos)).map_err(|e| failed(e.to_string()))
         }
 
         // -- spaces ------------------------------------------------------
         "space.list" => {
             let cfg = eng.cfg.clone();
-            Ok(json!(eng.session.snapshot(&cfg).spaces))
+            Ok(json!(eng.session.snapshot(&cfg, &eng.repos).spaces))
         }
         "space.create" => {
             let cwd = str_arg(req, "cwd")
@@ -245,7 +239,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         // -- tabs --------------------------------------------------------
         "tab.list" => {
             let cfg = eng.cfg.clone();
-            Ok(json!(eng.session.snapshot(&cfg).tabs))
+            Ok(json!(eng.session.snapshot(&cfg, &eng.repos).tabs))
         }
         "tab.create" => {
             let space = eng
@@ -287,7 +281,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         // -- panes -------------------------------------------------------
         "pane.list" => {
             let cfg = eng.cfg.clone();
-            Ok(json!(eng.session.snapshot(&cfg).panes))
+            Ok(json!(eng.session.snapshot(&cfg, &eng.repos).panes))
         }
         "pane.current" => Ok(json!({ "pane": eng.session.focused_pane() })),
         "pane.split" => {
@@ -479,6 +473,9 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                         out.push(json!({
                             "name": a.name,
                             "kind": a.kind,
+                            // "agent" or "service". A dev server appears in the roster
+                            // because you want to see it; it is not one of your agents.
+                            "class": a.class,
                             "state": a.state.label(),
                             "elapsed": a.since.elapsed().as_secs(),
                             "authority": a.authority,
@@ -508,16 +505,141 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             let cmd = str_arg(req, "cmd").unwrap_or("claude").to_string();
             let dir = dir_arg(req, "split", Dir::Right);
             let cfg = eng.cfg.clone();
+            let name = str_arg(req, "name").map(|s| s.to_string());
+
+            // Who asked. An agent spawning agents is the whole point of a lead agent, and also
+            // the one way a pane count runs away without anybody noticing, so it is capped.
+            // A spawn from outside a pane is you, and you are not capped.
+            let from = pane_arg(eng, req, "from");
+            let by_agent = from.filter(|p| eng.session.panes.contains_key(p));
+            if by_agent.is_some() {
+                let live = eng
+                    .session
+                    .panes
+                    .values()
+                    .filter(|p| p.spawned_by_pane.is_some() && p.exited.is_none())
+                    .count();
+                if live >= cfg.max_fleet {
+                    return Err(failed(format!(
+                        "agents already have {live} panes open, which is the limit \
+                         (agents.max_fleet). Close some, or raise it in config.toml."
+                    )));
+                }
+            }
+
+            // A worktree, when asked for. Named after the agent unless you said otherwise,
+            // because "which tree is Kenny working in" should not need looking up.
+            let worktree = match req.params.get("worktree") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(false)) => None,
+                Some(v) => {
+                    let want = v
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| name.clone())
+                        .ok_or_else(|| bad("--worktree needs a name, or give the agent one"))?;
+                    // From the pane the split comes off, so the worktree hangs off the project
+                    // you are actually in rather than wherever the daemon was started.
+                    let from = eng
+                        .session
+                        .focused_pane()
+                        .and_then(|p| eng.session.panes.get(&p))
+                        .map(|p| p.cwd.clone())
+                        .ok_or_else(|| failed("no pane to take a directory from"))?;
+                    Some(super::repo::add_worktree(&from, &want, None).map_err(|e| failed(format!("{e:#}")))?)
+                }
+            };
+
             let id = eng
                 .session
-                .split(&cfg, None, dir, Some(&cmd))
+                .split_in(&cfg, None, dir, Some(&cmd), worktree.as_deref())
                 .map_err(|e| failed(e.to_string()))?;
-            if let (Some(n), Some(p)) = (str_arg(req, "name"), eng.session.panes.get_mut(&id)) {
-                p.name = Some(n.to_string());
+            if let Some(p) = eng.session.panes.get_mut(&id) {
+                if let Some(n) = name {
+                    p.name = Some(n);
+                }
+                // The job it is for, so a fleet reads as a team rather than as claude-2..7.
+                if let Some(r) = str_arg(req, "role").and_then(crate::config::normalise_role) {
+                    p.role = Some(r);
+                }
+                // Enlisting at spawn is how a lead agent builds a fleet that will take board
+                // work, without every other agent in the project being volunteered too.
+                if bool_arg(req, "board") {
+                    p.board = true;
+                }
+                p.spawned_by_pane = by_agent;
             }
+
+            // A first job, handed over at spawn. Goes on the board rather than into the pane:
+            // the agent is still booting and has no prompt to type at yet, and the board is
+            // the thing that survives it not being ready.
+            let task = match str_arg(req, "task") {
+                Some(text) => {
+                    let space = eng
+                        .session
+                        .panes
+                        .get(&id)
+                        .and_then(|p| eng.session.space(p.space))
+                        .map(|s| s.name.clone());
+                    let by = super::bus::Bus::sender_name(&eng.session, from);
+                    Some(
+                        eng.board
+                            .add(text, &by, space.as_deref())
+                            .map_err(|e| failed(e.to_string()))?,
+                    )
+                }
+                None => None,
+            };
+
             eng.touch();
             eng.detect_now();
-            Ok(json!({ "pane": id, "cmd": cmd }))
+            let mut out = json!({ "pane": id, "cmd": cmd });
+            if let Some(w) = worktree {
+                out["worktree"] = json!(w.to_string_lossy());
+            }
+            if let Some(t) = task {
+                out["task"] = json!(t.id);
+            }
+            Ok(out)
+        }
+        "worktree.list" => {
+            let from = worktree_origin(eng)?;
+            let found = super::repo::list_worktrees(&from).map_err(|e| failed(format!("{e:#}")))?;
+            // Which pane is in each tree, so the listing answers "can I remove this" without
+            // a second lookup. A worktree with nobody in it is the removable kind.
+            Ok(json!(found
+                .iter()
+                .map(|w| {
+                    let pane = eng.session.panes.values().find(|p| p.cwd == w.path);
+                    json!({
+                        "name": w.name,
+                        "branch": w.branch,
+                        "path": w.path.to_string_lossy(),
+                        "dirty": w.dirty,
+                        "pane": pane.map(|p| p.id),
+                        "agent": pane.and_then(|p| p.agent.as_ref()).map(|a| a.name.clone()),
+                    })
+                })
+                .collect::<Vec<_>>()))
+        }
+        "worktree.remove" => {
+            let name = str_arg(req, "name").ok_or_else(|| bad("name required"))?;
+            let from = worktree_origin(eng)?;
+            // A live pane in the tree is the one refusal git cannot make for us: it would
+            // happily delete the directory out from under a running agent.
+            let path = super::repo::worktree_path(
+                &super::repo::main_root(&from).ok_or_else(|| failed("not a git repository"))?,
+                name,
+            );
+            if let Some(p) = eng.session.panes.values().find(|p| p.cwd == path) {
+                return Err(bad(format!(
+                    "pane {} is still working in {name}; close it first",
+                    p.id
+                )));
+            }
+            let removed = super::repo::remove_worktree(&from, name, bool_arg(req, "force"))
+                .map_err(|e| failed(format!("{e:#}")))?;
+            Ok(json!({ "removed": removed.to_string_lossy() }))
         }
         "agent.wait" => {
             // Waiting blocks the caller, which would stall the single-threaded engine. The
@@ -608,14 +730,43 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         "task.add" => {
             let text = str_arg(req, "text").ok_or_else(|| bad("text required"))?;
             let by = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
-            let t = eng.board.add(text, &by).map_err(|e| failed(e.to_string()))?;
+            // An explicit `space` overrides, so a lead agent can stage work for a project it
+            // is not sitting in. Otherwise the caller's own.
+            let space =
+                str_arg(req, "space").map(|s| s.to_string()).or_else(|| caller_space(eng, req));
+            let t = eng
+                .board
+                .add(text, &by, space.as_deref())
+                .map_err(|e| failed(e.to_string()))?;
             eng.touch();
             serde_json::to_value(t).map_err(|e| failed(e.to_string()))
+        }
+        "task.clear" => {
+            // Scoped like everything else, so clearing one project's board does not wipe the
+            // others. `--all` widens it back out, because "I have stopped caring about all of
+            // this" is also a real intention.
+            let space = if bool_arg(req, "everywhere") { None } else { caller_space(eng, req) };
+            let dropped = eng.board.clear(space.as_deref(), bool_arg(req, "claimed"));
+            eng.touch();
+            Ok(json!({ "dropped": dropped.len(), "space": space }))
+        }
+        "task.work" => {
+            // Enlist. Deliberately a thing an agent does to itself rather than something done
+            // to it: the board's failure mode was work arriving at agents that never asked.
+            let pane = pane_arg(eng, req, "from")
+                .or_else(|| eng.session.focused_pane())
+                .ok_or_else(|| bad("no pane"))?;
+            let on = req.params.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+            let p = eng.session.panes.get_mut(&pane).ok_or_else(|| not_found("no such pane"))?;
+            p.board = on;
+            eng.touch();
+            Ok(json!({ "pane": pane, "board": on }))
         }
         "task.claim" => {
             let owner = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
             let id = req.params.get("task").and_then(|v| v.as_u64());
-            match eng.board.claim(&owner, id).map_err(|e| failed(e.to_string()))? {
+            let space = caller_space(eng, req);
+            match eng.board.claim(&owner, id, space.as_deref()).map_err(|e| failed(e.to_string()))? {
                 Some(t) => {
                     eng.touch();
                     serde_json::to_value(t).map_err(|e| failed(e.to_string()))
@@ -649,7 +800,20 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             serde_json::to_value(t).map_err(|e| failed(e.to_string()))
         }
         "task.list" => {
-            serde_json::to_value(eng.board.all()).map_err(|e| failed(e.to_string()))
+            // This project's board, unless asked otherwise. Reading someone else's board by
+            // accident is how you conclude there is work waiting that is not yours to do —
+            // the same confusion the scoping fixed for the nudge, in the other direction.
+            let space = if bool_arg(req, "everywhere") { None } else { caller_space(eng, req) };
+            let shown: Vec<&super::tasks::Task> = match &space {
+                Some(want) => eng
+                    .board
+                    .all()
+                    .iter()
+                    .filter(|t| t.space.as_deref() == Some(want.as_str()) || t.space.is_none())
+                    .collect(),
+                None => eng.board.all().iter().collect(),
+            };
+            serde_json::to_value(shown).map_err(|e| failed(e.to_string()))
         }
 
         // -- triggers ----------------------------------------------------
@@ -687,21 +851,6 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 _ => return Err(bad("give exactly one of task, to, or spawn")),
             };
 
-            // Refused at creation as well as at firing (see `tasks::autonomous()`): a rule that
-            // cannot act is better said no to now than at 09:00 tomorrow.
-            if !super::tasks::autonomous() && matches!(what, super::triggers::What::Task { .. }) {
-                return Err(bad(
-                    "the --task action is parked while the task board is reworked — use --spawn",
-                ));
-            }
-            // Same, for the action that goes over the bus. `--spawn` is the one left: it starts
-            // a program rather than typing at one that is already running.
-            if !super::bus::ENABLED && matches!(what, super::triggers::What::Send { .. }) {
-                return Err(bad(
-                    "the --to action is parked while the message bus is reworked — use --spawn",
-                ));
-            }
-
             // The depth guard. An agent creating a trigger is the interesting part; a
             // machine-started agent creating one closes the loop with no human anywhere in it,
             // and nothing downstream would ever refuse it.
@@ -718,7 +867,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             let only_if = str_arg(req, "when").map(|s| s.to_string());
             let t = eng
                 .triggers
-                .add(when, what, &by, only_if)
+                .add(when, what, &by, only_if, caller_space(eng, req))
                 .map_err(|e| failed(e.to_string()))?;
             eng.touch();
             // `armed` travels with the reply so the caller never has to re-read the config file
@@ -928,6 +1077,58 @@ mod tests {
 
     fn req(method: &str, params: serde_json::Value) -> Request {
         Request { id: String::new(), method: method.into(), params }
+    }
+
+    /// An agent spawning agents is the point of a lead agent, and also the one way a pane
+    /// count runs away without anyone noticing. The cap is on live panes agents opened, so
+    /// closing one frees a slot — a lifetime counter would retire a fleet that had merely
+    /// been busy.
+    #[test]
+    fn an_agent_cannot_open_more_panes_than_the_fleet_cap() {
+        let mut eng = super::super::tests::engine_with_idle_agents("fleetcap", 1);
+        eng.cfg.max_fleet = 2;
+        let from = *eng.session.panes.keys().next().unwrap();
+        // `cat` rather than an agent: a unit test that launches claude would be neither fast
+        // nor polite.
+        let spawn = |n: &str| req("agent.spawn", json!({ "cmd": "cat", "name": n, "from": from }));
+
+        assert!(handle(&mut eng, &spawn("a")).is_ok());
+        assert!(handle(&mut eng, &spawn("b")).is_ok());
+        let refused = handle(&mut eng, &spawn("c")).unwrap_err();
+        assert!(refused.message.contains("max_fleet"), "{}", refused.message);
+
+        // Closing one frees its slot.
+        let opened = *eng
+            .session
+            .panes
+            .values()
+            .find(|p| p.spawned_by_pane == Some(from))
+            .map(|p| &p.id)
+            .unwrap();
+        eng.session.close_pane(&eng.cfg.clone(), opened).unwrap();
+        assert!(handle(&mut eng, &spawn("d")).is_ok());
+
+        for id in eng.session.panes.keys().copied().collect::<Vec<_>>() {
+            if let Some(p) = eng.session.panes.get_mut(&id) {
+                p.kill();
+            }
+        }
+    }
+
+    /// You are not an agent, and you are not capped.
+    #[test]
+    fn a_spawn_from_outside_a_pane_is_not_counted_against_the_fleet() {
+        let mut eng = super::super::tests::engine_with_idle_agents("fleetuser", 1);
+        eng.cfg.max_fleet = 1;
+        for n in ["a", "b", "c"] {
+            let r = handle(&mut eng, &req("agent.spawn", json!({ "cmd": "cat", "name": n })));
+            assert!(r.is_ok(), "{n}: {:?}", r.err());
+        }
+        for id in eng.session.panes.keys().copied().collect::<Vec<_>>() {
+            if let Some(p) = eng.session.panes.get_mut(&id) {
+                p.kill();
+            }
+        }
     }
 
     /// Renaming a space existed only as a client frame — unreachable from the CLI or a

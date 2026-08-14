@@ -36,7 +36,7 @@ use anyhow::{anyhow, Context, Result};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 
-use crate::proto::AgentState;
+use crate::proto::{AgentClass, AgentState};
 
 /// Manifests shipped with the binary.
 const BUNDLED: &[(&str, &str)] = &[
@@ -46,6 +46,7 @@ const BUNDLED: &[(&str, &str)] = &[
     ("cursor-agent", include_str!("../../agents/cursor-agent.toml")),
     ("aider", include_str!("../../agents/aider.toml")),
     ("opencode", include_str!("../../agents/opencode.toml")),
+    ("dev", include_str!("../../agents/dev.toml")),
 ];
 
 // ---------------------------------------------------------------------------
@@ -292,6 +293,8 @@ pub struct Rule {
 #[derive(Debug, Clone)]
 pub struct Manifest {
     pub name: String,
+    /// Whether this manifest describes something you talk to or something that just runs.
+    pub class: AgentClass,
     /// Foreground process names that indicate this agent.
     pub processes: Vec<String>,
     /// Patterns proving this agent's UI is on screen. Must be unique to this agent: anything
@@ -312,8 +315,7 @@ impl Manifest {
     /// Is this agent's process in the foreground? A definite answer, when available.
     pub fn matches_process(&self, process: Option<&str>) -> bool {
         let Some(p) = process else { return false };
-        let base = p.rsplit('/').next().unwrap_or(p);
-        self.processes.iter().any(|want| want == base)
+        self.processes.iter().any(|want| want == process_base(p))
     }
 
     /// Does this agent's UI appear to be on screen? A guess, used only when the process name
@@ -327,11 +329,23 @@ impl Manifest {
         self.matches_process(process) || self.matches_screen(screen)
     }
 
+    /// The state to fall back to when no rule matches.
+    ///
+    /// A known agent sitting at a prompt horde does not recognise is far more likely idle
+    /// than indeterminate. A service is the same argument with a different answer: its
+    /// process is in the foreground of the pane, so the one thing we know for certain is
+    /// that it is still up.
+    pub fn rest_state(&self) -> AgentState {
+        match self.class {
+            AgentClass::Agent => AgentState::Idle,
+            AgentClass::Service => AgentState::Serving,
+        }
+    }
+
     /// Highest-priority matching rule wins.
     ///
-    /// Returns `None` when the winning rule says to leave the state alone, and an `idle`
-    /// fallback when nothing matches — a known agent sitting at a prompt horde does not
-    /// recognise is far more likely idle than indeterminate.
+    /// Returns `None` when the winning rule says to leave the state alone, and `rest_state`
+    /// when nothing matches at all.
     pub fn evaluate(&self, screen: &Screen<'_>) -> Option<Verdict> {
         let mut cache: HashMap<Region, (String, String)> = HashMap::new();
         for rule in &self.rules {
@@ -347,8 +361,35 @@ impl Manifest {
                 return Some(Verdict { state: rule.state, reason: rule.id.clone() });
             }
         }
-        Some(Verdict { state: AgentState::Idle, reason: "no rule matched".into() })
+        Some(Verdict { state: self.rest_state(), reason: "no rule matched".into() })
     }
+}
+
+/// The comparable part of a foreground process name.
+///
+/// `ps -o comm=` is not the tidy binary name it looks like. Node tooling rewrites its own
+/// process title, so a Next dev server reports as `npm run dev` and a path-launched binary
+/// reports with its whole path — meaning a plain equality test against `npm` matches neither.
+/// Take the first word, then its basename.
+fn process_base(p: &str) -> &str {
+    let first = p.split_whitespace().next().unwrap_or(p);
+    first.rsplit('/').next().unwrap_or(first)
+}
+
+/// Shells horde will not look behind.
+///
+/// When one of these is the pane's foreground process, whatever the screen still shows is
+/// scrollback, not a live program: the agent that printed it has exited back to the prompt.
+/// Without this, a shell that has merely *mentioned* an agent — a `claude --help`, a PR body
+/// with a "Generated with Claude Code" footer, a `git log` — keeps matching that agent's
+/// `detect` patterns and the pane sits in the roster as an agent that is not running.
+const SHELLS: &[&str] =
+    &["sh", "bash", "zsh", "fish", "ksh", "tcsh", "csh", "dash", "nu", "elvish", "xonsh"];
+
+/// Is the pane sitting at a shell prompt? `None` (horde could not read the process) is not a
+/// shell: falling back to the screen is better than detecting nothing at all.
+pub fn is_shell(process: Option<&str>) -> bool {
+    process.is_some_and(|p| SHELLS.contains(&process_base(p)))
 }
 
 fn compile(patterns: &[String], ctx: &str) -> Result<Vec<Regex>> {
@@ -374,7 +415,16 @@ fn parse_state(s: &str) -> Result<AgentState> {
         "idle" => AgentState::Idle,
         "done" => AgentState::Done,
         "unknown" => AgentState::Unknown,
+        "serving" => AgentState::Serving,
         other => return Err(anyhow!("unknown state {other:?}")),
+    })
+}
+
+fn parse_class(s: &str) -> Result<AgentClass> {
+    Ok(match s {
+        "agent" => AgentClass::Agent,
+        "service" => AgentClass::Service,
+        other => return Err(anyhow!("unknown class {other:?} (agent or service)")),
     })
 }
 
@@ -382,6 +432,9 @@ fn parse_state(s: &str) -> Result<AgentState> {
 #[serde(deny_unknown_fields)]
 struct RawManifest {
     name: String,
+    /// Omitted means `agent`: every manifest that predates services is one.
+    #[serde(default)]
+    class: Option<String>,
     #[serde(default)]
     processes: Vec<String>,
     #[serde(default)]
@@ -392,6 +445,10 @@ struct RawManifest {
 
 pub fn parse(text: &str) -> Result<Manifest> {
     let raw: RawManifest = toml::from_str(text)?;
+    let class = match &raw.class {
+        Some(c) => parse_class(c).with_context(|| format!("manifest {}", raw.name))?,
+        None => AgentClass::Agent,
+    };
     let mut rules = Vec::new();
     for r in &raw.rules {
         let ctx = format!("{}.{}", raw.name, r.id);
@@ -415,6 +472,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
     Ok(Manifest {
         detect: compile(&raw.detect, &format!("{}.detect", raw.name))?,
         name: raw.name,
+        class,
         processes: raw.processes,
         rules,
     })
@@ -852,5 +910,101 @@ contains = ["do you want"]
         assert!(!man.matches_process(Some("zsh")));
         assert!(man.matches_screen("here is The Unique UI String"));
         assert!(!man.matches_screen("something else"));
+    }
+
+    // -- services -----------------------------------------------------------------------
+
+    fn dev() -> Manifest {
+        parse(include_str!("../../agents/dev.toml")).unwrap()
+    }
+
+    /// `ps` reports what a process calls itself, and node tooling rewrites its own title. A
+    /// manifest that only matched a bare binary name would miss every dev server there is.
+    #[test]
+    fn a_rewritten_process_title_still_names_its_launcher() {
+        let m = dev();
+        assert!(m.matches_process(Some("npm run dev")));
+        assert!(m.matches_process(Some("/opt/homebrew/bin/pnpm dev")));
+        assert!(m.matches_process(Some("next-server (v15.0.3)")));
+        // Deliberately not claimed: these run anything at all, including an agent.
+        assert!(!m.matches_process(Some("node")));
+        assert!(!m.matches_process(Some("npx")));
+    }
+
+    #[test]
+    fn shells_are_recognised_wherever_they_live() {
+        assert!(is_shell(Some("/bin/zsh")));
+        assert!(is_shell(Some("bash")));
+        assert!(is_shell(Some("/usr/local/bin/fish -l")));
+        assert!(!is_shell(Some("claude")));
+        assert!(!is_shell(Some("npm run dev")));
+        // Unreadable is not a shell: falling back to the screen beats detecting nothing.
+        assert!(!is_shell(None));
+    }
+
+    /// The counterpart of `an_unmatched_screen_falls_back_to_idle_with_a_reason`. A service
+    /// resting at `idle` would be a lie — its process is in the foreground of the pane.
+    #[test]
+    fn an_unmatched_service_screen_rests_at_serving() {
+        let m = dev();
+        assert_eq!(m.class, AgentClass::Service);
+        let lines = to_lines("some output this manifest has never seen");
+        let v = m.evaluate(&screen(&lines, "")).unwrap();
+        assert_eq!(v.state, AgentState::Serving);
+    }
+
+    /// Captured from a live `npm run dev`. Serving traffic is not a state change.
+    #[test]
+    fn a_dev_server_serving_traffic_is_just_serving() {
+        let lines = to_lines(
+            " ✓ Compiled /reports in 376ms (1085 modules)\n\
+             \x20GET /reports 200 in 829ms\n\
+             \x20✓ Compiled in 137ms (691 modules)\n\
+             \x20GET /catalog/feed-center 200 in 22ms",
+        );
+        assert_eq!(dev().evaluate(&screen(&lines, "")).unwrap().state, AgentState::Serving);
+    }
+
+    #[test]
+    fn a_dev_server_that_cannot_bind_its_port_needs_you() {
+        let lines = to_lines(
+            "> next dev\n\
+             Error: listen EADDRINUSE: address already in use :::3000\n",
+        );
+        let v = dev().evaluate(&screen(&lines, "")).unwrap();
+        assert_eq!(v.state, AgentState::Blocked);
+        assert_eq!(v.reason, "port_in_use");
+    }
+
+    /// And the red clears itself: the next good compile prints over the failure, which is why
+    /// the rule reads a narrow region rather than the whole snapshot.
+    #[test]
+    fn a_fixed_build_stops_asking_for_attention() {
+        let broken = to_lines(" ⨯ Failed to compile\n ./app/page.tsx:3:1\n");
+        assert_eq!(dev().evaluate(&screen(&broken, "")).unwrap().state, AgentState::Blocked);
+
+        let fixed = to_lines(
+            " ⨯ Failed to compile\n ./app/page.tsx:3:1\n\
+             \x20✓ Compiled /page in 340ms\n\
+             \x20GET / 200 in 21ms\n\
+             \x20✓ Compiled in 98ms\n\
+             \x20GET / 200 in 18ms\n\
+             \x20✓ Compiled in 101ms\n\
+             \x20GET / 200 in 19ms",
+        );
+        assert_eq!(dev().evaluate(&screen(&fixed, "")).unwrap().state, AgentState::Serving);
+    }
+
+    #[test]
+    fn a_manifest_without_a_class_is_an_agent() {
+        let m = parse("name=\"t\"\n[[rules]]\nid=\"r\"\nstate=\"idle\"\ncontains=[\"x\"]").unwrap();
+        assert_eq!(m.class, AgentClass::Agent);
+        assert_eq!(m.rest_state(), AgentState::Idle);
+    }
+
+    #[test]
+    fn an_unknown_class_is_rejected_by_name() {
+        let e = format!("{:#}", parse("name=\"t\"\nclass=\"daemon\"").unwrap_err());
+        assert!(e.contains("daemon"), "{e}");
     }
 }

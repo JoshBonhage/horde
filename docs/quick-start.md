@@ -5,7 +5,8 @@
 ```sh
 cargo build --release
 # Replace, never overwrite: `cp` onto a binary the running daemon is executing
-# corrupts it mid-run, and macOS then kills it with SIGKILL on every exec.
+# corrupts it mid-run — macOS then kills it with SIGKILL on every exec, and Linux
+# refuses the copy outright with `Text file busy`.
 rm -f ~/.local/bin/horde && cp target/release/horde ~/.local/bin/
 horde upgrade                                # hand the live panes to the new binary
 ```

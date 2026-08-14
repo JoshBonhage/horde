@@ -90,6 +90,7 @@ impl Widget for TabBar<'_> {
                 AgentState::Blocked => t.ui.blocked,
                 AgentState::Working => t.ui.working,
                 AgentState::Done => t.ui.done,
+                AgentState::Serving => t.ui.serving,
                 _ => t.ui.idle,
             };
             right.push(Span::styled(format!("{}{} ", state.glyph(), n), panel.fg(color(c))));
@@ -102,26 +103,30 @@ impl Widget for TabBar<'_> {
     }
 }
 
-fn state_counts(snap: &Snapshot) -> [(AgentState, usize); 4] {
+fn state_counts(snap: &Snapshot) -> [(AgentState, usize); 5] {
     let mut blocked = 0;
     let mut done = 0;
     let mut working = 0;
     let mut idle = 0;
+    let mut serving = 0;
     for p in &snap.panes {
         match p.agent.as_ref().map(|a| a.state) {
             Some(AgentState::Blocked) => blocked += 1,
             Some(AgentState::Done) => done += 1,
             Some(AgentState::Working) => working += 1,
+            Some(AgentState::Serving) => serving += 1,
             Some(_) => idle += 1,
             None => {}
         }
     }
-    // Ordered by urgency so the eye lands on what matters first.
+    // Ordered by urgency so the eye lands on what matters first. Services come last, below
+    // even an idle agent: a dev server being up is the least surprising fact on the bar.
     [
         (AgentState::Blocked, blocked),
         (AgentState::Working, working),
         (AgentState::Done, done),
         (AgentState::Idle, idle),
+        (AgentState::Serving, serving),
     ]
 }
 
@@ -164,6 +169,9 @@ impl Widget for StatusBar<'_> {
             Mode::Roster { .. } => left.push(chip(" ROSTER ", t.ui.accent_alt, t)),
             Mode::Settings { .. } => left.push(chip(" SETTINGS ", t.ui.accent_alt, t)),
             Mode::Digest { .. } => left.push(chip(" DIGEST ", t.ui.accent_alt, t)),
+            // Its own colour, not the shared one: this is the mode where a keypress answers
+            // a question on your behalf, and it should not look like the ones where it does not.
+            Mode::Approvals { .. } => left.push(chip(" NEEDS YOU ", t.ui.blocked, t)),
             Mode::Terminal => left.push(Span::styled(
                 format!(" {} ", self.prefix),
                 panel.fg(color(t.ui.text_faint)),
@@ -270,11 +278,13 @@ mod tests {
                 agent: s.map(|st| AgentInfo {
                     kind: "claude".into(),
                     name: "builder".into(),
+                    class: Default::default(),
                     state: st,
                     elapsed: 5,
                     authority: "screen".into(),
                     reason: "t".into(),
                     activity: Default::default(),
+                    question: None,
                 }),                spawned_by: None,
                 exited: false,
                 scroll_offset: 0,
@@ -282,6 +292,8 @@ mod tests {
                 bracketed_paste: false,
                 role: None,
                 pinned: false,
+                board: false,
+                repo: None,
             })
             .collect();
         let tab_list: Vec<TabInfo> = (1..=tabs)
@@ -306,6 +318,7 @@ mod tests {
                 attention_count: 0,
                 accent: 0,
                 collapsed: false,
+                repo: None,
             }],
             tabs: tab_list,
             panes,
@@ -368,13 +381,28 @@ mod tests {
                 Some(AgentState::Done),
                 Some(AgentState::Working),
                 Some(AgentState::Blocked),
+                Some(AgentState::Serving),
             ],
             1,
         );
         let counts = state_counts(&s);
         assert_eq!(counts[0].0, AgentState::Blocked);
         assert_eq!(counts[1].0, AgentState::Working);
+        // A dev server sits below even an idle agent: it is the least surprising thing on the
+        // bar, and the bar is read left to right.
+        assert_eq!(counts[4].0, AgentState::Serving);
         assert!(counts.iter().all(|(_, n)| *n == 1));
+    }
+
+    /// A dev server is not an agent mid-turn, and the bar must not read as though it were.
+    #[test]
+    fn a_serving_pane_does_not_inflate_the_working_count() {
+        let s = snap(&[Some(AgentState::Serving), Some(AgentState::Serving)], 1);
+        let counts = state_counts(&s);
+        let by = |want: AgentState| counts.iter().find(|(st, _)| *st == want).unwrap().1;
+        assert_eq!(by(AgentState::Working), 0);
+        assert_eq!(by(AgentState::Idle), 0);
+        assert_eq!(by(AgentState::Serving), 2);
     }
 
     #[test]

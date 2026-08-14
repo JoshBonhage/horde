@@ -140,9 +140,10 @@ warns when it notices a version mismatch, but stopping is the cure.
 An agent is just a program in a pane that horde recognises — `claude`, `codex`, `gemini`,
 and others. horde does not launch them any differently; it watches them.
 
-What it adds is **state**: `working`, `blocked`, `done`, `idle`, `unknown`. See
-[agents](agents.md) for how that is determined and [orchestration](orchestration.md) for
-what you can do with it.
+What it adds is **state**: `working`, `blocked`, `done`, `idle`, `unknown`. A pane running a
+dev server or a watcher is recognised too, as a *service* rather than an agent, and rests at
+`serving`. See [agents](agents.md) for how that is determined and
+[orchestration](orchestration.md) for what you can do with it.
 
 ### Three names, one pane
 

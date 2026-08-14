@@ -168,5 +168,10 @@ horde --version          # should print, not die
 running daemon's mapped image untouched. `cp` alone writes into the inode that process is executing
 from, which corrupts both.
 
+On Linux — including WSL — the same mistake fails earlier and more helpfully: `cp` itself refuses
+with **`Text file busy`** (`ETXTBSY`), because the kernel will not let you write to a binary that
+is currently being executed. Different symptom, identical fix, and nothing is corrupted because
+the write never happened.
+
 Your session usually survives this — the daemon keeps running from pages it already has mapped.
 Check with `horde status`, and if it answers, `horde upgrade` still works once the binary does.

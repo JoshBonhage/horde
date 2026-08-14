@@ -401,11 +401,13 @@ mod tests {
             agent: agent.then(|| AgentInfo {
                 kind: "claude".into(),
                 name: "builder".into(),
+                class: Default::default(),
                 state: AgentState::Idle,
                 elapsed: 1,
                 authority: "hook".into(),
                 reason: "t".into(),
                 activity: Default::default(),
+                question: None,
             }),            spawned_by: None,
             exited: false,
             scroll_offset: 0,
@@ -413,6 +415,8 @@ mod tests {
             bracketed_paste: false,
             role: None,
             pinned: false,
+            board: false,
+            repo: None,
         };
         Snapshot {
             protocol: 1,
@@ -427,6 +431,7 @@ mod tests {
                 attention_count: 0,
                 accent: 0,
                 collapsed: false,
+                repo: None,
             }],
             tabs: vec![TabInfo {
                 id: 1,

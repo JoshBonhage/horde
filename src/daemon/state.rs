@@ -274,12 +274,28 @@ impl Session {
         dir: Dir,
         cmd: Option<&str>,
     ) -> Result<PaneId> {
+        self.split_in(cfg, target, dir, cmd, None)
+    }
+
+    /// Split, with somewhere else to start.
+    ///
+    /// `cwd` exists for worktrees: an agent given its own tree has to *start* in it, because
+    /// a pane's directory is fixed at spawn and no amount of the agent running `cd` later
+    /// would change what horde thinks it is working on.
+    pub fn split_in(
+        &mut self,
+        cfg: &Config,
+        target: Option<PaneId>,
+        dir: Dir,
+        cmd: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<PaneId> {
         let target = target.or_else(|| self.focused_pane()).ok_or_else(|| anyhow!("no pane"))?;
         let pane = self.panes.get(&target).ok_or_else(|| anyhow!("no such pane"))?;
         let (space, tab) = (pane.space, pane.tab);
-        // New panes inherit the cwd of the pane they split from, which is what you want
-        // when fanning out work in one project.
-        let cwd = pane.cwd.clone();
+        // New panes otherwise inherit the cwd of the pane they split from, which is what you
+        // want when fanning out work in one project.
+        let cwd = cwd.map(|c| c.to_path_buf()).unwrap_or_else(|| pane.cwd.clone());
         let cmd = cmd.map(|s| s.to_string()).unwrap_or_else(|| cfg.shell.clone());
 
         // Zoom hides siblings, so splitting while zoomed would put the new pane somewhere
@@ -928,7 +944,10 @@ impl Session {
 
     // -- snapshot ---------------------------------------------------------
 
-    pub fn snapshot(&self, cfg: &Config) -> Snapshot {
+    /// `repos` is read rather than refreshed: probing git costs a fork per directory, so it
+    /// happens once per tick on its own slow cadence and every snapshot in that tick reports
+    /// the same answer.
+    pub fn snapshot(&self, cfg: &Config, repos: &super::repo::Cache) -> Snapshot {
         let rects: HashMap<PaneId, (Rect, Rect)> = self
             .visible_rects(cfg)
             .into_iter()
@@ -958,6 +977,8 @@ impl Session {
                     bracketed_paste: p.bracketed_paste(),
                     role: p.role.clone(),
                     pinned: p.pinned,
+                    board: p.board,
+                    repo: repo_info(repos, &p.cwd),
                 }
             })
             .collect();
@@ -984,7 +1005,12 @@ impl Session {
                     if let Some(tab) = self.tab(t) {
                         for p in tab.layout.panes() {
                             if let Some(a) = self.panes.get(&p).and_then(|p| p.agent.as_ref()) {
-                                agent_count += 1;
+                                // A dev server is not one of the project's agents. It still
+                                // counts for attention: a server that cannot bind its port is
+                                // exactly as much your problem as an agent at a prompt.
+                                if a.class == crate::proto::AgentClass::Agent {
+                                    agent_count += 1;
+                                }
                                 if a.state.needs_attention() {
                                     attention_count += 1;
                                 }
@@ -1002,6 +1028,7 @@ impl Session {
                     attention_count,
                     accent: s.accent,
                     collapsed: s.collapsed,
+                    repo: repo_info(repos, &s.cwd),
                 }
             })
             .collect();
@@ -1063,12 +1090,25 @@ fn rebuild_hnode(
     })
 }
 
+/// What a directory's git state looks like on the wire.
+fn repo_info(repos: &super::repo::Cache, dir: &std::path::Path) -> Option<crate::proto::RepoInfo> {
+    repos.peek(dir).map(|r| crate::proto::RepoInfo {
+        branch: r.branch.clone(),
+        dirty: r.dirty,
+        worktree: super::repo::is_agent_worktree(dir),
+    })
+}
+
 /// Agent state attached to a pane. Populated in phase 2; declared here because `Pane` and
 /// the snapshot both refer to it.
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     pub kind: String,
     pub name: String,
+    /// Whether this is something you talk to or something that just runs. Re-read from the
+    /// manifest on every scan rather than stored once, so a pane that changes hands — or a
+    /// daemon that came back from an upgrade without it — corrects itself.
+    pub class: crate::proto::AgentClass,
     pub state: crate::proto::AgentState,
     pub since: std::time::Instant,
     pub authority: String,
@@ -1079,6 +1119,10 @@ pub struct AgentRuntime {
     pub session_id: Option<String>,
     /// Messages held back because the agent was mid-stream.
     pub queued: Vec<crate::proto::Message>,
+    /// What it is waiting on, read off the screen while it is blocked and cleared the moment
+    /// it is not. Held here rather than re-parsed per snapshot: detection already has the
+    /// lines in hand, and every reader after it has only the wire types.
+    pub question: Option<crate::proto::Question>,
     /// Counted from lifecycle hooks.
     pub activity: crate::proto::Activity,
     /// Files touched this turn. Kept as a set so a file edited five times counts once.
@@ -1103,11 +1147,13 @@ impl AgentRuntime {
         crate::proto::AgentInfo {
             kind: self.kind.clone(),
             name: self.name.clone(),
+            class: self.class,
             state: self.state,
             elapsed: self.since.elapsed().as_secs(),
             authority: self.authority.clone(),
             reason: self.reason.clone(),
             activity: self.activity.clone(),
+            question: self.question.clone(),
         }
     }
 

@@ -2,7 +2,9 @@
 name = "horde"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+# Verified by the `msrv` job in CI, not guessed. Was 1.85 and had not been true for some time:
+# ratatui 0.30, darling and time all require 1.88.
+rust-version = "1.88"
 description = "An agent-aware terminal multiplexer"
 
 [[bin]]

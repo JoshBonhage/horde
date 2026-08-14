@@ -18,7 +18,8 @@ Read any page from the terminal with `horde docs <topic>`.
 | Page | What it covers |
 |---|---|
 | **[orchestration](orchestration.md)** | **agent-to-agent messaging — the main event. Written to be read by an agent.** |
-| [agents](agents.md) | detection, the five states, lifecycle hooks vs screen manifests |
+| [agents](agents.md) | detection, the six states, lifecycle hooks vs screen manifests |
+| [worktrees](worktrees.md) | one git worktree per agent, so a fleet in one repo cannot overwrite itself |
 | [socket-api](socket-api.md) | the control protocol, every method, for scripting and for agents |
 
 ## Reference
@@ -27,6 +28,7 @@ Read any page from the terminal with `horde docs <topic>`.
 |---|---|
 | [configuration](configuration.md) | `config.toml`, themes, the settings page |
 | [unattended](unattended.md) | triggers, and how horde reaches you when nothing is attached |
+| [wsl](wsl.md) | running horde on Windows, under WSL2 |
 | [troubleshooting](troubleshooting.md) | when something looks wrong |
 
 ## Point your agents at this

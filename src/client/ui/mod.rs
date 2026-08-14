@@ -43,6 +43,7 @@ pub fn state_look(state: AgentState, t: &Theme, tick: usize, animate: bool) -> (
         AgentState::Done => t.ui.done,
         AgentState::Idle => t.ui.idle,
         AgentState::Unknown => t.ui.unknown,
+        AgentState::Serving => t.ui.serving,
     };
     (glyph, c)
 }
@@ -342,6 +343,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             dim_area(f.buffer_mut(), area, &theme, 0.6);
             overlays::digest(f, area, app);
         }
+        Mode::Approvals { .. } => {
+            dim_area(f.buffer_mut(), area, &theme, 0.6);
+            overlays::approvals(f, area, app);
+        }
         Mode::Menu { .. } => {
             // A menu is a light touch on top of the session, not a modal takeover.
             dim_area(f.buffer_mut(), area, &theme, 0.25);
@@ -472,15 +477,18 @@ mod frame_tests {
                 cell, content: cell.inset(1),
                 cols: cell.inset(1).w, rows: cell.inset(1).h,
                 agent: agent.map(|(n, s, e)| AgentInfo {
-                    kind: "claude".into(), name: n.into(), state: s, elapsed: e,
+                    kind: "claude".into(), name: n.into(), class: Default::default(),
+                    state: s, elapsed: e,
                     authority: "hook".into(), reason: "reported by integration".into(),
                     // The demo frame shows the activity line the hooks make possible.
                     activity: crate::proto::Activity {
                         tools: 12, files: 3, errors: 0, turns: 2,
                         last_tool: Some("Edit".into()),
                     },
+                    question: None,
                 }),                spawned_by: None,
-                exited: false, scroll_offset: 0, wants_mouse: false, bracketed_paste: true, role: None, pinned: false,
+                exited: false, scroll_offset: 0, wants_mouse: false, bracketed_paste: true, role: None, pinned: false, board: false,
+                repo: None,
             }
         };
 
@@ -495,9 +503,9 @@ mod frame_tests {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             spaces: vec![
                 SpaceInfo { id: 1, name: "api-refactor".into(), cwd: "/x".into(),
-                    tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1, accent: 0, collapsed: false },
+                    tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1, accent: 0, collapsed: false, repo: None },
                 SpaceInfo { id: 2, name: "docs".into(), cwd: "/y".into(),
-                    tabs: vec![2], focused_tab: Some(2), agent_count: 1, attention_count: 0, accent: 1, collapsed: false },
+                    tabs: vec![2], focused_tab: Some(2), agent_count: 1, attention_count: 0, accent: 1, collapsed: false, repo: None },
             ],
             tabs: vec![
                 TabInfo { id: 1, space: 1, name: "agents".into(), panes: vec![1,2,3], focused_pane: Some(1) },

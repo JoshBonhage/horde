@@ -38,8 +38,6 @@
 //!
 //! Neither is overridable by `--now`: forcing a write the terminal cannot take does not
 //! deliver the message, it loses it quietly or hangs the daemon.
-//!
-//! The whole bus is paused for now — see [`ENABLED`].
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -51,28 +49,6 @@ use crate::config::Config;
 use crate::proto::{AgentState, Delivery, Event, Message, MsgKind, PaneId, SpaceId};
 
 use super::state::Session;
-
-/// Master switch for the bus itself. Off: agent-to-agent messaging is paused.
-///
-/// Every method that moves a message — send, reply, broadcast — is refused at the socket while
-/// this is off, so nothing can be injected into a pane however it was asked for: not by hand,
-/// not by a trigger, not by the idle nudge. `bus.tail` and `bus.reply_for` are deliberately
-/// still allowed, because reading the record delivers nothing. The log on disk is left alone,
-/// so pausing costs no history.
-///
-/// Paired with [`super::tasks::ENABLED`] rather than independent of it: the board's nudge was
-/// the thing injecting messages nobody asked for, and half a pause would have left the other
-/// half free to surprise you the same way.
-///
-/// TODO(bus-pause): turning this back on restores the bus by hand. Every gate is an early
-/// return in front of code left intact, so there is nothing else to put back.
-#[cfg(not(test))]
-pub const ENABLED: bool = false;
-
-/// On under `cfg(test)`, so the paused machinery goes on being exercised instead of rotting
-/// while it waits — exactly as the board's switches are.
-#[cfg(test)]
-pub const ENABLED: bool = true;
 
 /// Messages kept in memory for the bus drawer.
 const RING: usize = 500;
@@ -257,6 +233,11 @@ impl Bus {
             AgentState::Blocked => Gate::Hold("target is blocked on a prompt"),
             AgentState::Working => Gate::Hold("target is working"),
             AgentState::Unknown => Gate::Hold("target state is unknown"),
+            // Same answer as a pane with nothing in it, because that is what a dev server is
+            // to the bus: there is no turn to wait for and nothing that will read a line. A
+            // hold would be worse than useless — it would queue against a delivery that is
+            // never going to come.
+            AgentState::Serving => Gate::TextOnly,
         }
     }
 
@@ -563,6 +544,7 @@ mod tests {
         session.panes.get_mut(&pane).unwrap().agent = Some(AgentRuntime {
             kind: "claude".into(),
             name: "target".into(),
+            class: Default::default(),
             state,
             since: std::time::Instant::now(),
             authority: "hook".into(),
@@ -570,6 +552,7 @@ mod tests {
             seen: false,
             session_id: None,
             queued: Vec::new(),
+            question: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,

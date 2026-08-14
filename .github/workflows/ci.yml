@@ -1,0 +1,75 @@
+# horde's evidence that it still builds somewhere other than the author's Mac.
+#
+# The whole point of this file is the `no $SHELL` job. horde was macOS-only by accident rather
+# than by design — there is not one `cfg(target_os)` in `src/` — and the way that surfaced was a
+# `/bin/zsh` fallback that took a fifth of the suite down on a stock Ubuntu. Nothing about that
+# was visible from a machine where `$SHELL` is always set, which is every machine a human uses.
+# So one job deliberately takes the environment away.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every combination reports, rather than the first red one cancelling the rest: when a
+      # platform assumption breaks, "which platforms" is the question worth answering in one run.
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux, os: ubuntu-latest, shell_env: /bin/bash }
+          - { name: macos, os: macos-latest, shell_env: /bin/zsh }
+          # The fallback path no developer machine ever takes. Empty rather than unset because
+          # `default_shell()` treats the two the same and a workflow cannot unset a variable.
+          - { name: linux · no $SHELL, os: ubuntu-latest, shell_env: "" }
+    env:
+      SHELL: ${{ matrix.shell_env }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions
+        run: rustc --version && cargo --version
+      # `--locked` so a run is testing the dependency tree that is committed, not whatever
+      # resolved that morning. A lockfile drift should fail here rather than silently pass.
+      - name: Test
+        run: cargo test --all --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Preinstalled on GitHub's runners, but this costs nothing when it is already there and
+      # turns "the image changed" from a red build into a no-op.
+      - name: Ensure clippy
+        run: rustup component add clippy
+      # Deliberately not `-D warnings`. There is a backlog of style warnings that predates this
+      # workflow, and a gate that is red on arrival gets ignored rather than fixed. This still
+      # fails on clippy's deny-by-default correctness lints, which are the ones worth blocking a
+      # merge for. Tighten to `-D warnings` once the backlog is cleared.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked
+
+  msrv:
+    # Static, because the `env` context is not available in a job-level `name` — it would
+    # render empty. The step names below can interpolate it, and do.
+    name: msrv
+    runs-on: ubuntu-latest
+    env:
+      # Keep in step with `rust-version` in Cargo.toml. This job is what stops that field being
+      # a guess: it was wrong by three releases until a run of exactly this check caught it.
+      MSRV: "1.88"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ${{ env.MSRV }}
+        run: rustup toolchain install ${{ env.MSRV }} --profile minimal
+      - name: Check
+        run: cargo +${{ env.MSRV }} check --all-targets --locked

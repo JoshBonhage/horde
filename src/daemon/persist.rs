@@ -95,6 +95,10 @@ pub struct SavedPane {
     pub role: Option<String>,
     #[serde(default)]
     pub pinned: bool,
+    #[serde(default)]
+    pub board: bool,
+    #[serde(default)]
+    pub spawned_by_pane: Option<crate::proto::PaneId>,
 }
 
 pub fn save(eng: &Engine, path: &Path) -> Result<()> {
@@ -158,6 +162,8 @@ fn save_node(eng: &Engine, n: &Node) -> SavedNode {
                 spawned_by: p.and_then(|p| p.spawned_by),
                 role: p.and_then(|p| p.role.clone()),
                 pinned: p.is_some_and(|p| p.pinned),
+                board: p.is_some_and(|p| p.board),
+                spawned_by_pane: p.and_then(|p| p.spawned_by_pane),
             })
         }
         Node::Split { axis, ratio, a, b, .. } => SavedNode::Split {
@@ -234,6 +240,8 @@ pub fn restore(eng: &mut Engine, saved: SavedState) -> Result<()> {
                     p.spawned_by = leaf.spawned_by;
                     p.role = leaf.role.clone();
                     p.pinned = leaf.pinned;
+                    p.board = leaf.board;
+                    p.spawned_by_pane = leaf.spawned_by_pane;
                 }
                 ids.push(id);
             }
@@ -402,6 +410,8 @@ mod tests {
                 spawned_by: None,
                     role: None,
                     pinned: false,
+                    board: false,
+                    spawned_by_pane: None,
             })),
             b: Box::new(SavedNode::Split {
                 horizontal: false,
@@ -415,6 +425,8 @@ mod tests {
                     spawned_by: None,
                     role: None,
                     pinned: false,
+                    board: false,
+                    spawned_by_pane: None,
                 })),
                 b: Box::new(SavedNode::Leaf(SavedPane {
                     cmd: "zsh".into(),
@@ -425,6 +437,8 @@ mod tests {
                     spawned_by: None,
                     role: None,
                     pinned: false,
+                    board: false,
+                    spawned_by_pane: None,
                 })),
             }),
         };
@@ -460,6 +474,8 @@ mod tests {
             spawned_by: None,
                     role: None,
                     pinned: false,
+                    board: false,
+                    spawned_by_pane: None,
         };
         assert_eq!(restore_command(&cfg, &with_session), "claude --resume abc123");
 
@@ -477,6 +493,8 @@ mod tests {
             spawned_by: None,
                     role: None,
                     pinned: false,
+                    board: false,
+                    spawned_by_pane: None,
         };
         assert_eq!(restore_command(&cfg, &unknown_agent), "/bin/zsh");
 
@@ -492,6 +510,8 @@ mod tests {
             spawned_by: None,
                     role: None,
                     pinned: false,
+                    board: false,
+                    spawned_by_pane: None,
         };
         assert_eq!(restore_command(&cfg, &with_session), "/bin/zsh");
 
@@ -505,6 +525,8 @@ mod tests {
             spawned_by: None,
                     role: None,
                     pinned: false,
+                    board: false,
+                    spawned_by_pane: None,
         };
         assert_eq!(restore_command(&cfg, &shell), "zsh");
     }
@@ -577,7 +599,9 @@ mod tests {
         let p = std::env::temp_dir().join("horde-state-preaccent.json");
         let tab = |n: &str| serde_json::json!({
             "name": n,
-            "tree": { "Leaf": { "cmd": "zsh", "cwd": ".", "name": null,
+            // `/bin/sh` rather than a named shell: `restore` really spawns this, and the only
+            // shell every platform promises is the one worth hardcoding in a fixture.
+            "tree": { "Leaf": { "cmd": "/bin/sh", "cwd": ".", "name": null,
                                 "agent_kind": null, "agent_session": null } },
             "focused_pane": 0,
         });

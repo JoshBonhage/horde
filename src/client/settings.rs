@@ -129,7 +129,6 @@ pub fn rows(cfg: &Config, cat: Category) -> Vec<Row> {
             setting("Sidebar width", cfg.sidebar_width.to_string(), Field::SidebarWidth),
             setting("Bus drawer", onoff(cfg.bus), Field::Bus),
             setting("Bus width", cfg.bus_width.to_string(), Field::BusWidth),
-            note("The bus is paused; the drawer still reads back what it logged."),
             separator(),
             setting("Pane titles", onoff(cfg.pane_titles), Field::PaneTitles),
             setting("Animations", onoff(cfg.animate), Field::Animate),

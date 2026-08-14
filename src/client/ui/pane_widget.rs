@@ -163,6 +163,7 @@ pub fn pane_frame(
             AgentState::Done => (agent.state.glyph(), theme.ui.done),
             AgentState::Idle => (agent.state.glyph(), theme.ui.idle),
             AgentState::Unknown => (agent.state.glyph(), theme.ui.unknown),
+            AgentState::Serving => (agent.state.glyph(), theme.ui.serving),
         };
         spans.push(Span::styled(glyph.to_string(), Style::default().fg(color(c))));
         spans.push(Span::raw(" "));
@@ -173,6 +174,18 @@ pub fn pane_frame(
     if let Some(role) = &pane.role {
         let (glyph, c) = role_look(role, roles, theme);
         spans.push(Span::styled(format!("{glyph} {role} "), Style::default().fg(color(c))));
+    }
+
+    // Its own branch, but only for an agent horde put in a worktree. Every other pane is on
+    // the project's branch, which the sidebar already says once for the whole project —
+    // repeating it on six pane titles would be six copies of one fact, and would bury the
+    // one case where the answer differs per pane.
+    if let Some(r) = pane.repo.as_ref().filter(|r| r.worktree) {
+        let dirty = if r.dirty { "*" } else { "" };
+        spans.push(Span::styled(
+            format!("⑂ {}{dirty} ", r.branch),
+            Style::default().fg(color(theme.ui.accent_alt)),
+        ));
     }
 
     let title_style = if focused {
@@ -193,6 +206,7 @@ pub fn pane_frame(
             AgentState::Working => theme.ui.working,
             AgentState::Blocked => theme.ui.blocked,
             AgentState::Done => theme.ui.done,
+            AgentState::Serving => theme.ui.serving,
             _ => theme.ui.text_faint,
         };
         spans.push(Span::styled(detail, Style::default().fg(color(c))));
