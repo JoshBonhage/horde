@@ -929,6 +929,10 @@ fn tick(eng: &mut Engine, detect_due: bool) {
     // fork-per-directory work on one clock.
     if detect_due {
         refresh_repos(eng);
+        // On detection's cadence deliberately: exhaustion is read off the same screen snapshot
+        // detection already takes, and a model that has just refused will still be refusing a
+        // second later. Checking it every tick would buy nothing and cost a scan per pane.
+        advance_spent_models(eng);
     }
 
     // A freshly spawned pane gets looked at on the very next tick rather than waiting out
@@ -1048,6 +1052,84 @@ fn eligible_state(a: &state::AgentRuntime, board_workers: &[String]) -> bool {
 ///
 /// The cache decides for itself what is stale, so calling this often is cheap; what it costs
 /// is bounded by the number of distinct directories, not by how often it is asked.
+/// How long after a switch to ignore exhaustion text.
+///
+/// The message that caused the switch is still in the scrollback afterwards. Without a pause,
+/// one rate limit would walk an agent through every model in its list within a few ticks and
+/// report the profile spent when only one model ever refused.
+const SWITCH_QUIET: Duration = Duration::from_secs(30);
+
+/// Move any agent whose model has stopped serving it onto the next one in its profile.
+///
+/// horde cannot see an HTTP 429 — it has no HTTP client and that is deliberate. What it can see
+/// is the pane, and an agent renders the provider's error into it. So exhaustion is read the
+/// same way every other agent state is read: as text on a screen.
+///
+/// The switch is *typed into the running agent* rather than done by restarting it. A restart
+/// would cost the agent's plan and everything it had read, which is a far higher price than the
+/// rate limit itself.
+fn advance_spent_models(eng: &mut Engine) {
+    let cfg = eng.cfg.clone();
+    if cfg.models.is_empty() {
+        return;
+    }
+    let mut switches: Vec<(PaneId, String, String)> = Vec::new();
+    let mut spent: Vec<(PaneId, String)> = Vec::new();
+
+    for (id, pane) in eng.session.panes.iter_mut() {
+        // Read everything needed from the pane before taking the mutable borrow on `model`:
+        // the screen snapshot borrows the pane immutably and the two cannot overlap.
+        let Some((profile_name, index, switched)) =
+            pane.model.as_ref().map(|m| (m.profile.clone(), m.index, m.switched))
+        else {
+            continue;
+        };
+        if switched.is_some_and(|t| t.elapsed() < SWITCH_QUIET) {
+            continue;
+        }
+        let Some(profile) = cfg.models.get(&profile_name) else { continue };
+        let Some(switch) = profile.switch.as_ref() else { continue };
+
+        let screen = pane.detection_snapshot(cfg.detection_lines).join("\n");
+        if !profile.exhausted.iter().any(|pat| screen.contains(pat.as_str())) {
+            continue;
+        }
+        let Some(run) = pane.model.as_mut() else { continue };
+
+        match profile.order.get(index + 1) {
+            Some(next) => {
+                run.index = index + 1;
+                run.switched = Some(std::time::Instant::now());
+                switches.push((*id, switch.replace("{model}", next), next.clone()));
+            }
+            // Deliberately not wrapping. A fleet that has spent every free model should say so;
+            // going back to the one that just refused is a loop that looks like work.
+            None => {
+                run.switched = Some(std::time::Instant::now());
+                spent.push((*id, profile_name.clone()));
+            }
+        }
+    }
+
+    for (pane, command, model) in switches {
+        let name = super::daemon::bus::Bus::sender_name(&eng.session, Some(pane));
+        // Journalled, because the alternative is waking to work done by a model you did not
+        // choose with nothing saying so. Provenance is the thing this feature most easily loses.
+        log_line(&format!("{name}: model spent, switching to {model}"));
+        eng.journal.note(journal::Kind::Notified, &format!("{name} switched to {model}"));
+        let Engine { bus, session, .. } = eng;
+        if let Err(e) = bus.send(session, &cfg, None, &name, &command, false, false, None) {
+            log_line(&format!("{name}: could not send the model switch: {e}"));
+        }
+    }
+    for (pane, profile) in spent {
+        let name = super::daemon::bus::Bus::sender_name(&eng.session, Some(pane));
+        log_line(&format!("{name}: every model in profile {profile:?} is spent"));
+        eng.journal
+            .note(journal::Kind::Notified, &format!("{name} exhausted profile {profile}"));
+    }
+}
+
 fn refresh_repos(eng: &mut Engine) {
     let mut dirs: Vec<std::path::PathBuf> =
         eng.session.spaces.iter().map(|s| s.cwd.clone()).collect();
@@ -1489,6 +1571,87 @@ mod tests {
             seen.contains("sk-or-test"),
             "the pane never saw the configured value; screen was {seen:?}"
         );
+    }
+
+    /// The whole feature, end to end: a model refuses, the agent is moved to the next one.
+    ///
+    /// Driven through a real pane whose program prints the provider error, because the claim is
+    /// specifically that horde reads this off a screen — asserting on an in-memory string would
+    /// test the `contains` call and nothing else.
+    #[test]
+    fn an_exhausted_model_moves_the_agent_to_the_next_one() {
+        // `echo` so the pane's screen carries OpenRouter's real refusal wording.
+        let mut eng = engine_with_shell(Some("echo Rate limit exceeded"));
+        let pane = *eng.session.panes.keys().next().unwrap();
+        eng.cfg.models.insert(
+            "free".into(),
+            crate::config::ModelProfile {
+                cmd: "opencode --model openrouter/{model}".into(),
+                order: vec!["first/model".into(), "second/model".into()],
+                exhausted: vec!["Rate limit exceeded".into()],
+                switch: Some("/models openrouter/{model}".into()),
+            },
+        );
+        eng.session.panes.get_mut(&pane).unwrap().model =
+            Some(crate::daemon::pane::ModelRun { profile: "free".into(), index: 0, switched: None });
+        give_agent_named(&mut eng.session, pane, "builder");
+
+        // Let the refusal reach the screen.
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
+            if eng.session.panes[&pane].visible_text().join("").contains("Rate limit") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        advance_spent_models(&mut eng);
+        let run = eng.session.panes[&pane].model.clone().expect("still on a profile");
+        assert_eq!(run.index, 1, "it should have moved to the second model");
+        assert!(run.switched.is_some(), "and recorded when, so it does not fire again");
+
+        // The error is still on screen. A second pass inside the quiet window must not walk it
+        // through the rest of the list.
+        advance_spent_models(&mut eng);
+        assert_eq!(eng.session.panes[&pane].model.as_ref().unwrap().index, 1, "one switch, not two");
+
+        kill_all(&mut eng);
+    }
+
+    /// A profile with nowhere left to go stops rather than wrapping.
+    #[test]
+    fn a_spent_profile_stops_instead_of_starting_over() {
+        let mut eng = engine_with_shell(Some("echo Rate limit exceeded"));
+        let pane = *eng.session.panes.keys().next().unwrap();
+        eng.cfg.models.insert(
+            "free".into(),
+            crate::config::ModelProfile {
+                cmd: "c {model}".into(),
+                order: vec!["only/model".into()],
+                exhausted: vec!["Rate limit exceeded".into()],
+                switch: Some("/models {model}".into()),
+            },
+        );
+        eng.session.panes.get_mut(&pane).unwrap().model =
+            Some(crate::daemon::pane::ModelRun { profile: "free".into(), index: 0, switched: None });
+        give_agent_named(&mut eng.session, pane, "builder");
+
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
+            if eng.session.panes[&pane].visible_text().join("").contains("Rate limit") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        advance_spent_models(&mut eng);
+        // Still on the last model, not back at the start.
+        assert_eq!(eng.session.panes[&pane].model.as_ref().unwrap().index, 0);
+        kill_all(&mut eng);
     }
 
     /// Put a named, idle agent into a pane, standing in for a detection pass.

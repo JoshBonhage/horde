@@ -525,6 +525,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             // Refused rather than defaulted when the name is unknown. A typo that silently
             // started `claude` on someone's Anthropic key, when they asked for the free tier,
             // is the wrong direction to fail in.
+            let profile_name = str_arg(req, "profile").map(|s| s.to_string());
             let cmd = match str_arg(req, "profile") {
                 Some(p) => {
                     let profile = cfg.models.get(p).ok_or_else(|| {
@@ -600,6 +601,14 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             if let Some(p) = eng.session.panes.get_mut(&id) {
                 if let Some(n) = name.clone() {
                     p.name = Some(n);
+                }
+                // Where in the profile this agent is, so exhaustion has a next model to move to.
+                if let Some(profile) = profile_name.clone() {
+                    p.model = Some(crate::daemon::pane::ModelRun {
+                        profile,
+                        index: 0,
+                        switched: None,
+                    });
                 }
                 // The job it is for, so a fleet reads as a team rather than as claude-2..7.
                 if let Some(r) = str_arg(req, "role").and_then(crate::config::normalise_role) {
@@ -1170,13 +1179,17 @@ mod tests {
         )
         .unwrap();
         assert!(r.get("brief").is_some(), "the brief was accepted: {r}");
-        assert_eq!(eng.bus.orphan_count(), 1, "and is waiting rather than delivered");
+        // Relative: the test bus log is a file in the temp dir shared by every test in this
+        // binary, and `Bus::new` recovers held messages from it — so an absolute count is an
+        // assertion about what else ran today.
+        let held = eng.bus.orphan_count();
+        assert!(held >= 1, "the brief is waiting rather than delivered");
 
         // The pane exists but has no agent yet, so a flush changes nothing.
         let cfg = eng.cfg.clone();
         let Engine { bus, session, .. } = &mut eng;
         bus.flush_queued(session, &cfg);
-        assert_eq!(eng.bus.orphan_count(), 1, "nothing to deliver to yet");
+        assert_eq!(eng.bus.orphan_count(), held, "nothing to deliver to yet");
 
         // Detection names the agent; now it lands.
         let pane = *eng
@@ -1190,7 +1203,7 @@ mod tests {
         let cfg = eng.cfg.clone();
         let Engine { bus, session, .. } = &mut eng;
         bus.flush_queued(session, &cfg);
-        assert_eq!(eng.bus.orphan_count(), 0, "the brief found its agent");
+        assert!(eng.bus.orphan_count() < held, "the brief found its agent");
 
         for p in eng.session.panes.values_mut() {
             p.kill();
@@ -1250,6 +1263,8 @@ mod tests {
             crate::config::ModelProfile {
                 cmd: "cat --model openrouter/{model}".into(),
                 order: vec!["qwen/qwen3-coder:free".into(), "second/model".into()],
+                exhausted: Vec::new(),
+                switch: None,
             },
         );
         let r = handle(&mut eng, &req("agent.spawn", json!({ "profile": "free" }))).unwrap();
@@ -1269,7 +1284,12 @@ mod tests {
         let mut eng = super::super::tests::engine();
         eng.cfg.models.insert(
             "free".into(),
-            crate::config::ModelProfile { cmd: "cat {model}".into(), order: vec!["a".into()] },
+            crate::config::ModelProfile {
+                cmd: "cat {model}".into(),
+                order: vec!["a".into()],
+                exhausted: Vec::new(),
+                switch: None,
+            },
         );
         let e = handle(&mut eng, &req("agent.spawn", json!({ "profile": "fre" }))).unwrap_err();
         assert!(e.message.contains("fre"), "{}", e.message);

@@ -334,6 +334,29 @@ The list does not wrap. A fleet that has burned through every free model should 
 rotating forever turns "the free tier does not support this workload" into an agent that looks
 busy and achieves nothing.
 
+### Switching automatically
+
+```toml
+exhausted = ["Rate limit exceeded", "rate_limit_exceeded", "429"]
+switch = "/models openrouter/{model}"
+```
+
+With both set, horde moves an agent to the next model on its own. `exhausted` is **screen text**,
+not a status code — horde has no HTTP client, so it reads the provider's error the same way it
+reads every other agent state: as words rendered into the pane. The defaults match what
+OpenRouter returns and opencode prints; change them if your agent words it differently.
+
+`switch` is typed into the *running* agent, so its session survives — the plan it had formed and
+everything it had read are still there. Restarting the agent instead would cost more than the
+rate limit did. Leave `switch` unset and horde reports the model is spent without touching it.
+
+Every switch is logged and journalled, so `horde digest` says which model did which work. That
+matters more than it sounds: the failure mode of this feature is waking up to work done by a
+model you did not choose, with nothing saying so.
+
+A switch is ignored for 30 seconds afterwards. The error that triggered it is still in the
+scrollback, and without the pause one rate limit would walk an agent through the whole list.
+
 An unknown profile name is refused rather than defaulted. Quietly falling back to `claude` when
 you asked for the free tier would spend the wrong budget on the wrong provider and look like it
 worked.

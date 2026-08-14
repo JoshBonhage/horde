@@ -177,6 +177,12 @@ pub struct Pane {
     mirror: Vec<Row>,
     /// Rows changed since the last `take_dirty`.
     dirty: HashSet<u16>,
+    /// Which model profile this pane was started on, and how far through it it has got.
+    ///
+    /// Held on the pane rather than in the profile because the profile is shared config and this
+    /// is per-agent progress: two agents on `free` can be on different models, and one of them
+    /// running out says nothing about the other.
+    pub model: Option<ModelRun>,
     /// The cursor as the client was last told it.
     ///
     /// Kept because the cursor rides along with row updates, and a keystroke can move it without
@@ -199,6 +205,20 @@ pub struct Pane {
     /// remainder here and pushing it on later ticks is what keeps a slow or wedged agent from
     /// stalling the engine mid-message.
     outbound: Vec<u8>,
+}
+
+/// A pane's position in a model profile.
+#[derive(Debug, Clone)]
+pub struct ModelRun {
+    /// Which `[models.<name>]` block.
+    pub profile: String,
+    /// Index into that profile's `order`.
+    pub index: usize,
+    /// When the last switch happened, so the error still on screen does not trigger another.
+    ///
+    /// The text that caused a switch stays in the scrollback afterwards — without this, one rate
+    /// limit would walk an agent through every model in the list in the space of a few ticks.
+    pub switched: Option<Instant>,
 }
 
 impl Pane {
@@ -296,6 +316,7 @@ impl Pane {
             signal_rx,
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
+            model: None,
             last_sent_cursor: None,
             full_repaint: true,
             deferred: Vec::new(),
@@ -723,6 +744,7 @@ impl Pane {
             signal_rx,
             mirror: vec![Row::default(); saved.rows as usize],
             dirty: HashSet::new(),
+            model: None,
             last_sent_cursor: None,
             full_repaint: true,
             deferred: Vec::new(),

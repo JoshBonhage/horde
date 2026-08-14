@@ -101,6 +101,11 @@ struct RawModelProfile {
     cmd: String,
     #[serde(default)]
     order: Vec<String>,
+    /// Screen text meaning "this model will not serve you any more".
+    #[serde(default)]
+    exhausted: Vec<String>,
+    /// Typed into the pane to change model without restarting the agent.
+    switch: Option<String>,
 }
 
 /// One `[[roles]]` block.
@@ -189,7 +194,25 @@ pub struct ModelProfile {
     pub cmd: String,
     /// Models to try, best first.
     pub order: Vec<String>,
+    /// Screen text that means the current model is spent.
+    ///
+    /// horde cannot see an HTTP status — it reads panes. But a provider error is *rendered*
+    /// into the pane by the agent, so the message is on screen. OpenRouter answers an exhausted
+    /// free model with `429` and `"Rate limit exceeded"`, and opencode prints the message body,
+    /// which is why the defaults below are what they are. Override when your agent words it
+    /// differently; there is no way for horde to know in advance.
+    pub exhausted: Vec<String>,
+    /// What to type into the pane to move to the next model, with `{model}` substituted.
+    ///
+    /// Set, and switching keeps the agent's session — its plan and context survive, which a
+    /// restart would throw away along with the rate limit. Unset, and horde reports that the
+    /// model is spent and leaves it alone.
+    pub switch: Option<String>,
 }
+
+/// What horde assumes an exhausted model says, when a profile does not say otherwise.
+pub const DEFAULT_EXHAUSTED: &[&str] =
+    &["Rate limit exceeded", "rate_limit_exceeded", "429 Too Many Requests"];
 
 impl ModelProfile {
     /// The command for the model at `index`, or `None` once the list is spent.
@@ -475,9 +498,26 @@ impl Config {
                 ));
                 continue;
             }
+            let exhausted = if m.exhausted.is_empty() {
+                DEFAULT_EXHAUSTED.iter().map(|s| s.to_string()).collect()
+            } else {
+                m.exhausted.clone()
+            };
+            if m.switch.as_ref().is_some_and(|c| !c.contains("{model}")) {
+                warnings.push(format!(
+                    "models.{name}: switch has no {{model}} placeholder, so every switch would \
+                     ask for the same model"
+                ));
+                continue;
+            }
             cfg.models.insert(
                 name.clone(),
-                ModelProfile { cmd: m.cmd.clone(), order: m.order.clone() },
+                ModelProfile {
+                    cmd: m.cmd.clone(),
+                    order: m.order.clone(),
+                    exhausted,
+                    switch: m.switch.clone(),
+                },
             );
         }
 
@@ -1045,6 +1085,8 @@ order = ["a", "b"]
         let m = ModelProfile {
             cmd: "opencode --model openrouter/{model}".into(),
             order: vec!["a".into(), "b".into()],
+            exhausted: Vec::new(),
+            switch: None,
         };
         assert!(m.command(0).is_some());
         assert!(m.command(1).is_some());

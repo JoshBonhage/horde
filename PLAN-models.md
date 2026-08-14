@@ -111,7 +111,7 @@ advances through, and what an agent spawning another agent can name without know
 strings. `ModelProfile::command(index)` returns `None` past the end rather than wrapping, so
 Phase 3 inherits "the list is spent" as a state it must handle rather than a case it can ignore.
 
-## Phase 3 — switching without losing the session
+## Phase 3 — switching without losing the session — **shipped**
 
 The obvious design is: detect exhaustion, kill the pane, respawn with the next model. **Do not
 do this.** A respawn is a new session — the agent loses its conversation, its plan and whatever
