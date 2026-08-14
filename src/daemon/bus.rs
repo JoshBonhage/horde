@@ -562,6 +562,51 @@ mod tests {
         panic!("the sink never reported raw mode — is python3 on PATH?");
     }
 
+    /// Pump the pane until the sink's running total reaches `expected`, delivery stalls, or a
+    /// generous ceiling is hit. Returns `(highest total seen, whether it stalled)`.
+    ///
+    /// The sink pauses 10ms per 4KB read on purpose — it is standing in for an agent busy
+    /// rendering — so a 60KB message takes real time, and how much depends entirely on the
+    /// machine. A fixed 5s budget was enough here and not on a GitHub macOS runner, where 75%
+    /// arrived before the clock ran out and the test reported truncation that had not happened.
+    ///
+    /// Waiting on *progress* rather than on a stopwatch removes the guess. Real truncation stops
+    /// the counter dead, so it is caught in `STALL` rather than `CEILING`; a slow machine keeps
+    /// the counter moving and is given as long as it needs.
+    fn drain_until_total(
+        session: &mut Session,
+        pane: PaneId,
+        theme: &crate::theme::Theme,
+        expected: usize,
+    ) -> (usize, bool) {
+        /// How long without a single new byte counts as "the terminal ate it".
+        const STALL: std::time::Duration = std::time::Duration::from_secs(10);
+        /// Backstop, so a genuine hang cannot wedge the suite forever.
+        const CEILING: std::time::Duration = std::time::Duration::from_secs(120);
+
+        let started = std::time::Instant::now();
+        let mut best = 0usize;
+        let mut last_progress = std::time::Instant::now();
+        while best < expected && started.elapsed() < CEILING {
+            session.panes.get_mut(&pane).unwrap().pump(theme);
+            let flat = session.panes[&pane].visible_text().join("");
+            // The sink reports a running total; the largest one is what has arrived.
+            let mut seen = best;
+            for part in flat.split("GOT=").skip(1) {
+                let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+                seen = seen.max(digits.parse::<usize>().unwrap_or(0));
+            }
+            if seen > best {
+                best = seen;
+                last_progress = std::time::Instant::now();
+            } else if last_progress.elapsed() > STALL {
+                return (best, true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        (best, false)
+    }
+
     fn give_agent(session: &mut Session, pane: PaneId, state: AgentState) {
         session.panes.get_mut(&pane).unwrap().agent = Some(AgentRuntime {
             kind: "claude".into(),
@@ -807,24 +852,18 @@ mod tests {
         assert_eq!(m.delivery, Delivery::Delivered);
 
         let theme = cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut best = 0usize;
-        while std::time::Instant::now() < deadline && best < expected {
-            session.panes.get_mut(&pane).unwrap().pump(&theme);
-            let flat = session.panes[&pane].visible_text().join("");
-            // The sink reports a running total; the largest one is what has arrived.
-            for part in flat.split("GOT=").skip(1) {
-                let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-                best = best.max(digits.parse::<usize>().unwrap_or(0));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        let (best, stalled) = drain_until_total(&mut session, pane, &theme, expected);
         for p in session.panes.values_mut() {
             p.kill();
         }
+        // Distinguished, because the two failures have opposite causes. Bytes that stopped
+        // arriving mean the terminal ate them — the truncation this test exists to catch. Bytes
+        // still arriving when time ran out mean only that the machine is slow, which is not a
+        // fact about horde and must not be reported as one.
         assert!(
             best >= expected,
-            "message was truncated: {best} of {expected} bytes arrived"
+            "{} at {best} of {expected} bytes",
+            if stalled { "delivery stalled" } else { "still arriving when the clock ran out" }
         );
     }
 
@@ -1061,17 +1100,29 @@ mod tests {
 
         // Now pump it out, checking that no single tick takes long.
         let theme = cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        // Progress-bounded rather than clock-bounded, for the reason spelled out on
+        // `drain_until_total` — a stopwatch here measures the runner, not the code. Kept as its
+        // own loop because this test also times each individual pump, which is the actual claim:
+        // the tail goes out without any one tick blocking on a write.
         let mut best = 0usize;
         let mut worst_tick = std::time::Duration::ZERO;
-        while std::time::Instant::now() < deadline && best < expected {
+        let started = std::time::Instant::now();
+        let mut last_progress = std::time::Instant::now();
+        while best < expected && started.elapsed() < std::time::Duration::from_secs(120) {
             let t = std::time::Instant::now();
             session.panes.get_mut(&pane).unwrap().pump(&theme);
             worst_tick = worst_tick.max(t.elapsed());
             let flat = session.panes[&pane].visible_text().join("");
+            let mut seen = best;
             for part in flat.split("GOT=").skip(1) {
                 let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-                best = best.max(digits.parse::<usize>().unwrap_or(0));
+                seen = seen.max(digits.parse::<usize>().unwrap_or(0));
+            }
+            if seen > best {
+                best = seen;
+                last_progress = std::time::Instant::now();
+            } else if last_progress.elapsed() > std::time::Duration::from_secs(10) {
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -1079,7 +1130,7 @@ mod tests {
             p.kill();
         }
 
-        assert!(best >= expected, "only {best} of {expected} bytes arrived");
+        assert!(best >= expected, "delivery stopped at {best} of {expected} bytes");
         assert!(
             worst_tick < std::time::Duration::from_millis(150),
             "one tick took {worst_tick:?} — the engine was blocked in a write"
