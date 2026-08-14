@@ -177,6 +177,13 @@ pub struct Pane {
     mirror: Vec<Row>,
     /// Rows changed since the last `take_dirty`.
     dirty: HashSet<u16>,
+    /// The cursor as the client was last told it.
+    ///
+    /// Kept because the cursor rides along with row updates, and a keystroke can move it without
+    /// changing any row — typing a space onto a blank cell rebuilds an identical row. Without
+    /// this the pane looks unchanged, nothing is sent, and the cursor sits a column behind until
+    /// some later keystroke happens to alter a character.
+    pub last_sent_cursor: Option<crate::proto::CursorPos>,
     /// Set when a client attaches or the pane resizes, forcing a full repaint.
     full_repaint: bool,
     /// Bytes to write once their deadline passes.
@@ -273,6 +280,7 @@ impl Pane {
             signal_rx,
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
+            last_sent_cursor: None,
             full_repaint: true,
             deferred: Vec::new(),
             outbound: Vec::new(),
@@ -699,6 +707,7 @@ impl Pane {
             signal_rx,
             mirror: vec![Row::default(); saved.rows as usize],
             dirty: HashSet::new(),
+            last_sent_cursor: None,
             full_repaint: true,
             deferred: Vec::new(),
             outbound: Vec::new(),

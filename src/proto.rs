@@ -154,7 +154,7 @@ pub struct RowUpdate {
     pub row: Row,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorPos {
     pub x: u16,
     pub y: u16,

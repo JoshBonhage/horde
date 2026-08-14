@@ -1110,15 +1110,22 @@ fn broadcast(eng: &mut Engine) {
     for id in &visible {
         let Some(p) = eng.session.panes.get_mut(id) else { continue };
         let dirty = p.take_dirty();
-        if dirty.is_empty() {
+        let mut cursor = p.cursor();
+        cursor.visible = cursor.visible && Some(*id) == focused;
+
+        // A moved cursor is an update in its own right, not just a passenger on a changed row.
+        // Typing a space onto a blank cell rebuilds an identical row, so nothing is dirty — and
+        // skipping the pane here left the cursor a column behind until some later keystroke
+        // altered a character, at which point it jumped two columns at once.
+        let moved = p.last_sent_cursor != Some(cursor);
+        if dirty.is_empty() && !moved {
             continue;
         }
+        p.last_sent_cursor = Some(cursor);
         let rows: Vec<RowUpdate> = dirty
             .iter()
             .filter_map(|&y| p.row(y).map(|r| RowUpdate { y, row: r.clone() }))
             .collect();
-        let mut cursor = p.cursor();
-        cursor.visible = cursor.visible && Some(*id) == focused;
         updates.push((*id, rows, Some(cursor)));
     }
 
@@ -1329,7 +1336,20 @@ mod tests {
 
     /// Build an engine with one real pane, as the daemon would have.
     pub(super) fn engine() -> Engine {
-        let cfg = Config::default();
+        engine_with_shell(None)
+    }
+
+    /// An engine whose one pane runs `shell`, or the configured default when `None`.
+    ///
+    /// Worth the parameter: the default is the developer's own `$SHELL`, which prints a prompt
+    /// at a width nobody can predict and does so *concurrently* with the test. Anything
+    /// asserting on cursor columns has to run something silent — `cat` — or it is really
+    /// asserting on how fast zsh started.
+    pub(super) fn engine_with_shell(shell: Option<&str>) -> Engine {
+        let mut cfg = Config::default();
+        if let Some(s) = shell {
+            cfg.shell = s.to_string();
+        }
         let session = Session::new(&cfg);
         let agents = agents::Detector::new(&cfg);
         let mut eng = Engine {
@@ -1356,6 +1376,76 @@ mod tests {
         let cfg = eng.cfg.clone();
         eng.session.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
         eng
+    }
+
+    /// Type `bytes` into a pane and pump until the emulator has taken them in.
+    ///
+    /// Waits on the daemon's own view of the cursor rather than on a sleep, and returns whether
+    /// it got there — so a test can tell "the terminal never saw the keystroke" apart from "the
+    /// terminal saw it and the client was never told", which is the distinction the bug lives in.
+    fn type_into(eng: &mut Engine, pane: PaneId, bytes: &[u8], want_x: u16) -> bool {
+        eng.session.panes.get_mut(&pane).unwrap().write_input(bytes).unwrap();
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
+            if eng.session.panes[&pane].cursor().x == want_x {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// Broadcast, then report the cursor the client was actually told about.
+    fn cursor_sent_to_client(
+        eng: &mut Engine,
+        rx: &mut mpsc::UnboundedReceiver<ServerFrame>,
+    ) -> Option<crate::proto::CursorPos> {
+        broadcast(eng);
+        let mut last = None;
+        while let Ok(frame) = rx.try_recv() {
+            if let ServerFrame::Rows { cursor: Some(c), .. } = frame {
+                last = Some(c);
+            }
+        }
+        last
+    }
+
+    /// Typing a space has to move the cursor on screen.
+    ///
+    /// A space landing on an already-blank cell changes no text, so the rebuilt row is identical
+    /// and nothing is marked dirty. `broadcast` skips a pane with no dirty rows entirely — and
+    /// the cursor only ever travels *attached to* a row update. So the keystroke is invisible
+    /// until some later keystroke happens to change a character, at which point the cursor jumps
+    /// two columns at once. Reported as "space doesn't render until I type".
+    #[test]
+    fn a_keystroke_that_changes_no_text_still_moves_the_cursor() {
+        // `cat` rather than a shell: it prints no prompt, so column 0 is column 0.
+        let mut eng = engine_with_shell(Some("cat"));
+        let pane = *eng.session.panes.keys().next().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+        eng.session.focus_pane(pane);
+
+        // A visible character first: this part already works, and it gets the client a cursor
+        // to be wrong about.
+        assert!(type_into(&mut eng, pane, b"a", 1), "the pty never echoed the first keystroke");
+        let before = cursor_sent_to_client(&mut eng, &mut rx).expect("a printable char updates");
+        assert_eq!(before.x, 1);
+
+        // Now the space. The emulator must see it...
+        assert!(type_into(&mut eng, pane, b" ", 2), "the pty never echoed the space");
+        assert_eq!(eng.session.panes[&pane].cursor().x, 2, "the terminal knows where it is");
+
+        // ...and so must the client.
+        let after = cursor_sent_to_client(&mut eng, &mut rx);
+        kill_all(&mut eng);
+        assert_eq!(
+            after.map(|c| c.x),
+            Some(2),
+            "the terminal moved the cursor to column 2 but the client was never told"
+        );
     }
 
     fn kill_all(eng: &mut Engine) {
