@@ -540,6 +540,28 @@ mod tests {
         (cfg, session)
     }
 
+    /// Block until the python sink reports that its tty is in raw mode.
+    ///
+    /// Replaces a fixed 700ms sleep, which was a guess at how long python takes to start and
+    /// was wrong on a cold CI runner: the message went into a tty that was still canonical,
+    /// `MAX_CANON` silently ate all but the first kilobyte, and the test reported truncation —
+    /// correctly, but about itself rather than about the code. Both sinks now print `READY`
+    /// once `setraw` has returned, so this waits for the fact instead of estimating it.
+    ///
+    /// Twenty seconds because the cost of being wrong is asymmetric: too short fails a good
+    /// build, and too long only matters on a build that is already failing.
+    fn wait_until_raw(session: &mut Session, pane: PaneId, theme: &crate::theme::Theme) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            session.panes.get_mut(&pane).unwrap().pump(theme);
+            if session.panes[&pane].visible_text().join("").contains("READY") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the sink never reported raw mode — is python3 on PATH?");
+    }
+
     fn give_agent(session: &mut Session, pane: PaneId, state: AgentState) {
         session.panes.get_mut(&pane).unwrap().agent = Some(AgentRuntime {
             kind: "claude".into(),
@@ -774,8 +796,7 @@ mod tests {
         let pane = *session.panes.keys().next().unwrap();
         give_agent(&mut session, pane, AgentState::Idle);
         session.panes.get_mut(&pane).unwrap().resize(200, 60).unwrap();
-        // Let python get the tty into raw mode before measuring anything.
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        wait_until_raw(&mut session, pane, &cfg.theme);
 
         let body = "x".repeat(60_000);
         let bus = Bus::new(std::env::temp_dir().join("horde-test-long.jsonl"));
@@ -854,7 +875,7 @@ mod tests {
         session.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
         let pane = *session.panes.keys().next().unwrap();
         give_agent(&mut session, pane, AgentState::Idle);
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        wait_until_raw(&mut session, pane, &cfg.theme);
 
         // Fill the tty input queue, which nothing is draining. One byte at a time: POLLOUT
         // promises *some* space, not a bufferful, so a larger write could block right here
@@ -1019,7 +1040,7 @@ mod tests {
         let pane = *session.panes.keys().next().unwrap();
         give_agent(&mut session, pane, AgentState::Idle);
         session.panes.get_mut(&pane).unwrap().resize(200, 60).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        wait_until_raw(&mut session, pane, &cfg.theme);
 
         let bus = Bus::new(std::env::temp_dir().join("horde-test-slow.jsonl"));
         let mut m = msg(1, &"x".repeat(40_000));
@@ -1074,7 +1095,7 @@ mod tests {
         let mut session = Session::new(&cfg);
         session.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
         let pane = *session.panes.keys().next().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        wait_until_raw(&mut session, pane, &cfg.theme);
 
         // Writes succeed into the buffer until the cap, then refuse. None of them block.
         let chunk = vec![b'z'; 32 * 1024];
