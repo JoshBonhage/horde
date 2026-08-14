@@ -114,6 +114,17 @@ fn dir_arg(req: &Request, key: &str, default: Dir) -> Dir {
 }
 
 fn handle(eng: &mut Engine, req: &Request) -> R {
+    // The board can be switched off without switching off the bus. They are separate promises:
+    // messaging is agents talking to each other, and the board is agents *taking work* nobody
+    // watched them take. Someone may reasonably want the first without the second.
+    //
+    // Enforced here rather than by leaving it out of the skill, because an agent that reads
+    // about `horde task claim` anywhere else would otherwise find it working.
+    if req.method.starts_with("task.") && !eng.cfg.board {
+        return Err(failed(
+            "the task board is off — set agents.board = true in config.toml to enable it",
+        ));
+    }
     match req.method.as_str() {
         // -- server ------------------------------------------------------
         "ping" => Ok(json!({ "type": "pong", "protocol": crate::proto::PROTOCOL_VERSION })),
@@ -1115,6 +1126,32 @@ mod tests {
     /// count runs away without anyone noticing. The cap is on live panes agents opened, so
     /// closing one frees a slot — a lifetime counter would retire a fleet that had merely
     /// been busy.
+    /// The board and the bus are separate switches, and turning one off must not touch the other.
+    #[test]
+    fn the_board_can_be_closed_while_the_bus_stays_open() {
+        let mut eng = super::super::tests::engine();
+        eng.cfg.board = false;
+
+        let e = handle(&mut eng, &req("task.add", json!({ "text": "something" }))).unwrap_err();
+        assert!(e.message.contains("agents.board"), "{}", e.message);
+        // Every board verb, not just the one that writes: claiming and listing are how an agent
+        // discovers the board exists at all.
+        for m in ["task.list", "task.claim", "task.work", "task.done", "task.clear"] {
+            let e = handle(&mut eng, &req(m, json!({}))).unwrap_err();
+            assert!(e.message.contains("board is off"), "{m}: {}", e.message);
+        }
+
+        // The bus is untouched: resolving a target still works, which is the first thing
+        // `bus.send` does and the part that would break if the gate were too broad.
+        let panes: Vec<_> = eng.session.panes.keys().copied().collect();
+        assert!(!panes.is_empty(), "the fixture has a pane to address");
+        assert!(handle(&mut eng, &req("agent.list", json!({}))).is_ok(), "the roster still works");
+
+        // And with the board on again, the same call goes through.
+        eng.cfg.board = true;
+        assert!(handle(&mut eng, &req("task.list", json!({}))).is_ok());
+    }
+
     /// A profile names a list of models; spawning on one starts at its head.
     #[test]
     fn spawning_on_a_profile_runs_the_first_model_in_it() {

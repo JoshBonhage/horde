@@ -180,7 +180,7 @@ impl Engine {
     ///   nudge is not asked again until it has actually done something. Ten tasks added at
     ///   once produce one nudge, not ten.
     ///
-    /// Parked for now behind [`tasks::autonomous`]: everything below the gate is intact and
+    /// Gated on `agents.board` and `agents.task_nudge`: everything below the gate is intact and
     /// still under test, but nothing tells an agent about the board until the switch is back on.
     fn nudge_for_tasks(&mut self) -> Vec<Event> {
         if !self.cfg.task_nudge {
@@ -940,7 +940,7 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         // A message held back for a busy agent may now be deliverable.
         events.extend(eng.flush_bus());
         // Then, if anyone is free and the board is not empty, say so. A no-op while the board's
-        // autonomous half is parked; see `tasks::autonomous()`.
+        // autonomous half is opt-in; see `agents.task_nudge` and `agents.board`.
         events.extend(eng.nudge_for_tasks());
         let changed = !events.is_empty();
         for ev in events {

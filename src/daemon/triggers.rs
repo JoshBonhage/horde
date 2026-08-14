@@ -627,6 +627,14 @@ pub fn owner_tag(id: u64) -> String {
 fn perform(eng: &mut Engine, t: &Trigger) -> Result<(String, Vec<Event>)> {
     match &t.what {
         What::Task { text } => {
+            // A trigger reaches the board directly rather than through the socket, so the RPC
+            // gate does not cover it. Without this check a closed board would still fill up on
+            // a schedule — which is the exact combination someone turning it off is avoiding.
+            if !eng.cfg.board {
+                return Err(anyhow!(
+                    "the task board is off (agents.board), so this rule cannot place work"
+                ));
+            }
             // Scoped to the space the rule was created in, so a scheduled task lands in the
             // project it was written for rather than being offered to whoever is idle.
             let space = t.space.clone();
@@ -1409,6 +1417,41 @@ mod tests {
         assert!(hm[..2].parse::<u32>().is_ok_and(|h| h < 24), "{s}");
         assert!(hm[3..].parse::<u32>().is_ok_and(|m| m < 60), "{s}");
         assert!(off.starts_with("UTC+") || off.starts_with("UTC-"), "{s}");
+    }
+
+    /// A trigger reaches the board directly, not through the socket, so closing the board has
+    /// to be checked here too — otherwise "no board" still fills up overnight on a schedule.
+    #[test]
+    fn a_closed_board_stops_a_scheduled_task_from_landing() {
+        let mut e = super::super::tests::engine();
+        e.cfg.unattended = true;
+        e.cfg.board = false;
+        let t = Trigger {
+            id: 1,
+            when: When::Every { secs: 1800 },
+            what: task_what(),
+            enabled: true,
+            created: super::super::now_millis(),
+            by: "user".into(),
+            space: None,
+            last_fired: None,
+            fire_count: 0,
+            only_if: None,
+            last_eval: None,
+            deleted: false,
+        };
+        // Counted relative to where it started: the test board is a file in the temp dir shared
+        // by every test in this binary, so an absolute count is really an assertion about what
+        // else happened to be running.
+        let before = e.board.open_count();
+        let err = perform(&mut e, &t).unwrap_err().to_string();
+        assert!(err.contains("agents.board"), "{err}");
+        assert_eq!(e.board.open_count(), before, "nothing may have landed");
+
+        // Open it again and the same rule works, so this is a switch rather than a removal.
+        e.cfg.board = true;
+        assert!(perform(&mut e, &t).is_ok());
+        assert_eq!(e.board.open_count(), before + 1);
     }
 
     #[test]

@@ -71,8 +71,8 @@ animate = true              # spinners for working agents
 [agents]
 restore = true              # resume agents after a daemon restart
 detection_lines = 40        # rows of the live buffer detection reads
-force_inject = false        # deliver messages even mid-stream — parked, see below
-task_nudge = false          # tell an idle agent when the board has work — parked, see below
+force_inject = false        # deliver messages even mid-stream
+task_nudge = false          # tell an idle agent when the board has work
 
 [notifications]
 delivery = "horde"          # horde · system · off
@@ -138,11 +138,8 @@ through untouched, so panes look exactly as they would outside horde.
 
 ## `agents.force_inject`
 
-**Parked, along with the bus it forces.** Setting it currently does nothing: `daemon::bus::ENABLED`
-is off, so `bus.send`, `bus.reply` and `bus.broadcast` are refused at the socket and no message
-is delivered to any pane — by hand, by a trigger, or by the board's nudge. `bus.tail` and
-`bus.reply_for` still read the log, and the log on disk is left alone. Messages that were queued
-when the switch went off stay queued rather than flushing.
+The bus is on. `bus.send`, `bus.reply` and `bus.broadcast` all deliver, by hand, from a trigger,
+or from the board's nudge.
 
 The rest of this section is how it behaves when the bus is back on.
 
@@ -191,6 +188,22 @@ waiting for an agent, it is something you forgot about, and offering it to a fle
 restart is how a quiet morning turns into archaeology. It stays on the board, still readable
 and still claimable by id — stale is not deleted. `horde task clear` wipes a project's open
 work outright.
+
+## `agents.board`
+
+```toml
+[agents]
+board = false
+```
+
+Whether the shared task board accepts anything at all. On by default; `false` refuses every
+`task.*` call at the socket **and** stops a scheduled `--task` rule from placing work, which
+reaches the board directly rather than through the socket and would otherwise keep filling a
+board you had closed.
+
+Deliberately separate from the bus. Messaging is agents talking to each other; the board is
+agents *taking work* nobody watched them take. Wanting the first without the second is a coherent
+position, and before this switch the only way to hold it was to hope nobody tried.
 
 ## `agents.max_fleet`
 

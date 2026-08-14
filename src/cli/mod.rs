@@ -219,10 +219,9 @@ pub enum Command {
 pub enum TriggerCmd {
     /// Add a rule. Needs one of --every/--at, and one of --task/--to/--spawn.
     ///
-    /// `--task` and `--to` are both parked while the board and the bus are reworked, and the
-    /// daemon refuses them; `--spawn` is the one left. When the board is back, `--task` is the
-    /// one to reach for: the work lands on it and whichever agent is free claims it, so the
-    /// rule never has to know who is idle.
+    /// `--task` is usually the one to reach for: the work lands on the board and whichever
+    /// agent is free claims it, so the rule never has to know who is idle. It is refused when
+    /// `agents.board = false`.
     Add {
         /// How often, e.g. 30m, 2h, 1d. At least 60s.
         #[arg(long, conflicts_with = "at")]

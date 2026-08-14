@@ -50,8 +50,9 @@ horde trigger off --all      # the kill switch
 horde trigger rm 1
 ```
 
-**`--task` and `--to` are both parked.** Either is refused for now, both when you try to add the
-rule and if an older one comes due.
+**`--task` needs the board open.** It is refused when `agents.board = false`, both at the moment
+the rule would place work and — since a trigger reaches the board directly rather than through
+the socket — regardless of how the rule was added.
 
 
 The work lands on the board, and the nudge that already exists finds whichever agent is free.
@@ -149,7 +150,7 @@ horde trigger add --at 02:01 --spawn claude --name nightly
 ```
 
 The task lands on the board; the spawned agent gets nudged about it a moment later and claims it.
-That ordering is the whole pattern — the rule never has to know who is free. (Parked: with both
+That ordering is the whole pattern — the rule never has to know who is free. (With both
 `--task` and `--to` refused, a `--spawn` rule brings an agent up at an empty prompt and nothing
 briefs it. Until the switches are back, a scheduled agent needs its instructions baked into the
 command it is spawned with.)

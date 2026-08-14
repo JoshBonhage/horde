@@ -150,6 +150,8 @@ struct RawAgents {
     task_nudge: Option<bool>,
     /// Live panes agents may have started between them.
     max_fleet: Option<usize>,
+    /// Whether the shared task board accepts anything at all.
+    board: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -236,8 +238,14 @@ pub struct Config {
     pub restore_agents: bool,
     pub detection_lines: usize,
     pub force_inject: bool,
-    /// Tell an idle agent when the board has work. Parked: see `daemon::tasks::AUTONOMOUS`.
+    /// Tell an idle agent when the board has work. Needs `board = true` to do anything.
     pub task_nudge: bool,
+    /// Whether the shared task board is open.
+    ///
+    /// Separate from the bus on purpose. Messaging is agents talking to each other; the board is
+    /// agents *taking work* nobody watched them take. Wanting the first without the second is a
+    /// coherent position, and before this the only way to hold it was to hope nobody tried.
+    pub board: bool,
     /// How many live panes agents may have started between them.
     ///
     /// Separate from `triggers.max_spawned`, which bounds what horde starts with nobody
@@ -355,10 +363,11 @@ impl Default for Config {
             restore_agents: true,
             detection_lines: 40,
             force_inject: false,
-            // Off while the board's autonomous half is parked; see `daemon::tasks::AUTONOMOUS`.
-            // Turning it on in config.toml does nothing until that switch is back too.
+            // Off by default: this is the half that acts without being asked, and it is worth
+            // watching the board behave for a day before switching it on. Needs `board = true`.
             task_nudge: false,
             max_fleet: 6,
+            board: true,
             unattended: false,
             max_spawned: 2,
             env: HashMap::new(),
@@ -521,6 +530,7 @@ impl Config {
         cfg.force_inject = raw.agents.force_inject.unwrap_or(cfg.force_inject);
         cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
         cfg.max_fleet = raw.agents.max_fleet.unwrap_or(cfg.max_fleet);
+        cfg.board = raw.agents.board.unwrap_or(cfg.board);
         cfg.unattended = raw.triggers.unattended.unwrap_or(cfg.unattended);
         // Clamped rather than trusted: this bounds how many full-permission agents can run
         // unwatched, and a typo'd 200 should not be taken at face value.
