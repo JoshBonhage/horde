@@ -75,10 +75,15 @@ Then exhaust it deliberately and screenshot the pane. Also confirm what `horde a
 says about the pane — `agents/opencode.toml` is marked *"Untested locally"* and its `detect`
 patterns have never been checked against a running opencode.
 
-## Phase 1 — per-pane environment
+## Phase 1 — per-pane environment — **shipped**
 
-`horde spawn --env KEY=VALUE`, repeatable, plus an `[env]` table in `config.toml` applied to
-every pane. Touches `Pane::spawn`, the `agent.spawn` RPC (`src/daemon/rpc.rs`), and the CLI.
+Shipped as the `[env]` table in `config.toml`, applied to every pane. Per-spawn `--env` was
+**deliberately deferred**: it is only needed when two agents want *different* keys, and varying
+the model — the actual goal — is already expressible through the command line. The table solves
+key delivery, which is the part that blocks everything else.
+
+Spawning now also names the program it could not start. `failed to spawn command` alone sent
+someone hunting for a config problem when opencode simply was not installed.
 
 Two rules worth writing into the code rather than discovering later:
 
@@ -89,7 +94,7 @@ Two rules worth writing into the code rather than discovering later:
   also persisted env, the key would be on disk in horde's own state file. Re-read it from the
   daemon's environment or the config instead.
 
-## Phase 2 — model profiles
+## Phase 2 — model profiles — **shipped**
 
 ```toml
 [models.free]
@@ -103,7 +108,8 @@ order = [
 
 `horde spawn --profile free` starts at the head of `order`. The profile is what a trigger later
 advances through, and what an agent spawning another agent can name without knowing any model
-strings.
+strings. `ModelProfile::command(index)` returns `None` past the end rather than wrapping, so
+Phase 3 inherits "the list is spent" as a state it must handle rather than a case it can ignore.
 
 ## Phase 3 — switching without losing the session
 

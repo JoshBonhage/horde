@@ -502,9 +502,36 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             Ok(eng.agents.explain(&eng.session, p, &eng.cfg))
         }
         "agent.spawn" => {
-            let cmd = str_arg(req, "cmd").unwrap_or("claude").to_string();
-            let dir = dir_arg(req, "split", Dir::Right);
             let cfg = eng.cfg.clone();
+            // A profile names a list of models rather than a command, and beats `--cmd` when
+            // both are given: asking for a profile is the more specific request.
+            //
+            // Refused rather than defaulted when the name is unknown. A typo that silently
+            // started `claude` on someone's Anthropic key, when they asked for the free tier,
+            // is the wrong direction to fail in.
+            let cmd = match str_arg(req, "profile") {
+                Some(p) => {
+                    let profile = cfg.models.get(p).ok_or_else(|| {
+                        let mut known: Vec<&str> = cfg.models.keys().map(|s| s.as_str()).collect();
+                        known.sort();
+                        failed(match known.is_empty() {
+                            true => format!(
+                                "no model profile {p:?} — none are defined; add a [models.{p}] \
+                                 block to config.toml"
+                            ),
+                            false => format!(
+                                "no model profile {p:?} — defined: {}",
+                                known.join(", ")
+                            ),
+                        })
+                    })?;
+                    profile.command(0).ok_or_else(|| {
+                        failed(format!("model profile {p:?} lists no models"))
+                    })?
+                }
+                None => str_arg(req, "cmd").unwrap_or("claude").to_string(),
+            };
+            let dir = dir_arg(req, "split", Dir::Right);
             let name = str_arg(req, "name").map(|s| s.to_string());
 
             // Who asked. An agent spawning agents is the whole point of a lead agent, and also
@@ -1083,6 +1110,46 @@ mod tests {
     /// count runs away without anyone noticing. The cap is on live panes agents opened, so
     /// closing one frees a slot — a lifetime counter would retire a fleet that had merely
     /// been busy.
+    /// A profile names a list of models; spawning on one starts at its head.
+    #[test]
+    fn spawning_on_a_profile_runs_the_first_model_in_it() {
+        let mut eng = super::super::tests::engine();
+        eng.cfg.models.insert(
+            "free".into(),
+            crate::config::ModelProfile {
+                cmd: "cat --model openrouter/{model}".into(),
+                order: vec!["qwen/qwen3-coder:free".into(), "second/model".into()],
+            },
+        );
+        let r = handle(&mut eng, &req("agent.spawn", json!({ "profile": "free" }))).unwrap();
+        assert_eq!(
+            r.get("cmd").and_then(|c| c.as_str()),
+            Some("cat --model openrouter/qwen/qwen3-coder:free")
+        );
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    /// Refused, not defaulted. Quietly falling back to `claude` when someone asked for the free
+    /// tier would spend the wrong budget on the wrong provider and look like it worked.
+    #[test]
+    fn an_unknown_profile_is_refused_and_lists_the_real_ones() {
+        let mut eng = super::super::tests::engine();
+        eng.cfg.models.insert(
+            "free".into(),
+            crate::config::ModelProfile { cmd: "cat {model}".into(), order: vec!["a".into()] },
+        );
+        let e = handle(&mut eng, &req("agent.spawn", json!({ "profile": "fre" }))).unwrap_err();
+        assert!(e.message.contains("fre"), "{}", e.message);
+        assert!(e.message.contains("free"), "it should say what does exist: {}", e.message);
+
+        // And with none defined at all, it says how to define one.
+        eng.cfg.models.clear();
+        let e = handle(&mut eng, &req("agent.spawn", json!({ "profile": "free" }))).unwrap_err();
+        assert!(e.message.contains("[models.free]"), "{}", e.message);
+    }
+
     #[test]
     fn an_agent_cannot_open_more_panes_than_the_fleet_cap() {
         let mut eng = super::super::tests::engine_with_idle_agents("fleetcap", 1);

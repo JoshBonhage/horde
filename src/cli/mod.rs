@@ -96,6 +96,11 @@ pub enum Command {
         /// Command to run.
         #[arg(long, default_value = "claude")]
         cmd: String,
+        /// Start on a model profile from `[models.<name>]` instead of `--cmd`.
+        ///
+        /// Wins over `--cmd` when both are given.
+        #[arg(long)]
+        profile: Option<String>,
         /// Addressable name for the new agent.
         #[arg(long)]
         name: Option<String>,
@@ -687,20 +692,22 @@ pub fn run(cmd: Command) -> Result<()> {
             println!("sent to {n} agent(s)");
         }
 
-        Command::Spawn { cmd, name, split, worktree, role, board, task } => {
+        Command::Spawn { cmd, profile, name, split, worktree, role, board, task } => {
             // `--worktree` with no value means "name it after the agent", which the daemon
             // resolves because it is the side that knows what the agent ended up called.
             let worktree = worktree.map(|w| if w.is_empty() { Value::Bool(true) } else { json!(w) });
             let v = call(
                 "agent.spawn",
                 json!({
-                    "cmd": cmd, "name": name, "split": dir_name(&split)?,
+                    "cmd": cmd, "profile": profile, "name": name, "split": dir_name(&split)?,
                     "worktree": worktree, "role": role, "board": board, "task": task,
                     // Who asked, so an agent building a fleet is counted against the cap.
                     "from": self_pane(),
                 }),
             )?;
-            println!("pane {} running {cmd}", v.get("pane").unwrap_or(&Value::Null));
+            // What it actually ran, which a profile decides on the daemon side.
+            let ran = v.get("cmd").and_then(|c| c.as_str()).unwrap_or(&cmd);
+            println!("pane {} running {ran}", v.get("pane").unwrap_or(&Value::Null));
             if let Some(w) = v.get("worktree").and_then(|w| w.as_str()) {
                 println!("  worktree {w}");
             }

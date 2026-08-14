@@ -274,6 +274,59 @@ Neither ships with Windows, which is the whole reason horde does not try to pick
 `interop.appendWindowsPath` must also still be on in `wsl.conf`, or no `.exe` is on `$PATH` at
 all.
 
+## `[env]` — what every pane gets
+
+```toml
+[env]
+OPENROUTER_API_KEY = "sk-or-..."
+OPENCODE_CONFIG = "/home/you/.config/opencode/opencode.json"
+```
+
+Handed to every pane horde opens, applied last so it overrides horde's own defaults. This is how
+a provider key reaches an agent.
+
+Inheriting the key from the daemon's environment looks equivalent and is not. The daemon is
+`setsid`'d away from whichever shell started it, so a key exported in `.bashrc` reaches it only
+when horde was started from an interactive shell — and a daemon started any other way gets a thin
+environment and an agent that cannot authenticate, with nothing on screen explaining why. Naming
+it here removes the guess. It matters most under WSL, where the daemon's ancestry is least
+predictable.
+
+**Values are treated as secrets.** They are never written to the log, the journal, `horde status`
+or `state.json`. The cost of that is real and deliberate: a mistyped key produces an agent that
+fails to authenticate with nothing in horde's log to explain it. A key in a log file outlives
+every session that could have used it.
+
+## `[models]` — a list to work through
+
+```toml
+[models.free]
+cmd = "opencode --model openrouter/{model}"
+order = [
+  "qwen/qwen3-coder:free",
+  "deepseek/deepseek-chat-v3.1:free",
+  "z-ai/glm-4.5-air:free",
+]
+```
+
+```sh
+horde spawn --profile free --name builder
+```
+
+`{model}` is replaced with an entry from `order`; `--profile` starts at the head of the list and
+beats `--cmd` when both are given. horde keeps no catalogue of its own — this is your list, and
+horde's only opinion about it is which entry an agent is currently on.
+
+The list does not wrap. A fleet that has burned through every free model should stop and say so;
+rotating forever turns "the free tier does not support this workload" into an agent that looks
+busy and achieves nothing.
+
+An unknown profile name is refused rather than defaulted. Quietly falling back to `claude` when
+you asked for the free tier would spend the wrong budget on the wrong provider and look like it
+worked.
+
+Full reasoning, and where automatic switching goes next: [PLAN-models.md](../PLAN-models.md).
+
 ## `triggers.unattended`
 
 Off by default, and the one switch that changes what horde *is*. On, scheduled rules may put work

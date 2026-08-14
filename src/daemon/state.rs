@@ -261,6 +261,7 @@ impl Session {
             24,
             cfg.scrollback,
             &crate::config::socket_path(),
+            &cfg.env,
         )?;
         self.panes.insert(id, pane);
         Ok(id)

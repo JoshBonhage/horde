@@ -213,6 +213,7 @@ impl Pane {
         rows: u16,
         scrollback: usize,
         socket: &Path,
+        env: &std::collections::HashMap<String, String>,
     ) -> Result<Pane> {
         let cols = cols.max(MIN_COLS);
         let rows = rows.max(MIN_ROWS);
@@ -238,7 +239,22 @@ impl Pane {
         // are reachable. This is the breadcrumb.
         builder.env("HORDE_DOCS", "horde docs orchestration");
 
-        let child = pair.slave.spawn_command(builder).context("failed to spawn command")?;
+        // The user's own environment, last so it can override anything above — including `PAGER`
+        // for someone who means it. This is how a provider key reaches an agent.
+        //
+        // Values are secrets and are never logged. Note what that costs: a mistyped key produces
+        // an agent that fails to authenticate with nothing in horde's log to explain it, and that
+        // is the right trade. A key in a log file outlives every session that could have used it.
+        for (k, v) in env {
+            builder.env(k, v);
+        }
+
+        let child = pair.slave.spawn_command(builder).with_context(|| {
+            // `failed to spawn command` alone sent someone hunting for a config problem when
+            // the binary simply was not installed. Name the program and the likely cause.
+            let prog = cmd.split_whitespace().next().unwrap_or(cmd);
+            format!("could not start {prog:?} — is it installed and on PATH?")
+        })?;
         // The slave fd must be dropped or the PTY never reports EOF when the child exits.
         drop(pair.slave);
 

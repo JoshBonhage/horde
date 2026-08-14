@@ -1350,6 +1350,8 @@ mod tests {
         if let Some(s) = shell {
             cfg.shell = s.to_string();
         }
+        // Present for every test engine so the env path is exercised rather than bypassed.
+        cfg.env.insert("HORDE_ENV_TEST".into(), "sk-or-test".into());
         let session = Session::new(&cfg);
         let agents = agents::Detector::new(&cfg);
         let mut eng = Engine {
@@ -1445,6 +1447,36 @@ mod tests {
             after.map(|c| c.x),
             Some(2),
             "the terminal moved the cursor to column 2 but the client was never told"
+        );
+    }
+
+    /// A configured variable has to reach the program, not merely be stored.
+    ///
+    /// This is how a provider key gets to an agent, and the failure mode if it does not arrive is
+    /// silent: the agent starts, cannot authenticate, and says so in its own words somewhere in
+    /// its own UI. So the assertion goes all the way through a real PTY to a real child.
+    #[test]
+    fn configured_env_reaches_the_program_in_the_pane() {
+        // `printenv VAR` rather than `env`: one variable, one line. A bare `env` prints more
+        // than a pane has rows, and the answer scrolls off the top before anything can read it.
+        // Neither can use `sh -c '...'` — `build_command` splits on whitespace and does not
+        // honour quotes, so an argument containing spaces cannot be expressed here at all.
+        let mut eng = engine_with_shell(Some("printenv HORDE_ENV_TEST"));
+        let pane = *eng.session.panes.keys().next().unwrap();
+        let theme = eng.cfg.theme.clone();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline && !seen.contains("sk-or-test") {
+            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
+            seen = eng.session.panes[&pane].visible_text().join("");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        kill_all(&mut eng);
+        // `printenv VAR` prints the value alone, so the value is the whole assertion.
+        assert!(
+            seen.contains("sk-or-test"),
+            "the pane never saw the configured value; screen was {seen:?}"
         );
     }
 

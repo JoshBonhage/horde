@@ -88,6 +88,19 @@ struct RawConfig {
     triggers: RawTriggers,
     #[serde(default)]
     roles: Vec<RawRole>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    models: HashMap<String, RawModelProfile>,
+}
+
+/// One `[models.<name>]` block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModelProfile {
+    cmd: String,
+    #[serde(default)]
+    order: Vec<String>,
 }
 
 /// One `[[roles]]` block.
@@ -157,6 +170,37 @@ struct RawTriggers {
 // Resolved config
 // ---------------------------------------------------------------------------
 
+/// A named list of models to work through, and the command that runs one.
+///
+/// The point of the list is that free models run out. `cmd` is a template containing `{model}`;
+/// `order` is the sequence to try, best first. horde holds no catalogue of its own — this is the
+/// user's list, and horde's only opinion about it is which entry an agent is currently on.
+///
+/// ```toml
+/// [models.free]
+/// cmd = "opencode --model openrouter/{model}"
+/// order = ["qwen/qwen3-coder:free", "deepseek/deepseek-chat-v3.1:free"]
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelProfile {
+    /// Command template. `{model}` is replaced with an entry from `order`.
+    pub cmd: String,
+    /// Models to try, best first.
+    pub order: Vec<String>,
+}
+
+impl ModelProfile {
+    /// The command for the model at `index`, or `None` once the list is spent.
+    ///
+    /// Returning `None` rather than wrapping around is deliberate: a fleet that has exhausted
+    /// every free model should stop and say so. Rotating forever turns "the free tier does not
+    /// support this workload" into an agent that looks busy and achieves nothing.
+    pub fn command(&self, index: usize) -> Option<String> {
+        let model = self.order.get(index)?;
+        Some(self.cmd.replace("{model}", model))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Notify {
     /// In-app toast only.
@@ -211,6 +255,19 @@ pub struct Config {
     /// nobody present, so the default is "enough to be useful, few enough to read the transcript
     /// of afterwards".
     pub max_spawned: usize,
+    /// Extra environment handed to every pane.
+    ///
+    /// This is how a provider key reaches an agent. Inheriting it from the daemon's environment
+    /// looks equivalent and is not: the daemon is `setsid`'d from whichever shell started it, so
+    /// a key exported in `.bashrc` reaches it only when horde was started from an interactive
+    /// shell — and a daemon started any other way gets a thin environment and an agent that
+    /// cannot authenticate, with nothing on screen explaining why.
+    ///
+    /// **Values are secrets.** Nothing here may reach the log, the journal, `horde status`, or
+    /// `state.json`. See `Pane::spawn`.
+    pub env: HashMap<String, String>,
+    /// Named model rotations, keyed by profile name. See `ModelProfile`.
+    pub models: HashMap<String, ModelProfile>,
     pub notify: Notify,
     /// Program run when the daemon has something to tell you and nothing is attached. The
     /// summary arrives as `$1` and the full digest as JSON on stdin, which is what keeps
@@ -304,6 +361,8 @@ impl Default for Config {
             max_fleet: 6,
             unattended: false,
             max_spawned: 2,
+            env: HashMap::new(),
+            models: HashMap::new(),
             notify: Notify::Horde,
             notify_command: None,
             roles: Vec::new(),
@@ -377,6 +436,40 @@ impl Config {
                     None => warnings.push(format!("space_accents[{i}]: bad color {s:?}")),
                 }
             }
+        }
+
+        // Environment handed to every pane. Names are validated, values never inspected —
+        // one of them is an API key, and the less code that touches it the better.
+        for (k, v) in &raw.env {
+            if k.is_empty() || k.contains('=') || k.contains('\0') {
+                warnings.push(format!("env: {k:?} is not a usable variable name"));
+                continue;
+            }
+            cfg.env.insert(k.clone(), v.clone());
+        }
+
+        // Model profiles. A profile with no models is a typo that would otherwise present as
+        // "the agent silently refuses to start", so it is refused here where it can be explained.
+        for (name, m) in &raw.models {
+            if m.cmd.trim().is_empty() {
+                warnings.push(format!("models.{name}: cmd is empty"));
+                continue;
+            }
+            if m.order.is_empty() {
+                warnings.push(format!("models.{name}: order lists no models"));
+                continue;
+            }
+            if !m.cmd.contains("{model}") {
+                warnings.push(format!(
+                    "models.{name}: cmd has no {{model}} placeholder, so every entry in order \
+                     would run the same command"
+                ));
+                continue;
+            }
+            cfg.models.insert(
+                name.clone(),
+                ModelProfile { cmd: m.cmd.clone(), order: m.order.clone() },
+            );
         }
 
         // Roles resolve after the theme, because an undeclared one derives its colour from
@@ -880,6 +973,72 @@ mod tests {
         let p = std::env::temp_dir().join(format!("horde-cfgtest-{name}.toml"));
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    #[test]
+    fn env_and_model_profiles_are_read() {
+        let p = write_tmp(
+            "envmodels",
+            r#"
+[env]
+OPENROUTER_API_KEY = "sk-or-test"
+OPENCODE_CONFIG = "/home/me/.config/opencode/opencode.json"
+
+[models.free]
+cmd = "opencode --model openrouter/{model}"
+order = ["qwen/qwen3-coder:free", "deepseek/deepseek-chat-v3.1:free"]
+"#,
+        );
+        let (cfg, warnings) = Config::load_from(&p);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.env.get("OPENROUTER_API_KEY").unwrap(), "sk-or-test");
+        let free = cfg.models.get("free").expect("the profile is there");
+        assert_eq!(free.order.len(), 2);
+        assert_eq!(
+            free.command(0).unwrap(),
+            "opencode --model openrouter/qwen/qwen3-coder:free"
+        );
+    }
+
+    /// Each of these is a typo that would otherwise present as "the agent will not start",
+    /// which is the hardest possible way to be told about a config mistake.
+    #[test]
+    fn a_broken_profile_is_refused_with_a_reason() {
+        let p = write_tmp(
+            "badmodels",
+            r#"
+[models.nocmd]
+cmd = ""
+order = ["a"]
+
+[models.noorder]
+cmd = "opencode --model {model}"
+order = []
+
+[models.noplaceholder]
+cmd = "opencode --model openrouter/qwen"
+order = ["a", "b"]
+"#,
+        );
+        let (cfg, warnings) = Config::load_from(&p);
+        assert!(cfg.models.is_empty(), "none of these should be usable");
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("cmd is empty")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("lists no models")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("{model}")), "{warnings:?}");
+    }
+
+    /// The list is finite on purpose: a fleet that has burned through every free model should
+    /// stop and say so rather than loop back to the one that just refused it.
+    #[test]
+    fn a_spent_profile_offers_no_further_command() {
+        let m = ModelProfile {
+            cmd: "opencode --model openrouter/{model}".into(),
+            order: vec!["a".into(), "b".into()],
+        };
+        assert!(m.command(0).is_some());
+        assert!(m.command(1).is_some());
+        assert_eq!(m.command(2), None, "the list does not wrap");
     }
 
     #[test]
