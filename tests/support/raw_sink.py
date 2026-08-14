@@ -7,6 +7,11 @@ try:
     tty.setraw(fd)
 except Exception:
     pass
+# Announce that the line discipline is now raw, so a test can wait for the fact rather than
+# guess at how long python takes to start. On a loaded CI runner that guess is wrong, the
+# message is delivered into a still-canonical tty, and MAX_CANON silently eats most of it.
+sys.stdout.write("READY\r\n")
+sys.stdout.flush()
 total = 0
 while True:
     b = os.read(fd, 4096)
