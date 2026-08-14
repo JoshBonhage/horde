@@ -182,6 +182,94 @@ Everything here is Linux-side, so it mostly just works — with four specifics.
   gets a thin one. This is the same class of bug as the `/bin/zsh` fallback. Phase 1's `[env]`
   config table is the fix — the key is read from config by the daemon, not inherited by luck.
 
+## Phase 5 — succession: when the agent itself runs out
+
+Phase 3 moves a *model* inside a running agent. This is the harder case: the agent is finished —
+its plan is out of usage, not out of model — and something else has to carry on. "Claude runs out
+overnight, a free opencode picks it up, and when that one dies the next takes over."
+
+### What is actually detectable
+
+**"Out" is detectable. "Nearly out" mostly is not.** A usage limit announces itself in the pane
+as text, which is exactly what manifests already read. Remaining budget does not appear anywhere
+horde can see — there is no API here by design — so any "switch at 90%" design needs a number
+horde cannot obtain. Two honest paths instead:
+
+- **Cooperative.** The agent notices and says so: `horde broadcast "hit my usage limit"`. Better
+  quality, because the agent knows what it was in the middle of. Already added to the skill.
+- **Observational.** A manifest rule matches the limit message. The safety net for an agent that
+  stops mid-sentence and never gets to speak.
+
+Build both. The cooperative path carries the good handover; the observational one guarantees
+*something* happens.
+
+### The handover is the whole problem
+
+Spawning a successor is trivial — `agent.spawn` already does it, with the worktree, role, space
+and name of the pane it replaces. What is hard is that a fresh agent knows nothing.
+
+The instinct is to have the dying agent write a handoff note. **It cannot** — it is out of
+tokens; that is the premise.
+
+But horde has been watching the whole time, and can compose the brief itself from things it
+already holds:
+
+| Source | What it contributes | Already exists |
+|---|---|---|
+| the spawn's `--task`, or the board entry | what this agent was *for* | yes |
+| `repo.rs` facts on its worktree | `git status`, diff stat — what changed | yes |
+| the pane's scrollback tail | what it was doing when it stopped | yes |
+| the bus log to and from it | what it was told and what it promised | yes |
+| the journal | when it started, what states it passed through | yes |
+
+That is a better handover than most humans write, and it costs the dying agent nothing. It is
+also the argument for doing this in horde rather than in a shell script: **the multiplexer is the
+only thing in the system that watched.**
+
+### The chain
+
+A chain is an ordered list of what to try, and `[models.<name>]` is already an ordered list.
+
+```toml
+[models.fallback]
+cmd = "opencode --model openrouter/{model}"
+order = ["cohere/north-mini-code:free", "openai/gpt-oss-20b:free"]
+```
+
+```sh
+horde spawn --cmd claude --name builder --succeed-with fallback
+```
+
+Exhaustion advances one step; a spent chain stops and notifies rather than wrapping — same rule
+as Phase 2, for the same reason.
+
+### Four ways this goes wrong
+
+**Provenance disappears.** You go to bed with Claude on a task and wake to work done by a 20B
+free model, with nothing saying so. This is the most likely real harm and the easiest to fix:
+the succession must be journalled, visible in the roster, and in the digest headline —
+*"builder handed over to opencode/north-mini at 03:12"*. horde already has all three surfaces.
+
+**A weaker successor undoes good work.** It inherits a half-finished change it did not write, at
+full permission. Mitigation is to brief it to *read before continuing*, and possibly to commit
+the predecessor's work first so there is something to go back to.
+
+**Infinite succession.** A chain whose members all die immediately spawns forever. It must count
+against `max_spawned`, and a member that dies within some floor of starting should end the chain
+rather than advance it — that is a broken configuration, not a run of bad luck.
+
+**Cost inversion.** A chain that falls back to a *paid* model spends money unattended, which is
+the opposite of the intent. Falling back should never move to a more expensive model than the one
+that failed, and horde cannot know prices — so the safe rule is that a chain is opt-in per name
+and the human owns its ordering.
+
+### Why this is worth building
+
+Not because free models are good. Because the alternative to a weaker agent finishing the job is
+usually **nothing happening for eight hours**, and horde's entire premise is that the hours
+nobody is watching should not be dead time. A rate limit at 2am currently costs a night. It
+should cost a downgrade.
+
 ## Risks worth stating before building
 
 **Free models are weak at tool use.** Agentic coding depends on reliable tool-calling, and that

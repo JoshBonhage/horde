@@ -315,6 +315,72 @@ own, with no secret store and no built-in HTTP client to go stale.
 
 ---
 
+## Any model, including the free ones
+
+horde never talks to a model. It runs the agent, and the agent owns its provider — so pointing a
+fleet at OpenRouter's free tier is a config file, not an integration.
+
+```toml
+# ~/.config/horde/config.toml
+[models.free]
+cmd = "opencode --model openrouter/{model}"
+order = [
+  "cohere/north-mini-code:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "openai/gpt-oss-20b:free",
+]
+```
+
+```sh
+opencode auth login --provider openrouter --method api-key   # once; the key stays in opencode
+horde spawn --profile free --name builder
+```
+
+That is the whole setup. `{model}` is filled from `order`, and `--profile` starts at the head of
+the list.
+
+<details>
+<summary><b>Why the key is not in horde's config</b></summary>
+
+<br>
+
+`opencode auth login` puts it in opencode's own `~/.local/share/opencode/auth.json`. horde never
+reads it, never logs it, and never writes it to `state.json` — the same reason there is no HTTP
+client anywhere in the codebase. The moment a multiplexer holds a key it acquires a threat model
+and a reason to sit in the request path of every agent.
+
+For a tool that only reads its key from the environment, `[env]` hands variables to every pane:
+
+```toml
+[env]
+SOME_PROVIDER_KEY = "..."
+```
+
+Values there are treated as secrets — never logged, never persisted. The cost is deliberate: a
+mistyped key fails with nothing in horde's log to explain it, which is better than a key that
+outlives every session that could have used it.
+
+</details>
+
+<details>
+<summary><b>What the list is for</b></summary>
+
+<br>
+
+Free models run out. `order` is the sequence to fall through, best first, and it deliberately
+does **not** wrap — a fleet that has spent every model should stop and say so rather than loop
+back to the one that just refused it.
+
+An unknown profile name is refused rather than defaulted. Quietly starting `claude` when you
+asked for the free tier spends the wrong budget on the wrong provider and looks like it worked.
+
+Automatic switching — noticing a model is exhausted and moving the agent without losing its
+session — is designed in [PLAN-models.md](PLAN-models.md) and not built yet.
+
+</details>
+
+---
+
 ## How it works
 
 The split is the whole design: the client can die without disturbing a single running process.

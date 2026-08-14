@@ -61,8 +61,11 @@ horde task list                                 # this project's board
 horde task clear                                # drop every open task here
 ```
 
-Two things to know:
+Three things to know:
 
+- **The board can be closed.** If `agents.board = false`, every one of these is refused and the
+  error names the setting. That is a deliberate choice by your human, not a fault — messaging
+  still works, so use `horde send` and say what you need. Do not try to route around it.
 - **You are not offered work until you enlist.** `horde task work` once, then you may be told
   when tasks are waiting. Without it nothing will ever interrupt you, which is deliberate: an
   agent someone opened to think with is not a worker.
@@ -99,6 +102,7 @@ horde spawn --cmd "claude --model opus" --name parser \
 | `--board` | enlist it for board work in this project |
 | `--task` | a first job, put on the board for it to claim |
 | `--cmd` | the whole command, so the model goes here: `"claude --model opus"` |
+| `--profile` | start on a named model list from config instead of `--cmd` — see below |
 
 **Use `--worktree` whenever you start more than one agent in the same repository.** Without
 it they share one working tree, and two agents editing the same file is not a merge conflict
@@ -110,6 +114,19 @@ default). Hitting it is an error that says so. Do not work around it; tell your 
 After spawning, brief each agent with `horde send`, or put the work on the board and let them
 claim it. The board is better for more than two agents: it self-balances, and you never have
 to track who is free.
+
+## Models
+
+Your human may have defined named model lists in config. Each is a command plus an ordered set
+of models to work through:
+
+```bash
+horde spawn --profile free --name helper     # starts on the first model in the "free" list
+```
+
+Use a profile when you want *a* worker and do not care which model, and `--cmd` when the model
+matters. An unknown profile name is refused and the error lists the real ones — it never quietly
+falls back to a different model, because that would spend a budget nobody chose.
 
 ## Watching
 
@@ -127,5 +144,17 @@ States are `working`, `blocked`, `done`, `idle`, `unknown`, `serving`. Two need 
   send reaches it, and messages you send are held until it is answered.
 - **`serving` is not an agent.** It is a dev server or watcher, and there is nobody in there
   to talk to.
+
+## If you are running out
+
+If you hit your own usage limit, say so before you stop. Your human may not be watching, and a
+pane that goes quiet looks the same as one that is thinking:
+
+```bash
+horde broadcast "hit my usage limit — parser work is half done, tests not run yet"
+```
+
+Leave the working tree in a state someone else can pick up: commit or stash, and say which.
+A successor that inherits a dirty tree with no note has to guess what you meant.
 
 Full reference: `horde docs orchestration`.
