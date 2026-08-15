@@ -40,6 +40,10 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 toml_edit = "0.25.13"
+# Markdown parsing for the vault index. Default features off: the `html` renderer and
+# `getopts` are for a CLI that turns markdown into web pages, which is the one thing horde
+# will never do.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 
 [profile.release]
 lto = "thin"
