@@ -6,6 +6,11 @@ all.
 Not `~/Library/Application Support` on macOS: that path puts a space in the socket path and
 eats into the ~104 byte `AF_UNIX` limit. `XDG_CONFIG_HOME` is honoured if set.
 
+A complete working file is committed as
+[`config.example.toml`](../config.example.toml) — copy it to `~/.config/horde/config.toml` and
+edit. It carries the model and handover blocks, which are the tedious ones to reconstruct from
+this page.
+
 ## The settings page
 
 `ctrl+b .` opens settings with categories down the left: **Appearance, Keybindings, Agents,

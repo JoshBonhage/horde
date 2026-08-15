@@ -1,0 +1,116 @@
+# A complete, working `~/.config/horde/config.toml`.
+#
+# horde runs with no config file at all — everything here has a default. This exists because the
+# model and handover blocks below are tedious to reconstruct from the reference, and because a
+# working example is the fastest way to hand a setup to someone else.
+#
+# There are no secrets in this file and there is not supposed to be. `opencode auth login` keeps
+# the provider key in opencode's own `~/.local/share/opencode/auth.json`, so horde never holds
+# it. Use `[env]` only for a tool that reads its key from the environment instead — and then this
+# file becomes one you should not share.
+#
+# Full reference: `horde docs configuration`.
+
+prefix = "ctrl+b"
+scrollback = 10000
+
+# ---------------------------------------------------------------------------
+# Preferences — safe to change to taste, nothing below depends on them
+# ---------------------------------------------------------------------------
+
+[theme]
+# horde · tokyo-night · catppuccin · gruvbox · terminal
+name = "horde"
+
+[ui]
+sidebar = true
+sidebar_width = 24
+bus = true
+bus_width = 30
+pane_titles = true
+animate = true
+
+[notifications]
+# horde · system · off
+delivery = "horde"
+
+# ---------------------------------------------------------------------------
+# Choices worth making deliberately
+# ---------------------------------------------------------------------------
+
+[agents]
+restore = true
+detection_lines = 40
+# The shared task board. On by default. `false` refuses every `task.*` call and stops a
+# scheduled `--task` rule placing work — the bus is unaffected either way, because messaging and
+# agents-taking-work-unwatched are different promises.
+# board = false
+
+[triggers]
+# Off, deliberately. On, scheduled rules act while nobody is watching, which is the one switch
+# that changes what horde *is*. Turn it on once you have watched the rules behave.
+unattended = false
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+# Free OpenRouter models to work through, best first.
+#
+# Every entry supports tool calling, which is what agentic coding needs — checked against
+# OpenRouter's live catalogue rather than assumed. The ordering is a guess at coding quality and
+# worth revising once you have actually run them. Model IDs go stale; check
+# https://openrouter.ai/models?max_price=0 before copying this wholesale.
+#
+#   opencode auth login --provider openrouter --method api-key   # once
+#   horde spawn --profile free --name builder
+[models.free]
+cmd = "opencode --model openrouter/{model}"
+order = [
+  "cohere/north-mini-code:free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "poolside/laguna-s-2.1:free",
+  "openai/gpt-oss-20b:free",
+  "google/gemma-4-31b-it:free",
+]
+
+# What a spent model says on screen. horde has no HTTP client and cannot see a 429 — but the
+# agent prints the provider's error into its pane, which is where this is read from.
+exhausted = ["Rate limit exceeded", "rate_limit_exceeded", "429"]
+
+# Typed into the *running* agent to change model, so its session survives. Restarting would throw
+# away the plan it had formed and everything it had read — more than the rate limit cost.
+# Leave unset to have horde report the model is spent and leave the agent alone.
+switch = "/models openrouter/{model}"
+
+# ---------------------------------------------------------------------------
+# Handing over before an agent runs out
+# ---------------------------------------------------------------------------
+
+# `warning` is told to the agent so it hands over itself — the better path, because it knows what
+# it was doing. `exhausted` is the net for when it stopped mid-sentence and horde has to spawn
+# the successor and write the brief from what it watched.
+#
+# Provenance, since the whole feature turns on these strings:
+#   "Claude usage limit reached. Your limit will reset at 3pm (America/New_York)" is quoted
+#   verbatim in anthropics/claude-code issues #9236 and #5977 — well sourced.
+#   The approaching-limit wording is from third-party write-ups; Anthropic's help centre
+#   describes the behaviour without quoting it. Treat that tier as a guess until you see one.
+#
+# Matching ignores whitespace, so a phrase still matches when a narrow pane wrapped it. Check
+# `horde.log` for "told to hand over" and "ran out; started" to confirm either fired.
+[handover]
+warning = [
+  "Approaching 5-hour limit",
+  "Approaching usage limit",
+]
+exhausted = [
+  "usage limit reached",
+  "Your limit will reset at",
+  "limit reached, resets",
+  "limit reached - resets",
+]
+profile = "free"
+# Ends a lineage that keeps running out. If three agents in a row have run out, the answer is
+# not a fourth.
+max_chain = 3

@@ -336,6 +336,9 @@ opencode auth login --provider openrouter --method api-key   # once; the key sta
 horde spawn --profile free --name builder
 ```
 
+A complete working config, including automatic switching when a model runs out, is committed as
+**[config.example.toml](config.example.toml)** — copy it to `~/.config/horde/config.toml`.
+
 That is the whole setup. `{model}` is filled from `order`, and `--profile` starts at the head of
 the list.
 

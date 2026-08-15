@@ -1101,6 +1101,30 @@ mod tests {
         p
     }
 
+    /// The shipped example has to actually load.
+    ///
+    /// It exists to be copied, and it documents settings by using them — so a key renamed in
+    /// `RawConfig` breaks it silently, and the first person to find out is whoever copied it.
+    /// `deny_unknown_fields` means a stale key is a hard error here, which is the point.
+    #[test]
+    fn the_example_config_parses_with_no_warnings() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+        let (cfg, warnings) = Config::load_from(&path);
+        assert!(warnings.is_empty(), "the example must be clean: {warnings:?}");
+
+        // And the parts it exists for resolve, rather than merely parsing.
+        let free = cfg.models.get("free").expect("the free profile");
+        assert!(!free.order.is_empty(), "it lists models");
+        assert!(free.command(0).is_some(), "and can build a command from them");
+        assert!(!free.exhausted.is_empty(), "it says what a spent model looks like");
+        assert_eq!(cfg.handover.profile.as_deref(), Some("free"), "handover points at it");
+        assert!(!cfg.handover.exhausted.is_empty(), "and knows what running out looks like");
+
+        // The example must never carry a secret. It is committed to a public repository, and the
+        // whole design keeps keys in the agent's own credential store instead.
+        assert!(cfg.env.is_empty(), "the example must not ship an [env] block");
+    }
+
     #[test]
     fn env_and_model_profiles_are_read() {
         let p = write_tmp(
