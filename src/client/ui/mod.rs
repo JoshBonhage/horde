@@ -373,6 +373,57 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // One row up from the bottom, because the bottom row is the status bar and it is
         // drawn after this. The hint row had been landing underneath it, which is why nobody
         // had ever seen it.
+        // The completion list, over the text and under the cursor's line.
+        if let (Some(c), Some(buf)) = (app.completions.as_ref(), app.buffer.as_ref()) {
+            let prefix = buf.word_prefix();
+            let items = c.matching(&prefix);
+            if !items.is_empty() && buf.line >= scroll {
+                let cursor_row = area.y + 2 + (buf.line - scroll) as u16;
+                let below = area.y + area.height.saturating_sub(2) - cursor_row.min(area.y + area.height);
+                // Below the line normally; above it when the line is near the bottom, so the
+                // list never covers the thing being completed.
+                let want = (items.len() as u16).min(8);
+                let (list_y, room) = if below > want + 1 {
+                    (cursor_row + 1, want)
+                } else {
+                    (cursor_row.saturating_sub(want.min(cursor_row - area.y)), want.min(cursor_row - area.y))
+                };
+                let widest = items
+                    .iter()
+                    .take(room as usize)
+                    .map(|i| width(&i.label) + i.kind.as_deref().map(|k| width(k) + 2).unwrap_or(0))
+                    .max()
+                    .unwrap_or(10);
+                let w = (widest as u16 + 3).min(col.saturating_sub(2)).max(12);
+                let lx = (x + buf.word_start() as u16).min(x + col.saturating_sub(w));
+                let top_at = c.sel.saturating_sub(room.saturating_sub(1) as usize);
+                for (i, item) in items.iter().skip(top_at).take(room as usize).enumerate() {
+                    let selected = top_at + i == c.sel;
+                    let bg = if selected { theme2.ui.selection } else { theme2.ui.panel_bg };
+                    let y = list_y + i as u16;
+                    fill(f.buffer_mut(), TRect { x: lx, y, width: w, height: 1 }, bg);
+                    let mut spans = vec![ratatui::text::Span::styled(
+                        format!(" {}", truncate(&item.label, w as usize - 2)),
+                        Style::default()
+                            .fg(color(if selected { theme2.ui.text } else { theme2.ui.text_dim }))
+                            .bg(color(bg)),
+                    )];
+                    // The kind is worth a column of its own: `fn` against `field` is most of
+                    // what you are choosing between when two names look alike.
+                    if let Some(kind) = item.kind.as_deref() {
+                        let used = width(&item.label) + 1;
+                        if used + kind.len() + 2 < w as usize {
+                            spans.push(ratatui::text::Span::styled(
+                                format!("{}{kind} ", " ".repeat(w as usize - used - kind.len() - 1)),
+                                Style::default().fg(color(theme2.ui.text_faint)).bg(color(bg)),
+                            ));
+                        }
+                    }
+                    put_line(f.buffer_mut(), lx, y, w, Line::from(spans));
+                }
+            }
+        }
+
         let foot = area.y + area.height.saturating_sub(2);
         match vim_mode.prompt() {
             // The line being typed *is* the hint: it shows the command as it is written, the

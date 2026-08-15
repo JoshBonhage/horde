@@ -114,6 +114,9 @@ pub struct Engine {
     pub lsp: lsp::Registry,
     /// Absolute path to the name the client used for it, for documents the editor has open.
     lsp_paths: HashMap<PathBuf, String>,
+    /// Which client is waiting on a completion. One at a time, because a second request means
+    /// the cursor moved and the first answer is already wrong.
+    lsp_asked: Option<ClientId>,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
     dirty_shape: bool,
@@ -791,6 +794,7 @@ async fn engine_loop(
         vaults: HashMap::new(),
         lsp: lsp::Registry::new(),
         lsp_paths: HashMap::new(),
+        lsp_asked: None,
         cfg,
         clients: HashMap::new(),
         dirty_shape: true,
@@ -1125,6 +1129,17 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
         ClientFrame::Command(Cmd::DocClosed { space, path, vault }) => {
             eng.doc_closed(space, &path, vault);
         }
+        ClientFrame::Command(Cmd::Complete { space, path, body, line, col, vault }) => {
+            // The buffer goes with the request rather than waiting for the debounce: an
+            // answer about text the server has not been shown yet is an answer about a
+            // different file.
+            eng.doc_changed(space, &path, &body, vault);
+            let Some(full) = eng.doc_path(space, &path, vault) else { return };
+            let Some(lang) = lsp::language_for(&eng.cfg, &full) else { return };
+            let Some(root) = eng.session.space(space).map(|s| s.cwd.clone()) else { return };
+            eng.lsp_asked = Some(id);
+            eng.lsp.complete(&root, &lang, &full, line, col);
+        }
         ClientFrame::Command(Cmd::FileSave { space, path, body }) => {
             match eng.file_write(space, &path, &body) {
                 Ok(()) => eng.lsp_sync(space, &path, &body),
@@ -1357,7 +1372,8 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         | Cmd::FileRead { .. }
         | Cmd::FileSave { .. }
         | Cmd::DocChanged { .. }
-        | Cmd::DocClosed { .. } => {}
+        | Cmd::DocClosed { .. }
+        | Cmd::Complete { .. } => {}
         Cmd::ApplyLayout { preset } => {
             if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
                 problems.push((NoticeLevel::Warn, e.to_string()));
@@ -1890,6 +1906,17 @@ fn drain_lsp(eng: &mut Engine) {
                 };
                 said.push((NoticeLevel::Warn, text));
             }
+            // Straight back to whoever asked, and only to them: an unsolicited completion
+            // popup in somebody else's editor would be a haunting.
+            lsp::Event::Completions { path, items } => {
+                let named = eng.lsp_paths.get(&path).cloned();
+                if let (Some(rel), Some(c)) =
+                    (named, eng.lsp_asked.take().and_then(|id| eng.clients.get(&id)))
+                {
+                    let _ = c.out.send(ServerFrame::Completions { path: rel, items });
+                }
+            }
+            lsp::Event::Reply { .. } => {}
             lsp::Event::Diagnostics { path, diags, .. } => {
                 changed = true;
                 // Only for files an editor actually has open, and named the way that editor
@@ -2414,6 +2441,7 @@ mod tests {
             vaults: HashMap::new(),
             lsp: lsp::Registry::new(),
             lsp_paths: HashMap::new(),
+            lsp_asked: None,
             cfg,
             clients: HashMap::new(),
             dirty_shape: true,

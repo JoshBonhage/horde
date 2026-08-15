@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -684,6 +684,9 @@ pub enum Cmd {
     DocChanged { space: SpaceId, path: String, body: String, vault: bool },
     /// The editor closed. Whatever was analysing it can stop.
     DocClosed { space: SpaceId, path: String, vault: bool },
+    /// What could go here. Carries the buffer with it, because an answer computed against
+    /// text a debounce has not sent yet would be an answer about a different file.
+    Complete { space: SpaceId, path: String, body: String, line: u32, col: u32, vault: bool },
 }
 
 // Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
@@ -808,6 +811,25 @@ pub enum ServerFrame {
     /// Unsolicited: diagnostics arrive when the server has something to say, which is some
     /// time after the typing that prompted them and never in reply to a request.
     Diagnostics { path: String, diags: Vec<Diag> },
+    /// Answer to [`Cmd::Complete`]. Late by definition — the cursor has usually moved on.
+    Completions { path: String, items: Vec<Completion> },
+}
+
+/// One thing that could be typed here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Completion {
+    /// What the list shows.
+    pub label: String,
+    /// What goes in, which is not always what is shown — a server may list `println!(…)` and
+    /// mean `println!`.
+    pub insert: String,
+    /// The columns on the cursor's line this replaces, when the server was specific about
+    /// it. `None` means the word the cursor is in, worked out by whoever holds the buffer.
+    pub replace: Option<(u32, u32)>,
+    /// A word for what it is — `function`, `field`, `keyword`.
+    pub kind: Option<String>,
+    /// One line of detail. A type signature, usually.
+    pub detail: Option<String>,
 }
 
 // -- diagnostics ----------------------------------------------------------
@@ -1111,7 +1133,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 16, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 17, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the
@@ -1177,7 +1199,8 @@ mod digest_tests {
                 | Cmd::OpenDocPane { .. }
                 | Cmd::OpenProject { .. }
                 | Cmd::DocChanged { .. }
-                | Cmd::DocClosed { .. } => {}
+                | Cmd::DocClosed { .. }
+                | Cmd::Complete { .. } => {}
             }
         }
 
@@ -1199,7 +1222,8 @@ mod digest_tests {
                 | ServerFrame::Bye { .. }
                 | ServerFrame::Vault(..)
                 | ServerFrame::Files(..)
-                | ServerFrame::Diagnostics { .. } => {}
+                | ServerFrame::Diagnostics { .. }
+                | ServerFrame::Completions { .. } => {}
             }
             match e {
                 Event::AgentStateChanged { .. }

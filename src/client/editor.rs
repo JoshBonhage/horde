@@ -562,6 +562,48 @@ impl Buffer {
         self.last = None;
     }
 
+    /// The start of the identifier the cursor is inside, which is the part a completion is
+    /// finishing rather than adding to.
+    pub fn word_start(&self) -> usize {
+        let chars: Vec<char> = self.lines.get(self.line).map(|l| l.chars().collect()).unwrap_or_default();
+        let mut i = self.col.min(chars.len());
+        while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+            i -= 1;
+        }
+        i
+    }
+
+    /// What has been typed of the word the cursor is in.
+    pub fn word_prefix(&self) -> String {
+        let start = self.word_start();
+        self.lines
+            .get(self.line)
+            .map(|l| l.chars().skip(start).take(self.col.saturating_sub(start)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Swap part of the current line for something else, as one step.
+    ///
+    /// One step because accepting a completion is one decision. Doing it as a run of
+    /// backspaces followed by a run of characters would be two things to undo, and the first
+    /// undo would leave the buffer in a state nobody ever typed.
+    pub fn replace_in_line(&mut self, from: usize, to: usize, text: &str) {
+        let len = self.line_len(self.line);
+        let (from, to) = (from.min(len), to.min(len));
+        if from > to {
+            return;
+        }
+        self.last = None;
+        self.checkpoint(Edit::Insert);
+        let a = self.byte_at(self.line, from);
+        let b = self.byte_at(self.line, to);
+        self.lines[self.line].replace_range(a..b, text);
+        self.col = from + text.chars().count();
+        self.goal = self.col;
+        self.touched(Edit::Insert);
+        self.last = None;
+    }
+
     pub fn line_text(&self) -> String {
         self.lines.get(self.line).cloned().unwrap_or_default()
     }

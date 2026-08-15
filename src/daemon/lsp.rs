@@ -60,7 +60,7 @@ const STDERR_KEEP: usize = 20;
 /// A language server, as identified by the project it serves and the language it speaks.
 pub type Key = (PathBuf, String);
 
-pub use crate::proto::{Diag, Severity};
+pub use crate::proto::{Completion, Diag, Severity};
 
 /// LSP numbers its severities, error-first, and a server may leave the number out.
 fn severity_from_lsp(n: u64) -> Severity {
@@ -95,6 +95,11 @@ pub enum Event {
     Diagnostics { key: Key, path: PathBuf, diags: Vec<Diag> },
     /// The child is gone, with whatever it said on the way out.
     Exited { key: Key, why: String },
+    /// A reply to something horde asked. Kept generic because only the registry knows which
+    /// request id meant what.
+    Reply { key: Key, id: i64, result: Value },
+    /// A completion request came back, already matched to what asked for it.
+    Completions { path: PathBuf, items: Vec<Completion> },
 }
 
 // -- framing -----------------------------------------------------------------
@@ -283,6 +288,12 @@ pub struct Server {
     open: HashMap<String, i64>,
     /// The diagnostics it last published, per file.
     pub diags: HashMap<PathBuf, Vec<Diag>>,
+    /// The completion request still outstanding, if any, and what it was about.
+    ///
+    /// One at a time on purpose. A second request means the cursor moved, which makes the
+    /// first answer wrong — so it replaces rather than queues, and the old id is forgotten
+    /// so its reply is dropped when it eventually turns up.
+    asked: Option<(i64, PathBuf)>,
     /// When a document last passed through. What idle shutdown measures.
     pub last_used: Instant,
     pub restarts: u32,
@@ -481,6 +492,38 @@ impl Registry {
         );
     }
 
+    /// Ask what could be typed at a position.
+    ///
+    /// Nothing is returned here: the answer arrives on the event channel some tens of
+    /// milliseconds later, which is exactly why the popup has to cope with the cursor having
+    /// moved on by the time it lands.
+    pub fn complete(&mut self, root: &Path, lang: &str, path: &Path, line: u32, col: u32) {
+        let key = (root.to_path_buf(), lang.to_string());
+        let uri = to_uri(path);
+        let Some(s) = self.servers.get_mut(&key) else { return };
+        if s.state != State::Ready || !s.open.contains_key(&uri) {
+            return;
+        }
+        s.last_used = Instant::now();
+        let id = s.request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": col },
+            }),
+        );
+        s.asked = Some((id, path.to_path_buf()));
+    }
+
+    /// Whether this reply is the completion that was asked for, and what it was about.
+    fn asked_for(&mut self, key: &Key, id: i64) -> Option<PathBuf> {
+        let s = self.servers.get_mut(key)?;
+        match s.asked {
+            Some((asked, _)) if asked == id => s.asked.take().map(|(_, p)| p),
+            _ => None,
+        }
+    }
+
     /// The whole document, every time.
     ///
     /// Incremental sync would send only what changed, which matters for a file being typed
@@ -523,6 +566,16 @@ impl Registry {
     pub fn drain(&mut self) -> Vec<Event> {
         let mut out = Vec::new();
         while let Ok(ev) = self.rx.try_recv() {
+            // A reply only means something to whoever asked, and the registry is the only
+            // place that remembers which id was which.
+            if let Event::Reply { key, id, result } = &ev {
+                // A reply to a request nobody is waiting for any more is dropped: the cursor
+                // moved, and this answer is about a position that no longer exists.
+                if let Some(path) = self.asked_for(key, *id) {
+                    out.push(Event::Completions { path, items: parse_completions(result) });
+                }
+                continue;
+            }
             self.apply(&ev);
             out.push(ev);
         }
@@ -566,6 +619,7 @@ impl Registry {
                     }
                 }
             }
+            Event::Reply { .. } | Event::Completions { .. } => {}
             Event::Exited { key, why } => {
                 if let Some(s) = self.servers.get_mut(key) {
                     s.tx = None;
@@ -667,6 +721,7 @@ fn dead(lang: &str, command: &str) -> Server {
         next_id: 0,
         open: HashMap::new(),
         diags: HashMap::new(),
+        asked: None,
         last_used: Instant::now(),
         restarts: 0,
         retry_at: None,
@@ -776,6 +831,7 @@ fn spawn(
         next_id: 0,
         open: HashMap::new(),
         diags: HashMap::new(),
+        asked: None,
         last_used: Instant::now(),
         restarts: 0,
         retry_at: None,
@@ -814,6 +870,7 @@ fn dispatch(
         // A reply to something horde asked. `error` counts: a server that refuses answers the
         // request rather than the intent, and waiting only for `result` waits forever.
         (None, Some(id)) => {
+            let result = msg.get("result").cloned().unwrap_or(Value::Null);
             if id == 1 {
                 let _ = events.send(Event::Ready(key.clone()));
             }
@@ -828,6 +885,7 @@ fn dispatch(
                     return false;
                 }
             }
+            let _ = events.send(Event::Reply { key: key.clone(), id, result });
             true
         }
         // A request *from* the server. Every one gets an answer even when the answer is
@@ -861,6 +919,79 @@ fn server_request_result(method: &str, msg: &Value) -> Value {
         return Value::Array(vec![Value::Null; n]);
     }
     Value::Null
+}
+
+/// LSP numbers the kinds of thing a completion can be. Only the ones worth a word on screen.
+fn completion_kind(n: u64) -> Option<&'static str> {
+    Some(match n {
+        2 | 3 => "fn",
+        4 => "ctor",
+        5 => "field",
+        6 => "var",
+        7 => "class",
+        8 => "trait",
+        9 => "mod",
+        10 => "prop",
+        11 => "unit",
+        12 => "value",
+        13 => "enum",
+        14 => "keyword",
+        15 => "snippet",
+        17 => "file",
+        21 => "const",
+        22 => "struct",
+        25 => "type",
+        _ => return None,
+    })
+}
+
+/// Pull the list out of a completion reply.
+///
+/// The answer is either a bare array or an object with `items` in it, depending on whether
+/// the server wanted to say the list was incomplete. Both are legal and both are common.
+fn parse_completions(result: &Value) -> Vec<Completion> {
+    let items = result
+        .get("items")
+        .and_then(|i| i.as_array())
+        .or_else(|| result.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    items.iter().filter_map(parse_completion).take(200).collect()
+}
+
+fn parse_completion(v: &Value) -> Option<Completion> {
+    let label = v.get("label")?.as_str()?.trim().to_string();
+    // `textEdit` is the server being exact about what it is replacing, and taking it is both
+    // more correct and less work than guessing a word boundary. Only same-line edits: a
+    // completion that rewrites several lines is a refactoring, and not what a popup promised.
+    let edit = v.get("textEdit").and_then(|e| e.get("range").map(|r| (e, r)));
+    let (insert, replace) = match edit {
+        Some((e, range)) => {
+            let start = range.get("start")?;
+            let end = range.get("end")?;
+            if start.get("line") != end.get("line") {
+                return None;
+            }
+            let from = start.get("character")?.as_u64()? as u32;
+            let to = end.get("character")?.as_u64()? as u32;
+            (e.get("newText")?.as_str()?.to_string(), Some((from, to)))
+        }
+        None => (
+            v.get("insertText").and_then(|t| t.as_str()).unwrap_or(&label).to_string(),
+            None,
+        ),
+    };
+    Some(Completion {
+        label,
+        insert,
+        replace,
+        kind: v.get("kind").and_then(|k| k.as_u64()).and_then(completion_kind).map(String::from),
+        detail: v
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .map(|d| d.trim().replace('\n', " "))
+            .filter(|d| !d.is_empty()),
+    })
 }
 
 fn parse_diag(v: &Value) -> Option<Diag> {

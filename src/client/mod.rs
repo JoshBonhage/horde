@@ -50,6 +50,48 @@ const TOAST_LIFE: Duration = Duration::from_secs(6);
 /// Bus messages kept client-side for the drawer.
 const BUS_CAP: usize = 300;
 
+/// A completion list, open over the editor.
+///
+/// Held rather than re-requested as you type: the answer takes a round trip and tens of
+/// milliseconds, so narrowing the list already in hand is the difference between completion
+/// that feels instant and completion that feels like a network.
+#[derive(Debug, Clone)]
+pub struct Completions {
+    items: Vec<crate::proto::Completion>,
+    /// Which of the *matching* items is selected.
+    pub sel: usize,
+    /// The line the request was made on. Leaving it closes the popup, because a list of
+    /// completions for another line is worse than no list.
+    line: usize,
+    /// Where the word being completed starts. Typing before it is not narrowing any more.
+    from: usize,
+}
+
+impl Completions {
+    /// The items still matching what has been typed, in the order the server ranked them.
+    ///
+    /// Case-insensitive prefix, then anything containing it — which is what people expect
+    /// from typing three letters, without pulling in a fuzzy matcher for a list of twenty.
+    pub fn matching(&self, prefix: &str) -> Vec<&crate::proto::Completion> {
+        if prefix.is_empty() {
+            return self.items.iter().collect();
+        }
+        let p = prefix.to_lowercase();
+        let mut exact: Vec<&crate::proto::Completion> = Vec::new();
+        let mut loose: Vec<&crate::proto::Completion> = Vec::new();
+        for i in &self.items {
+            let l = i.label.to_lowercase();
+            if l.starts_with(&p) {
+                exact.push(i);
+            } else if l.contains(&p) {
+                loose.push(i);
+            }
+        }
+        exact.extend(loose);
+        exact
+    }
+}
+
 /// When to hand the daemon the buffer so a language server can look at it.
 ///
 /// Every keystroke would be a whole file down a socket and a reparse per character. Waiting
@@ -237,6 +279,8 @@ pub struct App {
     pub buffer: Option<editor::Buffer>,
     /// Keeping the daemon's copy of that buffer roughly in step with this one.
     pub doc: DocSync,
+    /// The completion list, while one is open.
+    pub completions: Option<Completions>,
     /// What a language server thinks of the file being edited, keyed by the path the editor
     /// knows it as. Cleared when the editor closes, because it is about one open file.
     pub diags: HashMap<String, Vec<crate::proto::Diag>>,
@@ -304,6 +348,7 @@ impl App {
             highlight: None,
             buffer: None,
             doc: DocSync::default(),
+            completions: None,
             diags: HashMap::new(),
             yank: None,
             search: String::new(),
@@ -670,6 +715,19 @@ fn apply_frame(
         // Unsolicited, and about whatever file the daemon was told about. Kept by path
         // rather than replacing one list, because a save and a change can be in flight for
         // different files at once.
+        // Late by definition, so it has to check that it is still about where the cursor is.
+        // Between asking and answering the person has usually typed another two characters,
+        // and may well have moved to another line entirely.
+        ServerFrame::Completions { path, items } => {
+            let open_here = matches!(&app.mode, Mode::Editor { path: p, .. } if *p == path);
+            match app.buffer.as_ref() {
+                Some(b) if open_here && !items.is_empty() => {
+                    app.completions =
+                        Some(Completions { items, sel: 0, line: b.line, from: b.word_start() });
+                }
+                _ => app.toast(NoticeLevel::Info, "nothing to complete"),
+            }
+        }
         ServerFrame::Diagnostics { path, diags } => {
             if diags.is_empty() {
                 app.diags.remove(&path);
@@ -2241,6 +2299,7 @@ fn editor_close(
     app.highlight = None;
     app.doc = DocSync::default();
     app.diags.clear();
+    app.completions = None;
     app.mode = if project {
         Mode::Files { query: String::new(), sel: 0 }
     } else {
@@ -2258,9 +2317,42 @@ fn editor_insert(
     page: usize,
 ) -> Option<Vim> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+
+    // While the list is open it owns the keys that move through it, and nothing else. Every
+    // other key falls through to typing, which is what narrows the list.
+    if app.completions.is_some() {
+        match (k.code, ctrl) {
+            (KeyCode::Char('n'), true) | (KeyCode::Down, _) => {
+                completion_move(app, 1);
+                return Some(Vim::Insert);
+            }
+            (KeyCode::Char('p'), true) | (KeyCode::Up, _) => {
+                completion_move(app, -1);
+                return Some(Vim::Insert);
+            }
+            (KeyCode::Enter, _) | (KeyCode::Tab, _) => {
+                completion_accept(app);
+                return Some(Vim::Insert);
+            }
+            // Up one layer, and the layer is the popup. Still writing afterwards, which is
+            // where you were before it opened.
+            (KeyCode::Esc, _) => {
+                app.completions = None;
+                return Some(Vim::Insert);
+            }
+            _ => {}
+        }
+    }
+
     match (k.code, ctrl) {
         (KeyCode::Char('s'), true) => {
             editor_save(app, out, path, project);
+            return Some(Vim::Insert);
+        }
+        // vim's own key for it, and free here. Asks the daemon, which asks whatever language
+        // server is watching this file; the answer arrives when it arrives.
+        (KeyCode::Char('n'), true) | (KeyCode::Char(' '), true) => {
+            completion_ask(app, out, path, project);
             return Some(Vim::Insert);
         }
         // esc leaves *insert*, not the note. That is the whole reason for having modes: the
@@ -2326,7 +2418,68 @@ fn editor_insert(
         (KeyCode::Char(c), false) => buf.insert(c),
         _ => {}
     }
+
+    // A completion list is about one word on one line. Leaving either ends it, and so does
+    // narrowing it down to nothing — a popup showing no matches is a popup in the way.
+    if let (Some(c), Some(b)) = (app.completions.as_ref(), app.buffer.as_ref()) {
+        let matches = c.matching(&b.word_prefix()).len();
+        if b.line != c.line || b.col < c.from || matches == 0 {
+            app.completions = None;
+        } else if let Some(c) = app.completions.as_mut() {
+            c.sel = c.sel.min(matches - 1);
+        }
+    }
     Some(Vim::Insert)
+}
+
+/// Ask what could go here.
+fn completion_ask(
+    app: &mut App,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    path: &str,
+    project: bool,
+) {
+    let Some(b) = app.buffer.as_ref() else { return };
+    let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) else { return };
+    let _ = out.send(ClientFrame::Command(Cmd::Complete {
+        space,
+        path: path.to_string(),
+        body: b.text(),
+        line: b.line as u32,
+        col: b.col as u32,
+        vault: !project,
+    }));
+}
+
+/// Move through the list, wrapping. A list you can fall off the end of makes you look.
+fn completion_move(app: &mut App, by: i32) {
+    let prefix = app.buffer.as_ref().map(|b| b.word_prefix()).unwrap_or_default();
+    let Some(c) = app.completions.as_mut() else { return };
+    let n = c.matching(&prefix).len();
+    if n == 0 {
+        return;
+    }
+    c.sel = ((c.sel as i32 + by).rem_euclid(n as i32)) as usize;
+}
+
+/// Put the selected completion in.
+fn completion_accept(app: &mut App) {
+    let Some(b) = app.buffer.as_ref() else { return };
+    let prefix = b.word_prefix();
+    let (col, start) = (b.col, b.word_start());
+    let Some(c) = app.completions.take() else { return };
+    let Some(item) = c.matching(&prefix).get(c.sel).copied().cloned() else { return };
+    // The server's own range when it gave one, and the word the cursor is in otherwise.
+    // Trusting the range matters: a server completing `self.field` knows the dot is not part
+    // of what it is replacing, and guessing that from the text is how a completion eats a
+    // character it should not have.
+    let (from, to) = match item.replace {
+        Some((a, z)) => (a as usize, (z as usize).max(col)),
+        None => (start, col),
+    };
+    if let Some(b) = app.buffer.as_mut() {
+        b.replace_in_line(from, to, &item.insert);
+    }
 }
 
 /// Normal: keys are verbs. `pending` is the first half of a pair, if one was typed.
@@ -3675,6 +3828,123 @@ mod tests {
             sent.iter().any(|c| matches!(c, Cmd::DocClosed { path, .. } if path == "note.md")),
             "and the daemon is told, so the server can stop: {sent:?}"
         );
+    }
+
+    // -- completion --------------------------------------------------------
+
+    fn item(label: &str, kind: &str) -> crate::proto::Completion {
+        crate::proto::Completion {
+            label: label.to_string(),
+            insert: label.to_string(),
+            replace: None,
+            kind: Some(kind.to_string()),
+            detail: None,
+        }
+    }
+
+    fn offer(app: &mut App, items: Vec<crate::proto::Completion>) {
+        let path = match &app.mode {
+            Mode::Editor { path, .. } => path.clone(),
+            _ => panic!("not editing"),
+        };
+        apply_frame(app, ServerFrame::Completions { path, items }, &sink());
+    }
+
+    /// Typing narrows the list already in hand rather than asking again. The round trip is
+    /// tens of milliseconds, and a popup that re-queries per character feels like a network.
+    #[test]
+    fn typing_narrows_the_list_rather_than_asking_again() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new(""));
+        offer(&mut app, vec![item("println", "macro"), item("print", "fn"), item("panic", "macro")]);
+        assert!(app.completions.is_some());
+
+        typed(&mut app, "pri");
+        let c = app.completions.as_ref().expect("still open");
+        let shown: Vec<&str> =
+            c.matching("pri").iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(shown, ["println", "print"], "panic no longer matches");
+
+        // Narrowed to nothing, so there is nothing to show and the popup goes.
+        typed(&mut app, "zzz");
+        assert!(app.completions.is_none(), "a popup with no matches is a popup in the way");
+    }
+
+    /// Accepting replaces what was typed, and does it as one step — an undo that left the
+    /// buffer half-completed would be a state nobody ever typed.
+    #[test]
+    fn accepting_replaces_the_word_and_undoes_in_one_go() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new("let x = pri"));
+        app.buffer.as_mut().unwrap().end();
+        offer(&mut app, vec![item("println", "macro")]);
+        press(&mut app, KeyCode::Enter);
+
+        assert_eq!(app.buffer.as_ref().unwrap().text(), "let x = println");
+        assert_eq!(app.buffer.as_ref().unwrap().col, 15, "the cursor is after it");
+        assert!(app.completions.is_none(), "and the list is done");
+
+        app.buffer.as_mut().unwrap().undo();
+        assert_eq!(app.buffer.as_ref().unwrap().text(), "let x = pri", "back in one press");
+    }
+
+    /// A server that says exactly what it is replacing is believed. Guessing the word
+    /// boundary from the text is how a completion eats the dot in front of it.
+    #[test]
+    fn a_server_that_names_the_range_it_replaces_is_believed() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new("self.fi"));
+        app.buffer.as_mut().unwrap().end();
+        offer(
+            &mut app,
+            vec![crate::proto::Completion {
+                label: "field".into(),
+                insert: "field".into(),
+                replace: Some((5, 7)),
+                kind: None,
+                detail: None,
+            }],
+        );
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.buffer.as_ref().unwrap().text(), "self.field", "the dot survived");
+    }
+
+    /// The list is about one word on one line. Both are ways of leaving it.
+    #[test]
+    fn moving_off_the_word_closes_the_list() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new("abc"));
+        app.buffer.as_mut().unwrap().end();
+        offer(&mut app, vec![item("abcdef", "fn")]);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.completions.is_none());
+
+        app.buffer = Some(editor::Buffer::new("abc\nxyz"));
+        app.buffer.as_mut().unwrap().end();
+        offer(&mut app, vec![item("abcdef", "fn")]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.completions.is_none(), "a list for another line is worse than none");
+    }
+
+    /// While it is open the list owns the keys that move through it, and gives everything
+    /// else straight back to typing.
+    #[test]
+    fn the_list_takes_only_the_keys_that_move_through_it() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new(""));
+        offer(&mut app, vec![item("aaa", "fn"), item("aab", "fn"), item("aac", "fn")]);
+
+        press_chord(&mut app, "ctrl+n");
+        assert_eq!(app.completions.as_ref().unwrap().sel, 1);
+        press_chord(&mut app, "ctrl+p");
+        press_chord(&mut app, "ctrl+p");
+        assert_eq!(app.completions.as_ref().unwrap().sel, 2, "and it wraps");
+
+        // esc is one layer, not two: the popup goes and the typing stays.
+        press(&mut app, KeyCode::Esc);
+        assert!(app.completions.is_none());
+        assert_eq!(vim_of(&app), Vim::Insert, "still writing");
     }
 
     /// Opening horde is arriving, and arriving shows you the state of things. Every attach
