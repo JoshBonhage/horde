@@ -22,7 +22,7 @@ state = "blocked"
 priority = 900
 region = "whole_recent"
 contains = ["allow command"]
-any = [{ contains = ["y/n"] }, { line_regex = ['^\\s*❯?\\s*\\d+\\.\\s*yes\\b'] }]
+any = [{ contains = ["y/n"] }, { line_regex = ['^\s*❯?\s*\d+\.\s*yes\b'] }]
 
 [[rules]]
 id = "status_line_working"
@@ -36,4 +36,4 @@ id = "composer_idle"
 state = "idle"
 priority = 500
 region = "prompt_box_body"
-line_regex = ['^\\s*[>❯]']
+line_regex = ['^\s*[>❯]']

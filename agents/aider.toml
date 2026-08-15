@@ -32,4 +32,4 @@ id = "prompt_idle"
 state = "idle"
 priority = 500
 region = "bottom_non_empty_lines(3)"
-line_regex = ['^\\s*>\\s*$']
+line_regex = ['^\s*>\s*$']

@@ -26,7 +26,7 @@ id = "blocked_approval"
 state = "blocked"
 priority = 900
 region = "whole_recent"
-any = [{ contains = ["y/n"] }, { contains = ["do you want to"], any = [{ line_regex = ['^\\s*❯?\\s*\\d+\\.\\s*yes\\b'] }] }]
+any = [{ contains = ["y/n"] }, { contains = ["do you want to"], any = [{ line_regex = ['^\s*❯?\s*\d+\.\s*yes\b'] }] }]
 
 # The spinner label, which is what actually distinguishes working from idle.
 #
@@ -57,5 +57,5 @@ priority = 500
 region = "whole_recent"
 any = [
   { contains = ["Ask anything"] },
-  { line_regex = ['^\\s*[>❯]\\s*$'] },
+  { line_regex = ['^\s*[>❯]\s*$'] },
 ]

@@ -564,6 +564,57 @@ mod tests {
         },
     ];
 
+    /// No bundled pattern may contain an escaped backslash.
+    ///
+    /// TOML literal strings — the single-quoted kind these files use — do no escaping at all, so
+    /// `'\\s'` reaches the regex engine as *a literal backslash* followed by zero-or-more `s`,
+    /// not as whitespace. Every rule written that way silently matches nothing.
+    ///
+    /// Five of the seven manifests shipped like this, and nobody noticed because the affected
+    /// rules were fallbacks behind a `contains` that worked. `claude.toml` was correct, which
+    /// fits — it is the one that gets exercised. Found by another agent auditing the files.
+    #[test]
+    fn no_bundled_pattern_is_double_escaped() {
+        for (name, text) in BUNDLED {
+            for (n, line) in text.lines().enumerate() {
+                assert!(
+                    !line.contains("\\\\"),
+                    "{name}.toml:{}: a literal string with `\\\\` reaches the regex engine as a \
+                     backslash, so this rule can never match: {}",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
+    /// And the patterns that guard a prompt actually recognise one.
+    ///
+    /// The structural test above catches the shape; this catches the intent. A pattern can be
+    /// free of double-escaping and still be wrong.
+    #[test]
+    fn a_prompt_line_is_recognised_by_the_manifests_that_look_for_one() {
+        let (all, _) = load_all(Path::new("/nonexistent"));
+        for name in ["opencode", "aider", "codex", "cursor-agent", "gemini"] {
+            let m = &all[name];
+            let prompts = ["❯ ", "> ", "  ❯ ", "❯"];
+            // Asserting on *which* rule fired, not merely that some state came back. An earlier
+            // version of this test checked `is_some()` and stayed green with the bug present,
+            // because another rule was answering for a different reason entirely — a test that
+            // cannot fail on the thing it is named after is worse than no test.
+            // Asserting a *rule* fired, not that a state came back. `evaluate` falls back to
+            // `rest_state()` with reason "no rule matched", so every screen yields Some(Idle) —
+            // two earlier versions of this test were green with the bug present because of it.
+            // A test that cannot fail on the thing it is named after is worse than none.
+            let matched = prompts.iter().any(|p| {
+                let lines = to_lines(p);
+                m.evaluate(&screen(&lines, ""))
+                    .is_some_and(|v| v.reason != "no rule matched")
+            });
+            assert!(matched, "{name}: a bare prompt line matches no rule at all");
+        }
+    }
+
     /// Real screens from opencode 1.18.15 on OpenRouter.
     ///
     /// Captured rather than composed. The previous manifest was written from guesswork, shipped

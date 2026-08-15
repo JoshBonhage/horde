@@ -14,7 +14,7 @@ id = "blocked_approval"
 state = "blocked"
 priority = 900
 region = "whole_recent"
-any = [{ contains = ["run this command?"] }, { contains = ["do you want to"], any = [{ line_regex = ['^\\s*❯?\\s*\\d+\\.\\s*yes\\b'] }] }]
+any = [{ contains = ["run this command?"] }, { contains = ["do you want to"], any = [{ line_regex = ['^\s*❯?\s*\d+\.\s*yes\b'] }] }]
 
 [[rules]]
 id = "status_line_working"
@@ -28,4 +28,4 @@ id = "composer_idle"
 state = "idle"
 priority = 500
 region = "prompt_box_body"
-line_regex = ['^\\s*[>❯]']
+line_regex = ['^\s*[>❯]']
