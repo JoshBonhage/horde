@@ -1048,8 +1048,14 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             super::refresh_vaults(eng);
             Ok(json!({ "root": root.to_string_lossy(), "created": fresh }))
         }
+        // Writing a note by path. `title` is the friendlier way in — Obsidian's rule is that
+        // the title is the filename, so a note written by title is one a `[[link]]` finds.
         "vault.write" => {
-            let path = str_arg(req, "path").ok_or_else(|| bad("path required"))?.to_string();
+            let path = match (str_arg(req, "path"), str_arg(req, "title")) {
+                (Some(p), _) => p.to_string(),
+                (None, Some(t)) => super::vault::note_filename(t),
+                (None, None) => return Err(bad("path or title required")),
+            };
             let body = str_arg(req, "body").ok_or_else(|| bad("body required"))?.to_string();
             let space = match str_arg(req, "space") {
                 Some(name) => eng
@@ -1058,8 +1064,14 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                     .ok_or_else(|| not_found(format!("no space called {name:?}")))?,
                 None => eng.session.focused_space.ok_or_else(|| bad("no focused space"))?,
             };
-            let written =
-                eng.vault_write(space, &path, &body).map_err(|e| failed(e.to_string()))?;
+            // Who to credit: whoever the caller says, else the agent in the pane the call
+            // came from. A note nobody signed is one you cannot decide how much to trust.
+            let by = str_arg(req, "by").map(|s| s.to_string()).or_else(|| {
+                pane_arg(eng, req, "pane").map(|p| super::bus::Bus::sender_name(&eng.session, Some(p)))
+            });
+            let written = eng
+                .vault_put(space, &path, &body, by.as_deref(), bool_arg(req, "append"))
+                .map_err(|e| failed(e.to_string()))?;
             Ok(json!({ "path": written.to_string_lossy() }))
         }
 

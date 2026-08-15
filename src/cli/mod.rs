@@ -164,6 +164,33 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Write a note into the vault.
+    ///
+    /// The way an agent records something worth keeping. Notes written this way are
+    /// attributed, size-capped, and land in their own folder — so what a fleet wrote down is
+    /// always separable from what you did.
+    ///
+    ///   horde note "Auth findings" --body "…"
+    ///   somecommand | horde note "Build log" --append
+    Note {
+        /// The note's title, which is also its filename. `[[Auth findings]]` finds it.
+        title: String,
+        /// The body. Read from stdin when not given, so output can be piped in.
+        #[arg(long)]
+        body: Option<String>,
+        /// Add to the note rather than replacing it.
+        #[arg(long)]
+        append: bool,
+        /// Write it somewhere other than the agent folder.
+        #[arg(long)]
+        path: Option<String>,
+        /// Credit someone other than the calling pane's agent.
+        #[arg(long)]
+        by: Option<String>,
+        /// Which project's vault. Defaults to the focused one.
+        #[arg(long)]
+        space: Option<String>,
+    },
     /// Show recent bus messages.
     Bus {
         #[command(subcommand)]
@@ -985,6 +1012,38 @@ pub fn run(cmd: Command) -> Result<()> {
                 return Ok(());
             }
             print_digest(&serde_json::from_value(v)?);
+        }
+
+        Command::Note { title, body, append, path, by, space } => {
+            // Piped input is the point: `cargo test | horde note "Test run" --append` is the
+            // shape this verb exists for, and asking for `--body` there would mean shelling
+            // out to read a file back.
+            let body = match body {
+                Some(b) => b,
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                }
+            };
+            if body.trim().is_empty() {
+                return Err(anyhow!("nothing to write — give --body or pipe something in"));
+            }
+            let mut params = json!({ "title": title, "body": body, "append": append });
+            if let Some(p) = &path {
+                params["path"] = json!(p);
+            }
+            if let Some(b) = &by {
+                params["by"] = json!(b);
+            }
+            if let Some(s) = &space {
+                params["space"] = json!(s);
+            }
+            if let Some(p) = self_pane() {
+                params["pane"] = json!(p);
+            }
+            let v = call("vault.write", params)?;
+            println!("{}", v.get("path").and_then(|p| p.as_str()).unwrap_or("written"));
         }
 
         Command::Bus { cmd } => match cmd {

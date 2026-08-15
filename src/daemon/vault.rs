@@ -618,6 +618,55 @@ pub fn locate(cwd: &Path, dir: &str) -> Option<PathBuf> {
 /// The one place a path from outside becomes a path horde writes to, so it is the one place
 /// that has to care: `../../.ssh/authorized_keys` is a note title an agent could send, and
 /// "write a note" must never be a way to write anything else.
+/// The most a single note may be.
+///
+/// Not a disk-space guard so much as a loop guard: the thing that writes a megabyte of note
+/// is an agent that has gone wrong, and the first symptom should be a refusal with a reason
+/// rather than a vault nobody can open.
+pub const MAX_NOTE: usize = 256 * 1024;
+
+/// Where a note written by something other than a person goes.
+///
+/// Its own folder, always. An agent's output landing among your own notes makes the vault a
+/// place you have to sort rather than a place you have written — and once the two are mixed
+/// there is no undoing it, because nothing recorded which was which.
+pub const AGENT_DIR: &str = "horde";
+
+/// Turn a title into a filename.
+///
+/// Obsidian's own rule: the title *is* the filename, so a link written `[[Some Note]]`
+/// resolves to `Some Note.md` without a lookup table. Only the characters a filesystem or a
+/// wikilink genuinely cannot carry are replaced.
+pub fn note_filename(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '|' | '#' | '^' | '[' | ']' => '-',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').trim();
+    let name = if cleaned.is_empty() { "untitled" } else { cleaned };
+    if name.to_ascii_lowercase().ends_with(".md") {
+        name.to_string()
+    } else {
+        format!("{name}.md")
+    }
+}
+
+/// Stamp a note with where it came from, unless it already says.
+///
+/// Attribution is the whole reason an agent may write here at all: a vault you cannot ask
+/// "who wrote this" of is one you end up distrusting entirely. Written as frontmatter so
+/// Obsidian shows it as properties and horde's own index reads it without a special case.
+pub fn attribute(body: &str, by: &str, when: &str) -> String {
+    if body.trim_start().starts_with("---") {
+        return body.to_string();
+    }
+    format!("---\nsource: horde\nby: {by}\ncreated: {when}\n---\n\n{}", body.trim_start())
+}
+
 pub fn safe_join(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     use std::path::Component;
     let rel = Path::new(rel);
@@ -1007,5 +1056,37 @@ mod tests {
             "but opening it directly finds it"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The title is the filename, so `[[Some Note]]` finds it without a lookup table. Only
+    /// the characters a filesystem or a wikilink genuinely cannot carry are replaced.
+    #[test]
+    fn a_title_becomes_a_filename_a_wikilink_can_find() {
+        assert_eq!(note_filename("Auth findings"), "Auth findings.md");
+        assert_eq!(note_filename("already.md"), "already.md", "not doubled up");
+        assert_eq!(note_filename("src/main.rs review"), "src-main.rs review.md", "no new folders");
+        assert_eq!(note_filename("a|b#c^d[e]"), "a-b-c-d-e-.md", "nothing a link cannot carry");
+        assert_eq!(note_filename("   "), "untitled.md");
+        // A title is not a path, whatever it looks like. `safe_join` is the real guard, but
+        // a filename that still contains a separator would defeat it before it ran.
+        let escaped = note_filename("../../etc/passwd");
+        assert!(!escaped.contains('/'), "{escaped}");
+        assert!(!escaped.starts_with('.'), "and it cannot start a traversal: {escaped}");
+    }
+
+    /// A vault you cannot ask "who wrote this" of is one you end up distrusting entirely.
+    /// Frontmatter because Obsidian reads it as properties and the index already parses it.
+    #[test]
+    fn a_note_written_by_a_machine_says_so() {
+        let out = attribute("# Findings\n\nthe thing", "reviewer", "2026-08-15");
+        assert!(out.starts_with("---\n"), "{out}");
+        assert!(out.contains("by: reviewer"), "{out}");
+        assert!(out.contains("created: 2026-08-15"), "{out}");
+        assert!(out.contains("# Findings"), "and the note is still in there");
+
+        // A body that already has frontmatter is left alone: the caller said what it wanted
+        // the properties to be, and overwriting them would be horde arguing with it.
+        let own = "---\ntags: [x]\n---\n\nbody";
+        assert_eq!(attribute(own, "agent", "2026-08-15"), own);
     }
 }

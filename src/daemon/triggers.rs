@@ -724,6 +724,21 @@ pub fn local_clock(ms: u64) -> String {
     format_clock(h, m, tm.tm_gmtoff as i64)
 }
 
+/// The local date, as `2026-08-15`.
+///
+/// Local rather than UTC, because a note called "today" has to mean the day the person
+/// writing it is having. A digest written at eleven at night belongs to that evening, not to
+/// tomorrow morning in London.
+pub fn local_date(ms: u64) -> String {
+    let t = (ms / 1000) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: as `local_parts` — `localtime_r` writes only the `tm` passed to it.
+    unsafe {
+        libc::localtime_r(&t, &mut tm);
+    }
+    format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+}
+
 /// The formatting half of [`local_clock`], split out because the other half is the machine's
 /// timezone and cannot be varied from a test without racing every other test that reads it.
 ///

@@ -314,12 +314,60 @@ impl Engine {
     /// so there is nothing to discover — and a note that does not appear in its own vault
     /// until a timer fires is a note you cannot trust the index about.
     pub fn vault_write(&mut self, space: SpaceId, rel: &str, body: &str) -> Result<PathBuf> {
+        self.vault_put(space, rel, body, None, false)
+    }
+
+    /// Write a note, with the rules that apply when the writer might not be a person.
+    ///
+    /// `by` is who to credit; `Some` also means "this is not a human's own note", which
+    /// decides both the folder it defaults into and whether it gets stamped. `append` adds to
+    /// what is there rather than replacing it, which is what makes a dated note a log rather
+    /// than the last thing that happened to be written to it.
+    pub fn vault_put(
+        &mut self,
+        space: SpaceId,
+        rel: &str,
+        body: &str,
+        by: Option<&str>,
+        append: bool,
+    ) -> Result<PathBuf> {
+        if body.len() > vault::MAX_NOTE {
+            return Err(anyhow!(
+                "note is {} bytes; the limit is {}. Something is writing in a loop.",
+                body.len(),
+                vault::MAX_NOTE
+            ));
+        }
         let root = self.vault_root_for_write(space)?;
-        let path = vault::safe_join(&root, rel)?;
+        // An agent's note goes in its own folder unless it named one. Not enforced against a
+        // caller that gives a path — an agent asked to write somewhere specific should be
+        // able to — but the default is the safe one, which is what defaults are for.
+        let rel = match by {
+            Some(_) if !rel.contains('/') => format!("{}/{rel}", vault::AGENT_DIR),
+            _ => rel.to_string(),
+        };
+        let path = vault::safe_join(&root, &rel)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, body)?;
+
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = match (append, existing.is_empty()) {
+            (true, false) => {
+                let joined = format!("{}\n{}", existing.trim_end(), body);
+                if joined.len() > vault::MAX_NOTE {
+                    return Err(anyhow!("appending would take the note past {} bytes", vault::MAX_NOTE));
+                }
+                joined
+            }
+            _ => match by {
+                Some(who) => {
+                    vault::attribute(body, who, &triggers::local_date(now_millis()))
+                }
+                None => body.to_string(),
+            },
+        };
+        std::fs::write(&path, &text)?;
         if let Some(idx) = self.vaults.get_mut(&root) {
             idx.refresh(usize::MAX);
         }
@@ -2300,6 +2348,82 @@ mod tests {
         assert!(eng.vault_for(space).is_some_and(|v| v.len() >= 1), "and it is indexed");
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// An agent's notes go somewhere of their own, always. Mixed in with your own writing
+    /// there is no undoing it — nothing recorded which was which.
+    #[test]
+    fn a_note_written_by_an_agent_is_kept_apart_and_signed() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-agentnote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        let space = eng.session.focused_space.expect("a space");
+
+        let written = eng
+            .vault_put(space, "Findings.md", "the thing I found", Some("reviewer"), false)
+            .expect("written");
+        assert!(
+            written.parent().is_some_and(|d| d.ends_with(vault::AGENT_DIR)),
+            "in its own folder: {}",
+            written.display()
+        );
+        let text = std::fs::read_to_string(&written).unwrap();
+        assert!(text.contains("by: reviewer"), "and signed: {text}");
+
+        // A path with a folder in it is the caller being specific, and is honoured.
+        let elsewhere = eng
+            .vault_put(space, "reviews/Deep.md", "body", Some("reviewer"), false)
+            .expect("written");
+        assert!(elsewhere.parent().is_some_and(|d| d.ends_with("reviews")));
+
+        // A person's own note is neither moved nor stamped.
+        let mine = eng.vault_write(space, "Mine.md", "just mine").expect("written");
+        assert_eq!(mine.parent(), Some(home.as_path()));
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "just mine");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Appending is what makes a dated note a log rather than the last thing that happened to
+    /// be written to it — and it must not re-stamp, or the file fills with frontmatter.
+    #[test]
+    fn appending_adds_to_a_note_without_stamping_it_again() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        let space = eng.session.focused_space.expect("a space");
+
+        eng.vault_put(space, "Log.md", "first", Some("builder"), false).unwrap();
+        let p = eng.vault_put(space, "Log.md", "second", Some("builder"), true).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("source: horde").count(), 1, "stamped once: {text}");
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+        assert!(text.find("first") < text.find("second"), "in order");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The thing that writes a megabyte of note is an agent that has gone wrong, and the
+    /// first symptom should be a refusal with a reason rather than a vault nobody can open.
+    #[test]
+    fn a_note_too_large_to_be_meant_is_refused_with_a_reason() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-huge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        let space = eng.session.focused_space.expect("a space");
+
+        let huge = "x".repeat(vault::MAX_NOTE + 1);
+        let err = eng.vault_put(space, "Huge.md", &huge, Some("runaway"), false).unwrap_err();
+        assert!(err.to_string().contains("loop"), "it says what it thinks happened: {err}");
+        assert!(!home.join(vault::AGENT_DIR).join("Huge.md").exists(), "and wrote nothing");
+
+        // And it cannot be got past by appending a little at a time.
+        eng.vault_put(space, "Slow.md", "start", Some("runaway"), false).unwrap();
+        let big = "y".repeat(vault::MAX_NOTE);
+        assert!(eng.vault_put(space, "Slow.md", &big, Some("runaway"), true).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
 
     /// A note written by horde has to be in horde's index immediately. Waiting for the next
     /// scan would mean the daemon not knowing about a file it just wrote itself.
