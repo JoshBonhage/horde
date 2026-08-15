@@ -702,7 +702,7 @@ mod tests {
         let pane = *session.panes.keys().next().unwrap();
         give_agent(&mut session, pane, AgentState::Idle);
 
-        let bus = Bus::new(std::env::temp_dir().join("horde-test-deliver.jsonl"));
+        let bus = Bus::new(super::super::tests::test_path("deliver.jsonl"));
         let mut m = msg(1, "ping");
         bus.deliver(&mut session, pane, &mut m, true);
         assert_eq!(m.delivery, Delivery::Delivered);
@@ -764,7 +764,7 @@ mod tests {
             agent.queued = vec![msg(1, "one"), msg(2, "two"), msg(3, "three")];
         }
 
-        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-flush.jsonl"));
+        let mut bus = Bus::new(super::super::tests::test_path("flush.jsonl"));
         let events = bus.flush_queued(&mut session, &cfg);
         assert_eq!(events.len(), 1, "exactly one message per pass");
         assert_eq!(
@@ -880,7 +880,7 @@ mod tests {
         wait_until_raw(&mut session, pane, &cfg.theme);
 
         let body = "x".repeat(60_000);
-        let bus = Bus::new(std::env::temp_dir().join("horde-test-long.jsonl"));
+        let bus = Bus::new(super::super::tests::test_path("long.jsonl"));
         let mut m = msg(1, &body);
         let expected = format_for(&m).len();
         assert!(expected > 60_000, "the envelope should make this longer still");
@@ -924,7 +924,7 @@ mod tests {
         assert!(matches!(Bus::gate(&session, pane, true, 4000), Gate::Hold(_)));
 
         // And it queues rather than being reported as delivered.
-        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-canon.jsonl"));
+        let mut bus = Bus::new(super::super::tests::test_path("canon.jsonl"));
         let m = bus
             .send(&mut session, &cfg, None, "target", &"y".repeat(4000), true, false, None)
             .unwrap();
@@ -968,7 +968,7 @@ mod tests {
             "the queue should be full after {filled} bytes with nothing draining"
         );
 
-        let mut bus = Bus::new(std::env::temp_dir().join("horde-test-deaf.jsonl"));
+        let mut bus = Bus::new(super::super::tests::test_path("deaf.jsonl"));
         let started = std::time::Instant::now();
         let m = bus
             .send(&mut session, &cfg, None, "target", "are you there?", false, false, None)
@@ -1117,7 +1117,7 @@ mod tests {
         session.panes.get_mut(&pane).unwrap().resize(200, 60).unwrap();
         wait_until_raw(&mut session, pane, &cfg.theme);
 
-        let bus = Bus::new(std::env::temp_dir().join("horde-test-slow.jsonl"));
+        let bus = Bus::new(super::super::tests::test_path("slow.jsonl"));
         let mut m = msg(1, &"x".repeat(40_000));
         let expected = format_for(&m).len();
 

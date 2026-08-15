@@ -1639,6 +1639,16 @@ mod tests {
     use super::*;
 
     /// Build an engine with one real pane, as the daemon would have.
+    /// A temp path unique to this test binary.
+    ///
+    /// The logs a test engine writes were fixed names in `$TMPDIR`, which two checkouts of horde
+    /// — or a second `cargo test` while the first is running — share. The board and bus recover
+    /// state from those files on construction, so a test asserting a count would read another
+    /// process's leftovers. Scoping by pid makes the collision impossible rather than unlikely.
+    pub(super) fn test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("horde-test-{}-{name}", std::process::id()))
+    }
+
     pub(super) fn engine() -> Engine {
         engine_with_shell(None)
     }
@@ -1660,12 +1670,12 @@ mod tests {
         let agents = agents::Detector::new(&cfg);
         let mut eng = Engine {
             session,
-            bus: bus::Bus::new(std::env::temp_dir().join("horde-test-bus.jsonl")),
-            board: tasks::Board::new(std::env::temp_dir().join("horde-test-tasks.jsonl")),
+            bus: bus::Bus::new(test_path("bus.jsonl")),
+            board: tasks::Board::new(test_path("tasks.jsonl")),
             triggers: triggers::Store::new(
-                std::env::temp_dir().join("horde-test-triggers.jsonl"),
+                test_path("triggers.jsonl"),
             ),
-            journal: journal::Journal::new(std::env::temp_dir().join("horde-test-journal.jsonl")),
+            journal: journal::Journal::new(test_path("journal.jsonl")),
             pane_names: HashMap::new(),
             started: now_millis(),
             last_seen: 0,
