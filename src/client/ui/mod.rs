@@ -375,7 +375,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // had ever seen it.
         // The completion list, over the text and under the cursor's line.
         if let (Some(c), Some(buf)) = (app.completions.as_ref(), app.buffer.as_ref()) {
-            let prefix = buf.word_prefix();
+            let prefix = buf.text_from(c.from);
             let items = c.matching(&prefix);
             if !items.is_empty() && buf.line >= scroll {
                 let cursor_row = area.y + 2 + (buf.line - scroll) as u16;

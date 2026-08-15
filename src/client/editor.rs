@@ -573,13 +573,21 @@ impl Buffer {
         i
     }
 
-    /// What has been typed of the word the cursor is in.
-    pub fn word_prefix(&self) -> String {
-        let start = self.word_start();
+    /// The text between a column and the cursor.
+    ///
+    /// What has been typed since a completion list opened, whether that was at the start of
+    /// an identifier or just after a `[[`. Both narrow the same way.
+    pub fn text_from(&self, from: usize) -> String {
         self.lines
             .get(self.line)
-            .map(|l| l.chars().skip(start).take(self.col.saturating_sub(start)).collect())
+            .map(|l| l.chars().skip(from).take(self.col.saturating_sub(from)).collect())
             .unwrap_or_default()
+    }
+
+    /// Whether the two characters before the cursor are `[[`, which is a wikilink starting.
+    pub fn at_link_open(&self) -> bool {
+        let chars: Vec<char> = self.lines.get(self.line).map(|l| l.chars().collect()).unwrap_or_default();
+        self.col >= 2 && chars[self.col - 1] == '[' && chars[self.col - 2] == '['
     }
 
     /// Swap part of the current line for something else, as one step.

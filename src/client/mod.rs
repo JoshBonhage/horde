@@ -58,6 +58,10 @@ const BUS_CAP: usize = 300;
 #[derive(Debug, Clone)]
 pub struct Completions {
     items: Vec<crate::proto::Completion>,
+    /// Whether accepting closes a wikilink. Links are the one completion that finishes its
+    /// own punctuation, because `[[` is an opening and nobody types the closing half on
+    /// purpose.
+    link: bool,
     /// Which of the *matching* items is selected.
     pub sel: usize,
     /// The line the request was made on. Leaving it closes the popup, because a list of
@@ -281,6 +285,9 @@ pub struct App {
     pub doc: DocSync,
     /// The completion list, while one is open.
     pub completions: Option<Completions>,
+    /// A note list was asked for by `[[` in the editor, so the next vault reply belongs to
+    /// the completion popup rather than to the browser.
+    pub linking: bool,
     /// What a language server thinks of the file being edited, keyed by the path the editor
     /// knows it as. Cleared when the editor closes, because it is about one open file.
     pub diags: HashMap<String, Vec<crate::proto::Diag>>,
@@ -349,6 +356,7 @@ impl App {
             buffer: None,
             doc: DocSync::default(),
             completions: None,
+            linking: false,
             diags: HashMap::new(),
             yank: None,
             search: String::new(),
@@ -723,7 +731,7 @@ fn apply_frame(
             match app.buffer.as_ref() {
                 Some(b) if open_here && !items.is_empty() => {
                     app.completions =
-                        Some(Completions { items, sel: 0, line: b.line, from: b.word_start() });
+                        Some(Completions { items, link: false, sel: 0, line: b.line, from: b.word_start() });
                 }
                 _ => app.toast(NoticeLevel::Info, "nothing to complete"),
             }
@@ -851,6 +859,32 @@ fn apply_frame(
                     app.mode = Mode::Editor { path, scroll: 0, project: true, vim: Vim::Insert };
                 }
                 _ => app.files = Some(*f),
+            }
+        }
+        // The note list, asked for by `[[` rather than by the browser. Taken before the
+        // browser's own handling, because these two want the same reply for different things
+        // and only one of them asked.
+        ServerFrame::Vault(v) if app.linking => {
+            app.linking = false;
+            let items: Vec<crate::proto::Completion> = v
+                .notes
+                .iter()
+                .map(|n| crate::proto::Completion {
+                    label: n.title.clone(),
+                    insert: n.title.clone(),
+                    replace: None,
+                    // What links here, which is the closest a vault has to a ranking and the
+                    // one fact that distinguishes two notes with similar names.
+                    kind: (n.backlinks > 0).then(|| format!("←{}", n.backlinks)),
+                    detail: None,
+                })
+                .collect();
+            match app.buffer.as_ref() {
+                Some(b) if !items.is_empty() => {
+                    app.completions =
+                        Some(Completions { items, link: true, sel: 0, line: b.line, from: b.col });
+                }
+                _ => app.toast(NoticeLevel::Info, "no notes to link to yet"),
             }
         }
         ServerFrame::Vault(v) => {
@@ -2419,10 +2453,22 @@ fn editor_insert(
         _ => {}
     }
 
+    // `[[` opens the note list, the way it does in the app this borrows the idea from. No key
+    // to learn: the thing you type to make a link is the thing that offers you one.
+    if app.buffer.as_ref().is_some_and(|b| b.at_link_open()) && app.completions.is_none() {
+        if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+            app.linking = true;
+            let _ = out.send(ClientFrame::Command(Cmd::VaultQuery {
+                space,
+                kind: crate::proto::VaultQuery::List,
+            }));
+        }
+    }
+
     // A completion list is about one word on one line. Leaving either ends it, and so does
     // narrowing it down to nothing — a popup showing no matches is a popup in the way.
     if let (Some(c), Some(b)) = (app.completions.as_ref(), app.buffer.as_ref()) {
-        let matches = c.matching(&b.word_prefix()).len();
+        let matches = c.matching(&b.text_from(c.from)).len();
         if b.line != c.line || b.col < c.from || matches == 0 {
             app.completions = None;
         } else if let Some(c) = app.completions.as_mut() {
@@ -2453,7 +2499,8 @@ fn completion_ask(
 
 /// Move through the list, wrapping. A list you can fall off the end of makes you look.
 fn completion_move(app: &mut App, by: i32) {
-    let prefix = app.buffer.as_ref().map(|b| b.word_prefix()).unwrap_or_default();
+    let from = app.completions.as_ref().map(|c| c.from).unwrap_or(0);
+    let prefix = app.buffer.as_ref().map(|b| b.text_from(from)).unwrap_or_default();
     let Some(c) = app.completions.as_mut() else { return };
     let n = c.matching(&prefix).len();
     if n == 0 {
@@ -2464,10 +2511,10 @@ fn completion_move(app: &mut App, by: i32) {
 
 /// Put the selected completion in.
 fn completion_accept(app: &mut App) {
-    let Some(b) = app.buffer.as_ref() else { return };
-    let prefix = b.word_prefix();
-    let (col, start) = (b.col, b.word_start());
     let Some(c) = app.completions.take() else { return };
+    let Some(b) = app.buffer.as_ref() else { return };
+    let prefix = b.text_from(c.from);
+    let (col, start) = (b.col, c.from);
     let Some(item) = c.matching(&prefix).get(c.sel).copied().cloned() else { return };
     // The server's own range when it gave one, and the word the cursor is in otherwise.
     // Trusting the range matters: a server completing `self.field` knows the dot is not part
@@ -2477,8 +2524,9 @@ fn completion_accept(app: &mut App) {
         Some((a, z)) => (a as usize, (z as usize).max(col)),
         None => (start, col),
     };
+    let text = if c.link { format!("{}]]", item.insert) } else { item.insert.clone() };
     if let Some(b) = app.buffer.as_mut() {
-        b.replace_in_line(from, to, &item.insert);
+        b.replace_in_line(from, to, &text);
     }
 }
 
@@ -3533,13 +3581,17 @@ mod tests {
         }
     }
 
-    /// Type a run of characters, one key at a time, and hand back everything they sent.
-    fn typed(app: &mut App, text: &str) -> Vec<Cmd> {
+    /// Type a run of characters, one key at a time, and hand back the frames they sent.
+    fn typed_frames(app: &mut App, text: &str) -> Vec<ClientFrame> {
         let mut out = Vec::new();
         for c in text.chars() {
-            out.extend(cmds(press(app, KeyCode::Char(c))));
+            out.extend(press(app, KeyCode::Char(c)));
         }
         out
+    }
+
+    fn typed(app: &mut App, text: &str) -> Vec<Cmd> {
+        cmds(typed_frames(app, text))
     }
 
     /// The whole point of having modes: `esc` reaches the commands, and the note stays open.
@@ -3945,6 +3997,97 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(app.completions.is_none());
         assert_eq!(vim_of(&app), Vim::Insert, "still writing");
+    }
+
+    /// The thing you type to make a link is the thing that offers you one. No key to learn,
+    /// which is the whole reason it is `[[` and not a binding.
+    #[test]
+    fn typing_two_brackets_asks_the_vault_for_its_notes() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new(""));
+        let sent = cmds(typed_frames(&mut app, "[["));
+        assert!(app.linking, "waiting on the answer");
+        assert!(
+            sent.iter().any(|c| matches!(
+                c,
+                Cmd::VaultQuery { kind: crate::proto::VaultQuery::List, .. }
+            )),
+            "it asked: {sent:?}"
+        );
+
+        // One bracket is not a link, and asking again while a list is open would be noise.
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new(""));
+        let sent = cmds(typed_frames(&mut app, "["));
+        assert!(!app.linking, "{sent:?}");
+    }
+
+    /// A link completion finishes its own brackets, because `[[` is an opening and nobody
+    /// types the closing half on purpose.
+    #[test]
+    fn accepting_a_note_closes_the_link() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new("see "));
+        app.buffer.as_mut().unwrap().end();
+        typed(&mut app, "[[");
+
+        let reply = crate::proto::VaultReply {
+            space: 1,
+            root: "/notes".into(),
+            notes: vec![crate::proto::NoteLine {
+                path: "Horde Dev Plan.md".into(),
+                title: "Horde Dev Plan".into(),
+                tags: Vec::new(),
+                mtime: 0,
+                backlinks: 2,
+            }],
+            body: None,
+            backlinks: Vec::new(),
+            graph: None,
+        };
+        apply_frame(&mut app, ServerFrame::Vault(Box::new(reply)), &sink());
+        assert!(app.completions.is_some(), "the note list opened");
+        assert_eq!(
+            app.completions.as_ref().unwrap().items[0].kind.as_deref(),
+            Some("←2"),
+            "and says what links there, which is how you tell two similar names apart"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.buffer.as_ref().unwrap().text(), "see [[Horde Dev Plan]]");
+    }
+
+    /// Note titles have spaces in them, so narrowing cannot use the identifier rule that
+    /// works for code. Both sources narrow on "everything typed since the list opened".
+    #[test]
+    fn a_note_list_narrows_on_titles_with_spaces_in_them() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new(""));
+        typed(&mut app, "[[");
+        let reply = crate::proto::VaultReply {
+            space: 1,
+            root: "/notes".into(),
+            notes: ["Horde Dev Plan", "Horde Updates", "Catalog Commander"]
+                .iter()
+                .map(|t| crate::proto::NoteLine {
+                    path: format!("{t}.md"),
+                    title: t.to_string(),
+                    tags: Vec::new(),
+                    mtime: 0,
+                    backlinks: 0,
+                })
+                .collect(),
+            body: None,
+            backlinks: Vec::new(),
+            graph: None,
+        };
+        apply_frame(&mut app, ServerFrame::Vault(Box::new(reply)), &sink());
+
+        typed(&mut app, "horde d");
+        let c = app.completions.as_ref().expect("still open across the space");
+        let shown: Vec<&str> =
+            c.matching("horde d").iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(shown, ["Horde Dev Plan"], "and case does not matter");
     }
 
     /// Opening horde is arriving, and arriving shows you the state of things. Every attach
