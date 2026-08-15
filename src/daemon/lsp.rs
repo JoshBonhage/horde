@@ -1159,7 +1159,10 @@ mod tests {
 
         let key = (root.clone(), "rust".to_string());
         let mut events = Vec::new();
-        for _ in 0..100 {
+        // Generous, because this waits on a process actually starting and exiting. Under a
+        // loaded machine that is not instant, and a test that fails on a busy laptop is a
+        // test people learn to re-run rather than read.
+        for _ in 0..500 {
             events.extend(reg.drain());
             if events.iter().any(|e| matches!(e, Event::Exited { .. })) {
                 break;
