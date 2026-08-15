@@ -3,7 +3,9 @@
 //! All geometry and session state comes from the daemon, so the client is free to die and
 //! come back without disturbing a single running process.
 
-pub mod input;
+pub mod editor;
+pub mod graph;
+mod input;
 pub mod menu;
 pub mod roster;
 pub mod selection;
@@ -29,7 +31,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use crate::config::{Action, Chord, Config, Notify, Trigger};
+use crate::config::{Action, Chord, Config, LeaderMatch, Notify, Trigger};
 use crate::client::menu::{Act, Level, Prompt, Target};
 use crate::framing;
 use crate::proto::{
@@ -52,6 +54,40 @@ pub enum Mode {
     Terminal,
     /// The prefix key was pressed; the next key is a horde binding.
     Prefix,
+    /// A project's notes, full screen. `query` filters as you type.
+    Notes { query: String, sel: usize },
+    /// A project's files. The thing opening a project shows you.
+    Files { query: String, sel: usize },
+    /// Writing. Modeless: the keys are the ones a text field has, because this is a notes
+    /// app and typing should type.
+    ///
+    /// `project` says which half of horde the file belongs to — a note in a vault, or a file
+    /// in the project — because that decides where saving sends it and nothing else about
+    /// the editor changes.
+    Editor { path: String, scroll: usize, project: bool },
+    /// A note, rendered. `link` indexes the wikilinks in it, so `tab` walks them and
+    /// `enter` follows one — which is the whole difference between a file and a vault.
+    Reader { scroll: usize, link: usize },
+    /// The link graph. The layout itself lives on `App` rather than in here, because it is
+    /// expensive to build and a `Mode` is cloned on every keystroke.
+    Graph { sel: usize },
+    /// The setup walkthrough, shown once before anything else.
+    Setup { step: ui::setup::Step },
+    /// The start screen. `sel` indexes the *selectable* rows, so headers and hints are
+    /// skipped without the cursor ever having to know they exist.
+    ///
+    /// Shown on attaching to a session that started from nothing, and reachable afterwards
+    /// with `prefix 0` — tabs are 1 through 9, so home is 0.
+    Dashboard { sel: usize },
+    /// The leader was pressed; `pending` is the sequence typed since.
+    ///
+    /// Unlike [`Mode::Prefix`] this can span several keys, so it holds them — and it holds
+    /// `back` too, because the leader is reachable from horde's own views as a bare `space`
+    /// and leaving it has to return the keyboard where it was found, not to a pane.
+    ///
+    /// Keys are only ever released as an *action*: an abandoned sequence is dropped, never
+    /// replayed into a pane. Replaying would type `wv` at whatever an agent was doing.
+    Leader { pending: Vec<Chord>, back: Box<Mode> },
     Help,
     Palette { query: String, sel: usize },
     SpaceSwitcher { query: String, sel: usize },
@@ -116,6 +152,44 @@ pub struct App {
     /// Where each landable roster row was drawn: row, column, width, and what it is. Rects
     /// rather than rows, because the roster is multi-column and a row means several things.
     pub roster_hits: Vec<(u16, u16, u16, Focus)>,
+    /// The most recent answer to a vault query, held until the next one replaces it.
+    pub vault: Option<crate::proto::VaultReply>,
+    /// Set while a note is being fetched to write into rather than to read.
+    pub opening_editor: bool,
+    /// A note whose body has been asked for, so the next reply is known to be a read.
+    pub pending_read: Option<String>,
+    /// A wikilink being followed: the daemon is resolving the name, and the best hit becomes
+    /// the next note to read. Held here because resolution is the index's job, not the
+    /// client's — the client has a name, and only the daemon knows what it points at.
+    pub follow: Option<String>,
+    /// Folders showing their contents in the file tree. On `App` rather than in the mode
+    /// because a mode is cloned on every keystroke, and which folders you opened is a thing
+    /// you did rather than a thing the view is.
+    pub open_dirs: std::collections::HashSet<String>,
+    /// Set when a project has just been opened and its files should be listed as soon as
+    /// the focus change lands.
+    pub want_files: bool,
+    /// The project's files, from the last file query.
+    pub files: Option<crate::proto::FileList>,
+    /// What the setup walkthrough has been told.
+    pub setup: ui::setup::Answers,
+    /// The note being written, alive only while the editor is open.
+    pub buffer: Option<editor::Buffer>,
+    /// The graph layout, alive only while the graph is open.
+    pub sim: Option<graph::Sim>,
+    /// How far in, and where the view is centred. Panning moves the centre; the layout
+    /// underneath does not know the difference.
+    pub graph_zoom: f64,
+    pub graph_centre: graph::Point,
+    /// Node hits for the graph: `(y, x, node index)`.
+    pub graph_hits: Vec<(u16, u16, usize)>,
+    /// Row hits for the note browser.
+    pub notes_hits: Vec<(u16, usize)>,
+    /// Row hits for the dashboard: `(y, index into its row list)`.
+    pub dashboard_hits: Vec<(u16, usize)>,
+    /// Whether the start-screen decision has been made for this attach. Made once, on the
+    /// first snapshot, so a later shape change cannot yank you back to a greeter.
+    greeted: bool,
     /// Set once the version mismatch warning has been shown, so it appears only once.
     pub warned_version: bool,
     /// Screen row to menu-item index, recorded during render for mouse hit-testing.
@@ -151,6 +225,22 @@ impl App {
             sidebar_hits: Vec::new(),
             sidebar: roster::SidebarState::default(),
             roster_hits: Vec::new(),
+            dashboard_hits: Vec::new(),
+            notes_hits: Vec::new(),
+            open_dirs: std::collections::HashSet::new(),
+            want_files: false,
+            files: None,
+            setup: ui::setup::Answers::default(),
+            buffer: None,
+            sim: None,
+            graph_zoom: 1.0,
+            graph_centre: graph::Point { x: 0.0, y: 0.0 },
+            graph_hits: Vec::new(),
+            vault: None,
+            follow: None,
+            pending_read: None,
+            opening_editor: false,
+            greeted: false,
             warned_version: false,
             menu_hits: Vec::new(),
             menu_rect: crate::proto::Rect::default(),
@@ -408,13 +498,13 @@ async fn run_loop(
             frame = inbound.recv() => {
                 match frame {
                     Some(frame) => {
-                        if let Some(reason) = apply_frame(app, frame) {
+                        if let Some(reason) = apply_frame(app, frame, &out) {
                             return Err(anyhow!(reason));
                         }
                         needs_draw = true;
                         // Drain anything already queued so one draw covers the burst.
                         while let Ok(f) = inbound.try_recv() {
-                            if let Some(reason) = apply_frame(app, f) {
+                            if let Some(reason) = apply_frame(app, f, &out) {
                                 return Err(anyhow!(reason));
                             }
                         }
@@ -448,13 +538,38 @@ async fn run_loop(
                 if animating || !app.toasts.is_empty() {
                     needs_draw = true;
                 }
+
+                // Advance the graph layout, if one is open and still moving. Several steps
+                // a frame, because one would take half a minute to settle — and then *stop*,
+                // which is the whole reason the simulation anneals. A graph left open must
+                // cost exactly as much as any other still picture.
+                if matches!(app.mode, Mode::Graph { .. }) {
+                    if let Some(sim) = app.sim.as_mut() {
+                        if !sim.settled() {
+                            for _ in 0..graph::STEPS_PER_FRAME {
+                                sim.step();
+                                if sim.settled() {
+                                    break;
+                                }
+                            }
+                            needs_draw = true;
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 /// Apply one server frame. Returns a reason string when the session must end.
-fn apply_frame(app: &mut App, frame: ServerFrame) -> Option<String> {
+///
+/// Takes the sender because one answer can lead to another: following a wikilink asks the
+/// daemon to resolve a name, and the reply to *that* is what says which note to fetch.
+fn apply_frame(
+    app: &mut App,
+    frame: ServerFrame,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+) -> Option<String> {
     match frame {
         ServerFrame::Digest(d) => {
             // Nothing to report is worth saying out loud rather than opening an empty panel.
@@ -482,6 +597,36 @@ fn apply_frame(app: &mut App, frame: ServerFrame) -> Option<String> {
                         snap.daemon_version
                     ),
                 );
+            }
+            // Every attach opens on the start screen. Opening horde is arriving, and what
+            // you want on arrival is the state of things — which agents need you, which
+            // projects are live — not whichever pane happened to be focused last time.
+            //
+            // The daemon and its agents are untouched by this: they keep running whether or
+            // not anyone is looking, which is the whole point of the daemon. Only the *view*
+            // resets, and `esc` is one keystroke away from the terminal.
+            if !app.greeted {
+                app.greeted = true;
+                if app.mode == Mode::Terminal {
+                    // No config file means horde has never been set up here, which is a fact
+                    // on disk rather than a guess about the person. Being asked four
+                    // questions once beats discovering them by hitting them — "no vault" the
+                    // first time you write a note is not a prompt, it is a wall.
+                    app.mode = if !crate::config::config_path().exists() {
+                        Mode::Setup { step: ui::setup::Step::Vault }
+                    } else if app.cfg.dashboard {
+                        Mode::Dashboard { sel: 0 }
+                    } else {
+                        Mode::Terminal
+                    };
+                }
+            }
+            // A project was opened and is now focused: list it.
+            if app.want_files {
+                if let Some(space) = snap.focused_space {
+                    app.want_files = false;
+                    let _ = out.send(ClientFrame::Command(Cmd::FileQuery { space }));
+                }
             }
             // Forget caches for panes that no longer exist.
             let live: Vec<PaneId> = snap.panes.iter().map(|p| p.id).collect();
@@ -533,6 +678,56 @@ fn apply_frame(app: &mut App, frame: ServerFrame) -> Option<String> {
             crate::proto::Event::Notice { level, text } => app.toast(level, text),
             crate::proto::Event::PaneExited { .. } => {}
         },
+        ServerFrame::Files(f) => {
+            match (f.body.clone(), f.path.clone()) {
+                // A body means this was asked for in order to edit it.
+                (Some(body), Some(path)) => {
+                    app.buffer = Some(editor::Buffer::new(&body));
+                    app.mode = Mode::Editor { path, scroll: 0, project: true };
+                }
+                _ => app.files = Some(*f),
+            }
+        }
+        ServerFrame::Vault(v) => {
+            // A link being followed: take the best match and ask for its body.
+            if let Some(name) = app.follow.take() {
+                if let Some(hit) = v.notes.first() {
+                    app.pending_read = Some(hit.path.clone());
+                } else {
+                    app.toast(NoticeLevel::Info, format!("no note called {name:?} yet"));
+                    app.mode = Mode::Notes { query: String::new(), sel: 0 };
+                }
+            }
+            if let Some(path) = app.pending_read.take() {
+                // The search answered; now fetch the note itself. Two round trips on a local
+                // socket, and it keeps name resolution in the one place that owns the index.
+                if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+                    let _ = out.send(ClientFrame::Command(Cmd::VaultQuery {
+                        space,
+                        kind: crate::proto::VaultQuery::Note { path },
+                    }));
+                }
+            }
+            // A note asked for by the editor arrives as a body to write into.
+            if app.opening_editor {
+                app.opening_editor = false;
+                if let (Some(body), Some(note)) = (v.body.clone(), v.notes.first()) {
+                    app.buffer = Some(editor::Buffer::new(&body));
+                    app.mode = Mode::Editor { path: note.path.clone(), scroll: 0, project: false };
+                }
+            }
+            if let Some(g) = v.graph.as_ref() {
+                let mut sim = graph::Sim::new(g);
+                // Past the animation limit the picture is a shape rather than a story, and
+                // watching two thousand nodes shuffle costs more than it explains.
+                if g.nodes.len() > graph::ANIMATE_LIMIT {
+                    sim.settle(600);
+                }
+                app.graph_centre = sim.centre();
+                app.sim = Some(sim);
+            }
+            app.vault = Some(*v);
+        }
         ServerFrame::Bye { reason } => return Some(reason),
     }
     None
@@ -827,6 +1022,541 @@ fn handle_key(
                 }
             }
         }
+        Mode::Graph { sel } => {
+            let count = app
+                .vault
+                .as_ref()
+                .and_then(|v| v.graph.as_ref())
+                .map(|g| g.nodes.len())
+                .unwrap_or(0);
+            let last = count.saturating_sub(1);
+            // Panning moves in layout units, scaled so one press crosses a similar fraction
+            // of the view whatever the zoom.
+            let pan = 200.0 / 12.0 / app.graph_zoom;
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    // The layout is worth tens of milliseconds to rebuild and nothing to
+                    // keep, and holding it would pin a vault's worth of points in a client
+                    // that may not open the graph again this session.
+                    app.sim = None;
+                    app.mode = Mode::Terminal;
+                }
+                // Tab walks the nodes, because the arrows are already panning the view.
+                KeyCode::Tab | KeyCode::Char('j') => {
+                    app.mode = Mode::Graph { sel: if sel >= last { 0 } else { sel + 1 } }
+                }
+                KeyCode::BackTab | KeyCode::Char('k') => {
+                    app.mode = Mode::Graph { sel: if sel == 0 { last } else { sel - 1 } }
+                }
+                KeyCode::Left => app.graph_centre.x -= pan,
+                KeyCode::Right => app.graph_centre.x += pan,
+                KeyCode::Up => app.graph_centre.y -= pan,
+                KeyCode::Down => app.graph_centre.y += pan,
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    app.graph_zoom = (app.graph_zoom * 1.25).min(8.0)
+                }
+                KeyCode::Char('-') => app.graph_zoom = (app.graph_zoom / 1.25).max(0.4),
+                // Recentre and reset, for when panning has lost you.
+                KeyCode::Char('0') => {
+                    app.graph_zoom = 1.0;
+                    if let Some(s) = app.sim.as_ref() {
+                        app.graph_centre = s.centre();
+                    }
+                }
+                KeyCode::Enter => {
+                    // A ghost has no note to open, so enter on one does nothing rather than
+                    // inventing a file the person never asked for.
+                    let node = app
+                        .vault
+                        .as_ref()
+                        .and_then(|v| v.graph.as_ref())
+                        .and_then(|g| g.nodes.get(sel))
+                        .cloned();
+                    if let Some(n) = node.filter(|n| !n.ghost) {
+                        let row = ui::notes::Row {
+                            path: n.path.clone(),
+                            title: n.label.clone(),
+                            tags: Vec::new(),
+                            backlinks: 0,
+                            depth: 0,
+                            folder: false,
+                            open: false,
+                        };
+                        open_note(app, &row, out);
+                        app.sim = None;
+                        app.mode = Mode::Terminal;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        Mode::Setup { step } => {
+            use ui::setup::Step;
+            let count = ui::setup::choices(step, &app.setup);
+            let advance = |app: &mut App, out: &mpsc::UnboundedSender<ClientFrame>, step: Step| {
+                let steps = Step::all();
+                let i = steps.iter().position(|s| *s == step).unwrap_or(0);
+                match steps.get(i + 1) {
+                    Some(next) => {
+                        app.setup.cursor = 0;
+                        app.mode = Mode::Setup { step: *next };
+                    }
+                    // Finishing writes the config, so the answers survive the session that
+                    // gave them. Anything already there is left alone: a walkthrough that
+                    // overwrites a config somebody wrote by hand is a walkthrough nobody
+                    // runs twice.
+                    None => {
+                        let path = crate::config::config_path();
+                        if !path.exists() {
+                            if let Some(dir) = path.parent() {
+                                let _ = std::fs::create_dir_all(dir);
+                            }
+                            match std::fs::write(&path, app.setup.to_config()) {
+                                Ok(()) => {
+                                    let _ = out.send(ClientFrame::Command(Cmd::VaultInit {
+                                        space: app
+                                            .snapshot
+                                            .as_ref()
+                                            .and_then(|s| s.focused_space)
+                                            .unwrap_or(0),
+                                    }));
+                                    app.toast(
+                                        NoticeLevel::Info,
+                                        format!("settings written to {}", path.display()),
+                                    );
+                                }
+                                Err(e) => app.toast(
+                                    NoticeLevel::Warn,
+                                    format!("could not write {}: {e}", path.display()),
+                                ),
+                            }
+                        }
+                        app.mode = Mode::Dashboard { sel: 0 };
+                    }
+                }
+            };
+
+            match k.code {
+                // Skipping is allowed and changes nothing: someone who wants to look around
+                // first should not have to answer four questions to be let in.
+                KeyCode::Esc => app.mode = Mode::Dashboard { sel: 0 },
+                KeyCode::Enter => advance(app, out, step),
+                KeyCode::Down | KeyCode::Tab => {
+                    app.setup.cursor = (app.setup.cursor + 1).min(count.saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    app.setup.cursor = app.setup.cursor.saturating_sub(1)
+                }
+                KeyCode::Char(' ') if step == Step::Languages => {
+                    if let Some(l) = app.setup.languages.get_mut(app.setup.cursor) {
+                        l.1 = !l.1;
+                    }
+                }
+                KeyCode::Char(' ') if step == Step::Unattended => {
+                    app.setup.unattended = app.setup.cursor == 1
+                }
+                KeyCode::Backspace if step == Step::Vault => {
+                    app.setup.vault.pop();
+                }
+                KeyCode::Char(c) if step == Step::Vault => app.setup.vault.push(c),
+                _ => {}
+            }
+            // The radio follows the cursor, so moving is choosing rather than a second step.
+            if step == Step::Unattended {
+                app.setup.unattended = app.setup.cursor == 1;
+            }
+            return Ok(());
+        }
+        Mode::Editor { path, scroll, project } => {
+            let rows = app.snapshot.as_ref().map(|s| s.status.h).unwrap_or(1) as usize;
+            let page = rows.max(10);
+            let Some(buf) = app.buffer.as_mut() else {
+                app.mode = Mode::Terminal;
+                return Ok(());
+            };
+            let save = |app: &mut App, out: &mpsc::UnboundedSender<ClientFrame>, path: &str| {
+                let Some(b) = app.buffer.as_mut() else { return };
+                let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) else {
+                    return;
+                };
+                let body = b.text();
+                let cmd = if project {
+                    Cmd::FileSave { space, path: path.to_string(), body }
+                } else {
+                    Cmd::VaultSave { space, path: path.to_string(), body }
+                };
+                let _ = out.send(ClientFrame::Command(cmd));
+                b.saved();
+            };
+
+            match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
+                (KeyCode::Char('s'), true) => save(app, out, &path),
+                // Leaving saves. An editor that can lose a note because you pressed the
+                // wrong key to get out of it is not one anybody should trust a thought to.
+                (KeyCode::Esc, _) => {
+                    save(app, out, &path);
+                    app.buffer = None;
+                    app.mode = if project {
+                        Mode::Files { query: String::new(), sel: 0 }
+                    } else {
+                        Mode::Notes { query: String::new(), sel: 0 }
+                    };
+                }
+                (KeyCode::Char('r'), true) => {
+                    save(app, out, &path);
+                    app.buffer = None;
+                    read_note(app, &path, out);
+                }
+                (KeyCode::Enter, _) => buf.newline(),
+                (KeyCode::Backspace, _) => buf.backspace(),
+                (KeyCode::Delete, _) => buf.delete(),
+                (KeyCode::Left, _) => buf.left(),
+                (KeyCode::Right, _) => buf.right(),
+                (KeyCode::Up, _) => buf.up(),
+                (KeyCode::Down, _) => buf.down(),
+                (KeyCode::Home, _) => buf.home(),
+                (KeyCode::End, _) => buf.end(),
+                (KeyCode::Tab, _) => {
+                    for _ in 0..2 {
+                        buf.insert(' ');
+                    }
+                }
+                (KeyCode::PageDown, _) => {
+                    for _ in 0..page {
+                        buf.down();
+                    }
+                }
+                (KeyCode::PageUp, _) => {
+                    for _ in 0..page {
+                        buf.up();
+                    }
+                }
+                // Everything else types. No mode to be in, and no key that silently means
+                // something else — this is a notes app.
+                (KeyCode::Char(c), false) => buf.insert(c),
+                _ => {}
+            }
+
+            // Keep the cursor on screen by following it, never by moving it.
+            if let Some(b) = app.buffer.as_ref() {
+                let view = rows.max(8);
+                let scroll = if b.line < scroll {
+                    b.line
+                } else if b.line >= scroll + view {
+                    b.line - view + 1
+                } else {
+                    scroll
+                };
+                if matches!(app.mode, Mode::Editor { .. }) {
+                    app.mode = Mode::Editor { path, scroll, project };
+                }
+            }
+            return Ok(());
+        }
+        Mode::Reader { scroll, link } => {
+            let (body, path) = app
+                .vault
+                .as_ref()
+                .map(|v| {
+                    (
+                        v.body.clone().unwrap_or_default(),
+                        v.notes.first().map(|n| n.path.clone()).unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_default();
+            let width = app.snapshot.as_ref().map(|s| s.status.w).unwrap_or(80);
+            let rendered = ui::markdown::render(&body, width.saturating_sub(6).min(96), &app.cfg.theme);
+            let page = 10;
+            let max = rendered.lines.len().saturating_sub(1);
+            match k.code {
+                // Back to the browser, which is where you came from and still has your
+                // filter in it.
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.mode = Mode::Notes { query: String::new(), sel: 0 }
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.mode = Mode::Reader { scroll: (scroll + 1).min(max), link }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.mode = Mode::Reader { scroll: scroll.saturating_sub(1), link }
+                }
+                KeyCode::Char(' ') | KeyCode::PageDown => {
+                    app.mode = Mode::Reader { scroll: (scroll + page).min(max), link }
+                }
+                KeyCode::PageUp => {
+                    app.mode = Mode::Reader { scroll: scroll.saturating_sub(page), link }
+                }
+                KeyCode::Char('g') | KeyCode::Home => app.mode = Mode::Reader { scroll: 0, link },
+                KeyCode::Char('G') | KeyCode::End => {
+                    app.mode = Mode::Reader { scroll: max, link }
+                }
+                // Walk the links in the note, scrolling to keep the selected one in view.
+                KeyCode::Tab if !rendered.links.is_empty() => {
+                    let next = (link + 1) % rendered.links.len();
+                    let at = rendered.links[next].0;
+                    let scroll = if at < scroll || at > scroll + page * 2 { at.saturating_sub(2) } else { scroll };
+                    app.mode = Mode::Reader { scroll, link: next };
+                }
+                KeyCode::BackTab if !rendered.links.is_empty() => {
+                    let next = if link == 0 { rendered.links.len() - 1 } else { link - 1 };
+                    let at = rendered.links[next].0;
+                    let scroll = if at < scroll || at > scroll + page * 2 { at.saturating_sub(2) } else { scroll };
+                    app.mode = Mode::Reader { scroll, link: next };
+                }
+                // Following a link is what makes this a vault rather than a file viewer.
+                // The daemon resolves the name, because it is the one holding the index.
+                KeyCode::Enter => {
+                    if let Some((_, target)) = rendered.links.get(link) {
+                        let target = target.clone();
+                        if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+                            let _ = out.send(ClientFrame::Command(Cmd::VaultQuery {
+                                space,
+                                kind: crate::proto::VaultQuery::Search { q: target.clone() },
+                            }));
+                        }
+                        app.mode = Mode::Reader { scroll: 0, link: 0 };
+                        app.follow = Some(target);
+                    }
+                }
+                KeyCode::Char('e') => {
+                    let row = ui::notes::Row {
+                        path,
+                        title: String::new(),
+                        tags: Vec::new(),
+                        backlinks: 0,
+                            depth: 0,
+                            folder: false,
+                            open: false,
+                    };
+                    open_note(app, &row, out);
+                    app.mode = Mode::Terminal;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        Mode::Files { query, sel } => {
+            let rows = ui::notes::file_rows(app.files.as_ref(), &query, &app.open_dirs);
+            match k.code {
+                KeyCode::Esc => app.mode = Mode::Dashboard { sel: 0 },
+                KeyCode::Down => {
+                    app.mode = Mode::Files { query, sel: (sel + 1).min(rows.len().saturating_sub(1)) }
+                }
+                KeyCode::Up => app.mode = Mode::Files { query, sel: sel.saturating_sub(1) },
+                // Left closes, right opens — what an arrow means in every tree.
+                KeyCode::Left => {
+                    if let Some(row) = rows.get(sel).filter(|r| r.folder) {
+                        app.open_dirs.remove(&row.path);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(row) = rows.get(sel).filter(|r| r.folder) {
+                        app.open_dirs.insert(row.path.clone());
+                    }
+                }
+                KeyCode::Enter => {
+                    // The space the *listing* came from, not whatever is focused now. Those
+                    // differ for exactly as long as it takes a focus change to round-trip,
+                    // which is exactly when someone opens a project and picks a file — and
+                    // the file then gets looked for in the previous project, where it is
+                    // not.
+                    match rows.get(sel) {
+                        // A folder is a thing to open, not a thing to edit.
+                        Some(row) if row.folder => {
+                            if !app.open_dirs.remove(&row.path) {
+                                app.open_dirs.insert(row.path.clone());
+                            }
+                        }
+                        Some(row) => {
+                            if let Some(space) = app.files.as_ref().map(|f| f.space) {
+                                let path = row.path.clone();
+                                let _ =
+                                    out.send(ClientFrame::Command(Cmd::FileRead { space, path }));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                // The multiplexer is one keystroke away rather than the way in. Opening a
+                // project shows the project; a terminal in it is a thing you then ask for.
+                KeyCode::Char('t') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::Terminal
+                }
+                KeyCode::Backspace => {
+                    let mut q = query;
+                    q.pop();
+                    app.mode = Mode::Files { query: q, sel: 0 };
+                }
+                KeyCode::Char(c) => {
+                    let mut q = query;
+                    q.push(c);
+                    app.mode = Mode::Files { query: q, sel: 0 };
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        Mode::Notes { query, sel } => {
+            let rows = ui::notes::rows(app.vault.as_ref(), &query);
+            match k.code {
+                KeyCode::Esc => app.mode = Mode::Terminal,
+                KeyCode::Down => {
+                    let sel = ui::notes::step(&rows, sel, 1);
+                    app.mode = Mode::Notes { query, sel }
+                }
+                KeyCode::Up => {
+                    let sel = ui::notes::step(&rows, sel, -1);
+                    app.mode = Mode::Notes { query, sel }
+                }
+                KeyCode::Backspace => {
+                    let mut q = query;
+                    q.pop();
+                    let sel = ui::notes::first(&ui::notes::rows(app.vault.as_ref(), &q));
+                    app.mode = Mode::Notes { query: q, sel };
+                }
+                KeyCode::Enter => {
+                    if let Some(row) = rows.get(sel).filter(|r| !r.folder) {
+                        let path = row.path.clone();
+                        read_note(app, &path, out);
+                    }
+                }
+                // Editing is a deliberate second step. Browsing a vault is overwhelmingly
+                // reading it, and enter should do the thing you came to do.
+                KeyCode::Char('e') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(row) = rows.get(sel).filter(|r| !r.folder) {
+                        let path = row.path.clone();
+                        edit_note(app, &path, out);
+                    }
+                }
+                // Every printable key types into the filter. This is the one full-screen
+                // view where bare letters are a field rather than a command, which is why
+                // it has no single-key bindings of its own competing with them.
+                // ctrl+n makes a note without leaving the browser; ctrl+e writes in the
+                // one under the cursor. Reading is what plain enter does.
+                KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.mode = Mode::Prompt { prompt: Prompt::NewNote, value: String::new() }
+                }
+                KeyCode::Char(c) => {
+                    let mut q = query;
+                    q.push(c);
+                    let sel = ui::notes::first(&ui::notes::rows(app.vault.as_ref(), &q));
+                    app.mode = Mode::Notes { query: q, sel };
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        Mode::Dashboard { sel } => {
+            let rows = app
+                .snapshot
+                .as_ref()
+                .map(|s| ui::dashboard::rows(s, ui::now_millis()))
+                .unwrap_or_default();
+            let picks = ui::dashboard::selectable(&rows);
+            let last = picks.len().saturating_sub(1);
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    app.mode = Mode::Dashboard { sel: (sel + 1).min(last) }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.mode = Mode::Dashboard { sel: sel.saturating_sub(1) }
+                }
+                KeyCode::Char('g') | KeyCode::Home => app.mode = Mode::Dashboard { sel: 0 },
+                KeyCode::Char('G') | KeyCode::End => app.mode = Mode::Dashboard { sel: last },
+                // Acts *and* leaves, like every other list in horde.
+                KeyCode::Enter => {
+                    let row = picks.get(sel).map(|i| rows[*i].clone());
+                    if let Some(cmd) = row.as_ref().and_then(dashboard_activate) {
+                        let _ = out.send(ClientFrame::Command(cmd));
+                    }
+                    // Opening a project shows you the project: its files, to pick one and
+                    // edit it. The multiplexer is a keystroke from there rather than the
+                    // thing you have to go through to reach anything.
+                    //
+                    // An agent that needs you is the exception — that row is a pane, and
+                    // the whole point of choosing it is to go and look at it.
+                    app.mode = match row {
+                        Some(ui::dashboard::Row::Attention { .. }) | None => Mode::Terminal,
+                        Some(_) => {
+                            // Asked for on the next snapshot rather than now: focusing a
+                            // space is a round trip, and a listing requested before it lands
+                            // is a listing of the project you just left.
+                            app.files = None;
+                            app.want_files = true;
+                            Mode::Files { query: String::new(), sel: 0 }
+                        }
+                    };
+                }
+                // The quote is "push P for project", and the habit is lower case, so both.
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    app.mode = Mode::SpaceSwitcher { query: String::new(), sel: 0 }
+                }
+                KeyCode::Char('n') => {
+                    let _ = out.send(ClientFrame::Command(Cmd::NewSpace { name: None }));
+                    app.mode = Mode::Terminal;
+                }
+                // The note side, straight from the menu. It never touches the multiplexer:
+                // writing a note is not a thing you should have to open a terminal to do.
+                KeyCode::Char('w') => return run_action(app, Action::NoteNew, out),
+                KeyCode::Char('N') => return run_action(app, Action::Notes, out),
+                KeyCode::Char('o') => return run_action(app, Action::Roster, out),
+                KeyCode::Char('D') => return run_action(app, Action::Cmd(Cmd::RequestDigest), out),
+                KeyCode::Char('.') => return run_action(app, Action::Settings, out),
+                KeyCode::Char('?') => return run_action(app, Action::Help, out),
+                // A greeter's `q` leaves the program, which is what every editor start screen
+                // has taught. Elsewhere in horde `q` backs out of a view; here there is no
+                // deeper place to back out to.
+                KeyCode::Char('q') => return run_action(app, Action::Detach, out),
+                KeyCode::Esc => app.mode = Mode::Terminal,
+                _ => {}
+            }
+            return Ok(());
+        }
+        Mode::Leader { mut pending, back } => {
+            // Esc abandons the whole sequence, however deep. Backspace steps back one key,
+            // so a mistyped middle key costs one press instead of starting over.
+            if k.code == KeyCode::Esc {
+                app.mode = *back;
+                return Ok(());
+            }
+            if k.code == KeyCode::Backspace {
+                // Stepping back off the last key returns to the open table rather than
+                // leaving it, so a wrong first key costs one press instead of two. Only a
+                // backspace with nothing left to undo actually exits.
+                app.mode = match pending.pop() {
+                    Some(_) => Mode::Leader { pending, back },
+                    None => *back,
+                };
+                return Ok(());
+            }
+
+            pending.push(chord);
+            match app.cfg.keys.leader_match(&pending) {
+                LeaderMatch::Action(a) => {
+                    let action = a.clone();
+                    app.mode = *back;
+                    return run_action(app, action, out);
+                }
+                // Still inside the table: hold the keys and wait for the rest.
+                LeaderMatch::Partial => {
+                    app.mode = Mode::Leader { pending, back };
+                    return Ok(());
+                }
+                // Nothing starts this way. The keys are dropped rather than forwarded —
+                // passing them on would type the sequence into whatever is in the pane.
+                LeaderMatch::None => {
+                    let typed =
+                        pending.iter().map(|c| c.describe()).collect::<Vec<_>>().join(" ");
+                    app.mode = *back;
+                    app.toast(
+                        NoticeLevel::Info,
+                        format!("leader {typed} is not bound — press {} ? for keys", app.cfg.prefix.describe()),
+                    );
+                    return Ok(());
+                }
+            }
+        }
         Mode::Terminal => {}
     }
 
@@ -837,6 +1567,13 @@ fn handle_key(
 
     if chord == app.cfg.prefix {
         app.mode = Mode::Prefix;
+        return Ok(());
+    }
+
+    // The leader, from a terminal pane. Bare `space` cannot do this job here — it is
+    // typing — which is why the leader has a chord of its own outside horde's own views.
+    if chord == app.cfg.leader {
+        app.mode = Mode::Leader { pending: Vec::new(), back: Box::new(Mode::Terminal) };
         return Ok(());
     }
 
@@ -936,7 +1673,7 @@ pub fn open_prompt(app: &mut App, prompt: Prompt) {
             app.pane_info(*p).and_then(|i| i.role.clone()).unwrap_or_default()
         }
         // Nothing sensible to prefill for these.
-        Prompt::NewSpace | Prompt::SendTo(_) | Prompt::RunCommand => String::new(),
+        Prompt::NewSpace | Prompt::SendTo(_) | Prompt::RunCommand | Prompt::NewNote => String::new(),
     };
     app.mode = Mode::Prompt { prompt, value };
 }
@@ -1107,6 +1844,12 @@ fn prompt_key(
             app.mode = Mode::Terminal;
             let v = value.trim().to_string();
             match prompt {
+                // Creating leaves you in the editor rather than back where you were: you
+                // asked for a note in order to write in it.
+                Prompt::NewNote => {
+                    create_note(app, &v, out);
+                    return Ok(());
+                }
                 Prompt::RenamePane(pane) => {
                     let _ = out.send(ClientFrame::Command(Cmd::RenamePane { pane, name: v }));
                 }
@@ -1330,6 +2073,89 @@ fn command_for(name: &str) -> Option<Cmd> {
     })
 }
 
+/// Ask the daemon for a note and open the reading view on it.
+/// Open a note for writing: fetch its body, then hand it to the editor.
+fn edit_note(app: &mut App, path: &str, out: &mpsc::UnboundedSender<ClientFrame>) {
+    if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+        let _ = out.send(ClientFrame::Command(Cmd::VaultQuery {
+            space,
+            kind: crate::proto::VaultQuery::Note { path: path.to_string() },
+        }));
+        app.opening_editor = true;
+    }
+}
+
+/// Make a note and start writing in it.
+///
+/// Works from anywhere — the start screen, a pane, another note — because a thought worth
+/// keeping rarely arrives while you happen to have the right directory open. When the
+/// project has no vault of its own the note goes to the home vault, which always exists.
+fn create_note(app: &mut App, title: &str, out: &mpsc::UnboundedSender<ClientFrame>) {
+    let title = title.trim();
+    if title.is_empty() {
+        return;
+    }
+    // A title is a filename here, so the characters a filename cannot hold come out.
+    let stem: String = title
+        .chars()
+        .map(|c| if "/\\:*?\"<>|".contains(c) { '-' } else { c })
+        .collect();
+    let path = format!("{}.md", stem.trim());
+    let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) else { return };
+    let _ = out.send(ClientFrame::Command(Cmd::VaultSave {
+        space,
+        path: path.clone(),
+        body: format!("# {title}\n\n"),
+    }));
+    app.buffer = Some(editor::Buffer::new(&format!("# {title}\n\n")));
+    if let Some(b) = app.buffer.as_mut() {
+        b.goto(2, 0); // past the heading, where you were going to type anyway
+    }
+    app.mode = Mode::Editor { path, scroll: 0, project: false };
+}
+
+fn read_note(app: &mut App, path: &str, out: &mpsc::UnboundedSender<ClientFrame>) {
+    if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+        let _ = out.send(ClientFrame::Command(Cmd::VaultQuery {
+            space,
+            kind: crate::proto::VaultQuery::Note { path: path.to_string() },
+        }));
+    }
+    app.mode = Mode::Reader { scroll: 0, link: 0 };
+}
+
+/// Open a note in `$EDITOR`, in a split beside whatever you were doing.
+///
+/// A real editor rather than one horde grew in a hurry: the knowledge layer is useful the
+/// day it can find a note, and the pane that opens is the one you already know how to use.
+/// Native buffers arrive in their own phase, and will have to earn the swap.
+fn open_note(app: &mut App, row: &ui::notes::Row, out: &mpsc::UnboundedSender<ClientFrame>) {
+    let Some(root) = app.vault.as_ref().map(|v| v.root.clone()) else { return };
+    let path = std::path::Path::new(&root).join(&row.path);
+    let editor = crate::client::settings::editor();
+    // Quoted: note names have spaces in them far more often than filenames usually do.
+    let cmd = format!("{editor} '{}'", path.to_string_lossy().replace('\'', r"'\''"));
+    let _ = out.send(ClientFrame::Command(Cmd::SpawnAgent {
+        cmd,
+        name: Some(row.title.clone()),
+        split: Some(crate::proto::Dir::Right),
+    }));
+}
+
+/// What pressing enter on a dashboard row asks the daemon to do.
+///
+/// A live project is *focused*; a remembered one is opened, which the daemon turns into a
+/// focus if a space is already on that directory. The row says which it is before you press
+/// anything, so enter never creates something you thought you were navigating to.
+fn dashboard_activate(row: &ui::dashboard::Row) -> Option<Cmd> {
+    match row {
+        ui::dashboard::Row::Attention { pane, .. } => Some(Cmd::FocusPane(*pane)),
+        ui::dashboard::Row::Live { space, .. } => Some(Cmd::FocusSpace(*space)),
+        ui::dashboard::Row::Recent { cwd, .. } => Some(Cmd::OpenProject { cwd: cwd.clone() }),
+        ui::dashboard::Row::Header(_) | ui::dashboard::Row::Hint(_) => None,
+    }
+}
+
 fn run_action(
     app: &mut App,
     action: Action,
@@ -1405,6 +2231,52 @@ fn run_action(
                     let _ = out.send(ClientFrame::Input { pane, bytes });
                 }
             }
+        }
+        Action::SendLeader => {
+            if let Some(pane) = app.focused_pane() {
+                let k = KeyEvent::new(app.cfg.leader.code, app.cfg.leader.mods);
+                if let Some(bytes) = input::encode_key(&k) {
+                    let _ = out.send(ClientFrame::Input { pane, bytes });
+                }
+            }
+        }
+        // Remembers where it was opened from, so leaving the table puts the keyboard back
+        // where it was rather than dropping you into a pane you were not using.
+        Action::Leader => app.mode = Mode::Leader { pending: Vec::new(), back: Box::new(Mode::Terminal) },
+        Action::Dashboard => app.mode = Mode::Dashboard { sel: 0 },
+        Action::Graph => {
+            if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+                let _ = out.send(ClientFrame::Command(Cmd::VaultQuery {
+                    space,
+                    kind: crate::proto::VaultQuery::Graph,
+                }));
+            }
+            // The layout is built when the answer arrives, not here: there is nothing to lay
+            // out until the daemon says what the graph is.
+            app.sim = None;
+            app.graph_zoom = 1.0;
+            app.mode = Mode::Graph { sel: 0 };
+        }
+        Action::NoteNew => {
+            app.mode = Mode::Prompt { prompt: Prompt::NewNote, value: String::new() }
+        }
+        Action::Files => {
+            if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+                let _ = out.send(ClientFrame::Command(Cmd::FileQuery { space }));
+            }
+            app.files = None;
+            app.mode = Mode::Files { query: String::new(), sel: 0 };
+        }
+        Action::Notes => {
+            // Ask as the view opens rather than caching: notes change under horde's feet,
+            // and the answer is one round trip on a socket that is already connected.
+            if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+                let _ = out.send(ClientFrame::Command(Cmd::VaultQuery {
+                    space,
+                    kind: crate::proto::VaultQuery::List,
+                }));
+            }
+            app.mode = Mode::Notes { query: String::new(), sel: 0 };
         }
     }
     Ok(())
@@ -1541,6 +2413,24 @@ fn handle_mouse(
                 app.mode = Mode::Roster { scroll: scroll.saturating_sub(1) }
             }
             _ => {}
+        }
+        return Ok(());
+    }
+
+    // Clicks on the start screen open the row under the pointer, the same rows `j` walks.
+    if let Mode::Dashboard { .. } = app.mode {
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some((_, row)) = app.dashboard_hits.iter().find(|(hy, _)| *hy == y).copied() {
+                let rows = app
+                    .snapshot
+                    .as_ref()
+                    .map(|s| ui::dashboard::rows(s, ui::now_millis()))
+                    .unwrap_or_default();
+                if let Some(cmd) = rows.get(row).and_then(dashboard_activate) {
+                    let _ = out.send(ClientFrame::Command(cmd));
+                    app.mode = Mode::Terminal;
+                }
+            }
         }
         return Ok(());
     }
@@ -1758,6 +2648,7 @@ mod tests {
                 accent: 0,
                 collapsed: false,
                 repo: None,
+                notes: None,
             }],
             tabs,
             panes: vec![],
@@ -1772,6 +2663,7 @@ mod tests {
             tasks_open: 0,
             tasks_claimed: 0,
             triggers_armed: 0,
+            recents: Vec::new(),
         };
 
         // Walk the bar and collect which tab each column maps to.
@@ -1828,8 +2720,7 @@ mod tests {
 
     #[test]
     fn notifications_can_be_switched_off_entirely() {
-        let mut cfg = Config::default();
-        cfg.notify = Notify::Off;
+        let cfg = Config { notify: Notify::Off, ..Config::default() };
         let mut app = App::new(cfg);
         app.toast(NoticeLevel::Warn, "should not appear");
         assert!(app.toasts.is_empty());
@@ -1849,9 +2740,9 @@ mod tests {
             expects_reply: false,
             reply_to: None,
         };
-        apply_frame(&mut app, ServerFrame::Event(crate::proto::Event::BusMessage(queued.clone())));
+        apply_frame(&mut app, ServerFrame::Event(crate::proto::Event::BusMessage(queued.clone())), &sink());
         let delivered = Message { delivery: crate::proto::Delivery::Delivered, ..queued };
-        apply_frame(&mut app, ServerFrame::Event(crate::proto::Event::BusMessage(delivered)));
+        apply_frame(&mut app, ServerFrame::Event(crate::proto::Event::BusMessage(delivered)), &sink());
 
         assert_eq!(app.bus.len(), 1, "the same message must not appear twice");
         assert_eq!(app.bus[0].delivery, crate::proto::Delivery::Delivered);
@@ -1867,6 +2758,7 @@ mod tests {
                 rows: vec![crate::proto::RowUpdate { y: 3, row: Row::default() }],
                 cursor: None,
             },
+            &sink(),
         );
         assert_eq!(app.rows[&1].len(), 4, "a sparse update must grow the cache");
     }
@@ -1874,7 +2766,7 @@ mod tests {
     #[test]
     fn bye_ends_the_session_with_its_reason() {
         let mut app = App::new(Config::default());
-        let r = apply_frame(&mut app, ServerFrame::Bye { reason: "mismatch".into() });
+        let r = apply_frame(&mut app, ServerFrame::Bye { reason: "mismatch".into() }, &sink());
         assert_eq!(r.as_deref(), Some("mismatch"));
     }
 
@@ -1908,6 +2800,221 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A sender for tests that only care what a frame does to `App`, not what it replies.
+    fn sink() -> mpsc::UnboundedSender<ClientFrame> {
+        mpsc::unbounded_channel().0
+    }
+
+    /// `press` only sends unmodified keys, and the leader is `ctrl+space`.
+    fn press_chord(app: &mut App, spec: &str) -> Vec<ClientFrame> {
+        let c = Chord::parse(spec).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handle_key(app, KeyEvent::new(c.code, c.mods), &tx).unwrap();
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            out.push(f);
+        }
+        out
+    }
+
+    /// Opening horde is arriving, and arriving shows you the state of things. Every attach
+    /// starts here — including a reattach to a session full of running agents, because what
+    /// you want after being away is the board, not whichever pane was last focused.
+    #[test]
+    fn every_attach_opens_on_the_start_screen() {
+        for panes in [0, 3] {
+            let mut app = App::new_for_test(Config::default());
+            let mut snap = crate::client::roster::tests::snap();
+            snap.panes.truncate(panes);
+            apply_frame(&mut app, ServerFrame::Snapshot(Box::new(snap)), &sink());
+            assert!(
+                matches!(app.mode, Mode::Dashboard { .. }),
+                "a session with {panes} panes still greets you"
+            );
+        }
+    }
+
+    /// The decision is made once. A later snapshot — a pane closing, an agent finishing —
+    /// must not yank someone back to a start screen while they are working.
+    #[test]
+    fn a_later_snapshot_cannot_pull_you_back_to_the_greeter() {
+        let mut app = App::new_for_test(Config::default());
+        let snap = crate::client::roster::tests::snap();
+        apply_frame(&mut app, ServerFrame::Snapshot(Box::new(snap.clone())), &sink());
+        app.mode = Mode::Terminal; // you pressed esc and got to work
+        apply_frame(&mut app, ServerFrame::Snapshot(Box::new(snap)), &sink());
+        assert_eq!(app.mode, Mode::Terminal, "it stays where you left it");
+    }
+
+    /// Turning it off has to actually turn it off, on the one path that shows it.
+    #[test]
+    fn the_greeter_can_be_switched_off() {
+        let cfg = Config { dashboard: false, ..Config::default() };
+        let mut app = App::new_for_test(cfg);
+        let snap = crate::client::roster::tests::snap();
+        apply_frame(&mut app, ServerFrame::Snapshot(Box::new(snap)), &sink());
+        assert_eq!(app.mode, Mode::Terminal);
+    }
+
+    /// Enter on a remembered project asks the daemon to open it, and enter on a live one
+    /// merely goes there — the row says which before you press anything.
+    #[test]
+    fn enter_opens_a_remembered_project_and_focuses_a_live_one() {
+        use crate::client::ui::dashboard::Row;
+        assert_eq!(
+            dashboard_activate(&Row::Recent {
+                cwd: "/tmp/blog".into(),
+                name: "blog".into(),
+                when: "3d ago".into()
+            }),
+            Some(Cmd::OpenProject { cwd: "/tmp/blog".into() })
+        );
+        assert_eq!(
+            dashboard_activate(&Row::Live {
+                space: 4,
+                name: "api".into(),
+                accent: 0,
+                facts: String::new(),
+                cwd: "/tmp/api".into()
+            }),
+            Some(Cmd::FocusSpace(4))
+        );
+        assert_eq!(dashboard_activate(&Row::Header("projects".into())), None);
+    }
+
+    /// The bug this pins: a file was read from whatever space was focused *now*, while the
+    /// listing had come from the space that was focused when it was asked for. Those differ
+    /// for exactly as long as a focus change takes to round-trip — which is precisely when
+    /// somebody opens a project and picks a file, so every such file was looked for in the
+    /// project they had just left, and reported missing.
+    #[test]
+    fn a_file_is_read_from_the_project_its_listing_came_from() {
+        let mut app = app_with_snapshot();
+        let focused = app.snapshot.as_ref().and_then(|s| s.focused_space).expect("a space");
+        let listing_space = focused + 7; // a different project, as after an unlanded focus change
+        app.files = Some(crate::proto::FileList {
+            space: listing_space,
+            root: "/somewhere/else".into(),
+            // At the root, so the first row is the file rather than the folder holding it.
+            files: vec!["main.rs".into()],
+            truncated: false,
+            body: None,
+            path: None,
+        });
+        app.mode = Mode::Files { query: String::new(), sel: 0 };
+
+        let out = press_chord(&mut app, "enter");
+        let sent: Vec<&Cmd> = out
+            .iter()
+            .filter_map(|f| match f {
+                ClientFrame::Command(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![&Cmd::FileRead { space: listing_space, path: "main.rs".into() }],
+            "read from the listing's project, not the focused one"
+        );
+    }
+
+    /// Enter on a folder opens it rather than trying to edit it, and closes it again.
+    #[test]
+    fn enter_on_a_folder_folds_it_instead_of_opening_a_file() {
+        let mut app = app_with_snapshot();
+        app.files = Some(crate::proto::FileList {
+            space: 1,
+            root: "/p".into(),
+            files: vec!["src/main.rs".into()],
+            truncated: false,
+            body: None,
+            path: None,
+        });
+        app.mode = Mode::Files { query: String::new(), sel: 0 };
+
+        let out = press_chord(&mut app, "enter");
+        assert!(out.is_empty(), "a folder is not a file to open: {out:?}");
+        assert!(app.open_dirs.contains("src"), "it opened");
+        press_chord(&mut app, "enter");
+        assert!(!app.open_dirs.contains("src"), "and closes again");
+    }
+
+    /// The control for the leak tests below. If an ordinary keystroke did not reach the pane
+    /// here, then "nothing reached the pane" would prove nothing about abandoned sequences.
+    #[test]
+    fn an_ordinary_key_still_reaches_the_pane() {
+        let mut app = app_with_snapshot();
+        assert!(
+            press_chord(&mut app, "w").iter().any(|f| matches!(f, ClientFrame::Input { .. })),
+            "a plain key must still be typing"
+        );
+    }
+
+    /// The failure this whole design is arranged around: keys held back for a sequence that
+    /// turns out not to exist are *dropped*, never flushed to the pane. Replaying them would
+    /// type `wv` at an agent you were only ever looking at.
+    #[test]
+    fn abandoning_a_leader_sequence_types_nothing_into_the_pane() {
+        let mut app = app_with_snapshot();
+        press_chord(&mut app, "ctrl+space");
+        let held = press_chord(&mut app, "w"); // a real group: still waiting
+        assert!(matches!(app.mode, Mode::Leader { .. }), "half a sequence must hold");
+        assert!(held.is_empty(), "a held key does not act");
+        let after = press_chord(&mut app, "esc");
+        assert_eq!(app.mode, Mode::Terminal, "esc leaves the table");
+        assert!(after.is_empty(), "an abandoned sequence must not reach the pane, and must not act");
+    }
+
+    /// The other half of the same rule: a dead end is dropped too, and says so, rather than
+    /// silently swallowing the keys or spraying them at the program.
+    #[test]
+    fn an_unbound_leader_sequence_is_dropped_with_a_hint() {
+        let mut app = app_with_snapshot();
+        press_chord(&mut app, "ctrl+space");
+        let out = press_chord(&mut app, "y"); // starts nothing
+        assert_eq!(app.mode, Mode::Terminal);
+        assert!(out.is_empty(), "an unbound sequence must not reach the pane");
+        assert!(!app.toasts.is_empty(), "and it should say why");
+    }
+
+    /// A completed sequence acts and leaves, so the common path never parks you in a mode
+    /// you then have to notice and escape.
+    #[test]
+    fn a_completed_leader_sequence_acts_and_exits() {
+        let mut app = app_with_snapshot();
+        press_chord(&mut app, "ctrl+space");
+        press_chord(&mut app, "w");
+        let out = press_chord(&mut app, "v");
+        assert_eq!(app.mode, Mode::Terminal);
+        assert_eq!(cmds(out), vec![Cmd::SplitRight], "leader w v splits right");
+    }
+
+    /// Backspace steps back one key rather than dumping the sequence, so a mistyped middle
+    /// key costs one press instead of starting over.
+    #[test]
+    fn backspace_walks_back_out_of_a_leader_sequence_one_key_at_a_time() {
+        let mut app = app_with_snapshot();
+        press_chord(&mut app, "ctrl+space");
+        press_chord(&mut app, "w");
+        press_chord(&mut app, "backspace");
+        assert!(
+            matches!(&app.mode, Mode::Leader { pending, .. } if pending.is_empty()),
+            "one key back, still in the table"
+        );
+        press_chord(&mut app, "backspace");
+        assert_eq!(app.mode, Mode::Terminal, "backing out of an empty sequence leaves");
+    }
+
+    /// The leader has to be reachable when its own chord is not, because `ctrl+space` is
+    /// `set-mark` to a terminal full of emacs users — and one of them will rebind it.
+    #[test]
+    fn the_prefix_opens_the_leader_table_too() {
+        let mut app = app_with_snapshot();
+        press_chord(&mut app, "ctrl+b");
+        press_chord(&mut app, "space");
+        assert!(matches!(app.mode, Mode::Leader { .. }));
     }
 
     /// The whole justification for a mode: bare `j` and `k` walk the list instead of being

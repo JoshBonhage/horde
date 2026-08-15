@@ -35,11 +35,14 @@ pub enum Prompt {
     SendTo(PaneId),
     /// Run a command in a new pane.
     RunCommand,
+    /// Title for a new note.
+    NewNote,
 }
 
 impl Prompt {
     pub fn title(&self) -> &'static str {
         match self {
+            Prompt::NewNote => "new note",
             Prompt::RenamePane(_) => "rename pane",
             Prompt::SetRole(_) => "role for this pane",
             Prompt::RenameSpace(_) => "rename space",
@@ -432,6 +435,7 @@ mod tests {
                 accent: 0,
                 collapsed: false,
                 repo: None,
+                notes: None,
             }],
             tabs: vec![TabInfo {
                 id: 1,
@@ -452,6 +456,7 @@ mod tests {
             tasks_open: 0,
             tasks_claimed: 0,
             triggers_armed: 0,
+            recents: Vec::new(),
         }
     }
 

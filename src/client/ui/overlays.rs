@@ -40,9 +40,104 @@ fn panel(f: &mut Frame, area: TRect, title: &str, theme: &Theme) -> TRect {
     inner
 }
 
+/// Rows of `key → where it leads` for the leader sequence typed so far.
+///
+/// Split out from the drawing so it can be asserted as text, the way every other content
+/// builder in this crate is: what the popup *says* is worth a test, and standing up a
+/// terminal to find out is not.
+pub fn which_key_rows(app: &App, pending: &[crate::config::Chord]) -> Vec<(String, String)> {
+    app.cfg
+        .keys
+        .leader_continuations(pending)
+        .into_iter()
+        .map(|(chord, label, is_group)| {
+            // which-key's own convention: a `+` means there is another key behind this one.
+            let label = if is_group { format!("+{label}") } else { label };
+            (chord.describe(), label)
+        })
+        .collect()
+}
+
+/// The leader table, as far as it has been typed.
+///
+/// Anchored to the bottom of the screen above the status bar, so the eye that just read the
+/// `LEADER` chip travels the shortest possible distance to find out what it can press next.
+pub fn which_key(f: &mut Frame, area: TRect, app: &App, pending: &[crate::config::Chord]) {
+    let theme = app.cfg.theme.clone();
+    let rows = which_key_rows(app, pending);
+    if rows.is_empty() {
+        return;
+    }
+
+    // Widest key and label decide the column, so nothing is truncated mid-word.
+    let widest_key = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(1);
+    let label_w = rows.iter().map(|(_, l)| l.chars().count()).max().unwrap_or(1);
+    let col_w = (widest_key + label_w + 5) as u16;
+    let usable = area.width.saturating_sub(4).max(col_w);
+    let cols = (usable / col_w).clamp(1, 4) as usize;
+    let lines = rows.len().div_ceil(cols);
+    // Never eat more than half the screen: a hint that hides the work is not a hint.
+    let lines = lines.min((area.height.saturating_sub(4) / 2).max(1) as usize);
+
+    let h = lines as u16 + 2;
+    let w = (col_w * cols as u16 + 2).min(area.width);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    // One row up from the very bottom, where the status bar lives.
+    let y = area.y + area.height.saturating_sub(h + 1);
+    let outer = TRect { x, y, width: w, height: h };
+
+    let typed = pending.iter().map(|c| c.describe()).collect::<Vec<_>>().join(" ");
+    let title = if typed.is_empty() { "leader".to_string() } else { format!("leader {typed}") };
+    let inner = panel(f, outer, &title, &theme);
+
+    // Each column sizes its own key field. One long chord like `ctrl+space` would otherwise
+    // indent every single-letter key in the popup by nine columns of nothing.
+    let key_w_for = |col: usize| {
+        rows.iter()
+            .skip(col * lines)
+            .take(lines)
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(1)
+    };
+
+    for (i, (key, label)) in rows.iter().enumerate().take(lines * cols) {
+        let (col, row) = (i / lines, i % lines);
+        let key_w = key_w_for(col);
+        let cx = inner.x + col as u16 * col_w;
+        let cy = inner.y + row as u16;
+        if cy >= inner.y + inner.height {
+            continue;
+        }
+        let spans = vec![
+            Span::styled(
+                format!("{key:>key_w$}"),
+                Style::default()
+                    .fg(color(theme.ui.accent))
+                    .bg(color(theme.ui.panel_bg))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ".to_string(),
+                Style::default().bg(color(theme.ui.panel_bg)),
+            ),
+            Span::styled(
+                label.clone(),
+                Style::default()
+                    // Groups read dimmer than leaves: the eye should land on what *acts*.
+                    .fg(color(if label.starts_with('+') { theme.ui.text_dim } else { theme.ui.text }))
+                    .bg(color(theme.ui.panel_bg)),
+            ),
+        ];
+        let w = col_w.min(inner.width.saturating_sub(cx - inner.x));
+        put_line(f.buffer_mut(), cx, cy, w, Line::from(spans));
+    }
+}
+
 pub fn help(f: &mut Frame, area: TRect, app: &App) {
     let theme = app.cfg.theme.clone();
     let prefix = app.cfg.prefix.describe();
+    let leader = app.cfg.leader.describe();
 
     // Only prefix bindings and direct chords are worth listing; unbound actions are not.
     let mut rows: Vec<(String, String)> = Vec::new();
@@ -50,6 +145,7 @@ pub fn help(f: &mut Frame, area: TRect, app: &App) {
         let key = match trigger {
             Trigger::Prefix(c) => format!("{prefix} {}", c.describe()),
             Trigger::Direct(c) => c.describe(),
+            Trigger::Leader(s) => format!("{leader} {}", s.describe()),
         };
         let desc = describe_action(&name, &action);
         rows.push((key, desc));
@@ -120,6 +216,13 @@ fn describe_action(name: &str, action: &Action) -> String {
         Action::RenamePane => "rename the focused pane".into(),
         Action::Settings => "settings".into(),
         Action::SendPrefix => "send the prefix key to the pane".into(),
+        Action::SendLeader => "send the leader key to the pane".into(),
+        Action::Leader => "open the leader table".into(),
+        Action::Dashboard => "the start screen".into(),
+        Action::Notes => "this project's notes".into(),
+        Action::NoteNew => "write a new note".into(),
+        Action::Files => "this project's files".into(),
+        Action::Graph => "how the notes link up".into(),
         Action::SidebarFocus => "walk the sidebar with j/k".into(),
         Action::TogglePin => "pin this agent to the top of the sidebar".into(),
         Action::Roster => "every project and agent, full screen".into(),
@@ -855,8 +958,61 @@ pub struct Item {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Keymap;
+    use crate::config::{Chord, Keymap};
     use crate::proto::TaskLine;
+
+    // -- which-key ---------------------------------------------------------------------
+
+    /// The popup is the only thing standing between a leader table and a keymap nobody can
+    /// remember, so what it *says* is worth pinning: groups marked, leaves named, and the
+    /// canonical `leader_` prefix stripped so rows read as English rather than as identifiers.
+    #[test]
+    fn which_key_names_groups_and_leaves_the_way_a_reader_expects() {
+        let app = App::new_for_test(crate::config::Config::default());
+        let rows = which_key_rows(&app, &[]);
+        let find = |k: &str| rows.iter().find(|(c, _)| c == k).map(|(_, l)| l.clone());
+
+        assert_eq!(find("w").as_deref(), Some("+window"), "a group is marked with +: {rows:?}");
+        assert_eq!(find("a").as_deref(), Some("+agent"), "cut at a segment, not mid-word");
+        assert_eq!(find("space").as_deref(), Some("finder"), "a leaf reads plainly");
+        assert!(find("?").is_some(), "help is reachable from the leader: {rows:?}");
+
+        let inside = which_key_rows(&app, &[Chord::parse("w").unwrap()]);
+        assert!(
+            inside.iter().any(|(k, l)| k == "v" && l == "split right"),
+            "one level in, the leaves are spelled out: {inside:?}"
+        );
+    }
+
+    /// It anchors above the status bar and never eats the screen: a hint that hides the work
+    /// it is hinting about has stopped being a hint.
+    #[test]
+    fn which_key_draws_above_the_status_bar_without_taking_the_screen() {
+        let app = App::new_for_test(crate::config::Config::default());
+        let area = TRect::new(0, 0, 100, 30);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| which_key(f, area, &app, &[])).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let text: String = (0..area.height)
+            .map(|y| {
+                (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n"
+            })
+            .collect();
+        assert!(text.contains("leader"), "titled with the sequence so far:\n{text}");
+        assert!(text.contains("+window"), "groups are listed:\n{text}");
+
+        let painted: Vec<u16> = (0..area.height)
+            .filter(|y| (0..area.width).any(|x| buf[(x, *y)].symbol() != " "))
+            .collect();
+        let lowest = *painted.iter().max().expect("something was drawn");
+        assert!(lowest < area.height - 1, "the status bar row stays clear");
+        assert!(
+            painted.len() as u16 <= area.height / 2,
+            "at most half the screen, got {} rows",
+            painted.len()
+        );
+    }
 
     // -- the approval queue ------------------------------------------------------------
 

@@ -158,6 +158,29 @@ impl Widget for StatusBar<'_> {
                     .fg(color(t.ui.bg))
                     .add_modifier(Modifier::BOLD),
             )),
+            // The trail is the feedback. A leader sequence spans several keys, so showing
+            // only "LEADER" would leave you unable to tell `w` from `w v` half-typed.
+            Mode::Leader { pending, .. } => {
+                let trail = pending.iter().map(|c| c.describe()).collect::<Vec<_>>().join(" ");
+                let label =
+                    if trail.is_empty() { " LEADER ".to_string() } else { format!(" LEADER {trail} ") };
+                left.push(Span::styled(
+                    label,
+                    Style::default()
+                        .bg(color(t.ui.accent))
+                        .fg(color(t.ui.bg))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            Mode::Dashboard { .. } => left.push(chip(" HOME ", t.ui.accent_alt, t)),
+            Mode::Notes { .. } => left.push(chip(" NOTES ", t.ui.accent_alt, t)),
+            Mode::Graph { .. } => left.push(chip(" GRAPH ", t.ui.accent_alt, t)),
+            Mode::Reader { .. } => left.push(chip(" READING ", t.ui.accent_alt, t)),
+            // Its own colour, like the approval queue: this is the mode where a keystroke
+            // changes a file, and it should not look like the ones where it does not.
+            Mode::Editor { .. } => left.push(chip(" WRITING ", t.ui.working, t)),
+            Mode::Setup { .. } => left.push(chip(" SETUP ", t.ui.accent_alt, t)),
+            Mode::Files { .. } => left.push(chip(" FILES ", t.ui.accent_alt, t)),
             Mode::Help => left.push(chip(" HELP ", t.ui.accent_alt, t)),
             Mode::Palette { .. } => left.push(chip(" COMMAND ", t.ui.accent_alt, t)),
             Mode::SpaceSwitcher { .. } => left.push(chip(" SPACE ", t.ui.accent_alt, t)),
@@ -319,6 +342,7 @@ mod tests {
                 accent: 0,
                 collapsed: false,
                 repo: None,
+                notes: None,
             }],
             tabs: tab_list,
             panes,
@@ -333,6 +357,7 @@ mod tests {
             tasks_open: 0,
             tasks_claimed: 0,
             triggers_armed: 0,
+            recents: Vec::new(),
         }
     }
 
