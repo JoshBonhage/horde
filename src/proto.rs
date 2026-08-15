@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -414,6 +414,12 @@ pub struct SpaceInfo {
     /// different question from what any one agent is working on: see `PaneInfo::repo`.
     #[serde(default)]
     pub repo: Option<RepoInfo>,
+    /// Notes indexed for this project, or `None` when it has no vault at all.
+    ///
+    /// A count rather than the notes: this struct is broadcast on every shape change, and a
+    /// vault's contents are unbounded. The notes themselves come back from a query.
+    #[serde(default)]
+    pub notes: Option<usize>,
 }
 
 /// Everything the client needs to draw a frame apart from cell contents.
@@ -447,6 +453,27 @@ pub struct Snapshot {
     /// answering is "can this thing act on its own", and a disarmed switch means no.
     #[serde(default)]
     pub triggers_armed: usize,
+    /// Projects opened before, most recent first — the dashboard's memory.
+    ///
+    /// Kept by the daemon rather than the client because the daemon is the thing that
+    /// outlives every attach, and because a client on another machine has no business
+    /// deciding what this session has been working on.
+    #[serde(default)]
+    pub recents: Vec<RecentProject>,
+}
+
+/// A project the session has opened before.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentProject {
+    /// The space's name when it was last open, which is usually the directory's.
+    pub name: String,
+    pub cwd: String,
+    /// Unix millis, for ordering and for "3 days ago".
+    pub last_used: u64,
+    /// True while a space is open on it, so the dashboard can say "3 agents" instead of
+    /// offering to reopen something already on screen.
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// Panel visibility. Lives in the daemon so geometry has exactly one owner.
@@ -589,6 +616,29 @@ pub enum Cmd {
     ToggleSpaceCollapsed(SpaceId),
     /// Hold a pane at the top of the sidebar's agent list.
     TogglePanePinned(PaneId),
+    /// Ask what is in a project's vault. Answered with [`ServerFrame::Vault`] to the asking
+    /// client only — the second command with a result rather than an effect, after
+    /// `RequestDigest`, and for the same reason: note lists are unbounded and change often,
+    /// so they have no business riding a snapshot everyone gets.
+    VaultQuery { space: SpaceId, kind: VaultQuery },
+    /// Write a note, creating it if it is not there. Answered with the saved note, so the
+    /// view it came from can show what is now on disk rather than what it hoped was.
+    VaultSave { space: SpaceId, path: String, body: String },
+    /// Set up a vault where there is not one yet: the directory, its marker, a first note.
+    VaultInit { space: SpaceId },
+    /// What is in a project: its files, so opening one shows the project rather than a
+    /// terminal that happens to be sitting in it.
+    FileQuery { space: SpaceId },
+    /// Write a project file. Relative to the project root, and jailed to it.
+    FileSave { space: SpaceId, path: String, body: String },
+    /// One project file's text, for editing.
+    FileRead { space: SpaceId, path: String },
+    /// Open a project directory: focus the space already on it, or make one if there is none.
+    ///
+    /// Focus-or-create rather than always-create, because the dashboard offers live projects
+    /// and remembered ones in the same list, and pressing enter on the one you are already
+    /// running should take you there rather than start a second copy of it.
+    OpenProject { cwd: String },
 }
 
 // Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
@@ -597,6 +647,87 @@ pub enum Cmd {
 // other variant, reads a field that is not there, and drops the connection. Found the hard way:
 // clicking a pane killed the session while every keybinding above the inserted variant still
 // worked.
+
+/// What to ask a vault. Append new kinds at the end, like every other wire enum.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum VaultQuery {
+    /// Every note, newest first.
+    List,
+    /// Notes matching a query, best first.
+    Search { q: String },
+    /// One note in full, with its backlinks.
+    Note { path: String },
+    /// The whole link graph: what to draw, not where to draw it.
+    ///
+    /// Positions are the client's business. The daemon knows which notes link to which, and
+    /// a layout is a property of the terminal it is being drawn in — sending coordinates
+    /// would mean the daemon owning a screen it cannot see.
+    Graph,
+}
+
+/// One note in the graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphNode {
+    /// Empty for a ghost — a link target nobody has written yet.
+    pub path: String,
+    pub label: String,
+    /// Links in plus links out, which is what decides how big a node draws.
+    pub degree: u16,
+    /// Groups nodes by their first tag, else their folder, so a cluster has a colour.
+    pub group: String,
+    /// A link target with no note behind it. Drawn hollow: it is a note somebody meant to
+    /// write, and that is worth seeing rather than hiding.
+    pub ghost: bool,
+}
+
+/// A project's files, as the file browser shows them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileList {
+    pub space: SpaceId,
+    pub root: String,
+    /// Relative paths, sorted.
+    pub files: Vec<String>,
+    /// True when there were more than the daemon was willing to list.
+    pub truncated: bool,
+    /// Set by `FileRead` and `FileSave`: the file's text and which file it is.
+    pub body: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VaultGraph {
+    pub nodes: Vec<GraphNode>,
+    /// Indices into `nodes`.
+    pub edges: Vec<(u16, u16)>,
+}
+
+/// A note as a list shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteLine {
+    /// Relative to the vault root, and the identity a `Note` query takes.
+    pub path: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    /// Unix millis.
+    pub mtime: u64,
+    /// How many notes point at this one.
+    pub backlinks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VaultReply {
+    pub space: SpaceId,
+    /// Absolute path of the vault root, so a client can show where it is reading from.
+    pub root: String,
+    pub notes: Vec<NoteLine>,
+    /// Set for a `Note` query: the note's own text.
+    pub body: Option<String>,
+    /// Set for a `Note` query: what links here.
+    pub backlinks: Vec<NoteLine>,
+    /// Set for a `Graph` query.
+    #[serde(default)]
+    pub graph: Option<VaultGraph>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dir {
@@ -623,6 +754,10 @@ pub enum ServerFrame {
     Digest(Box<Digest>),
     /// Protocol mismatch or daemon shutting down.
     Bye { reason: String },
+    /// Answer to [`Cmd::VaultQuery`], for the note browser.
+    Vault(Box<VaultReply>),
+    /// Answer to [`Cmd::FileQuery`] and friends, for the file browser and editor.
+    Files(Box<FileList>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -887,6 +1022,163 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 7, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 13, "bump this whenever a wire struct or enum changes");
+    }
+
+    /// The assert above is a reminder, not a detector. It fires when you *do* bump the
+    /// version, never when you *should have*: appending a variant or adding a field leaves
+    /// every test in this file green, and the change ships silently. A newer client then
+    /// sends a shape the running daemon cannot decode, and the handshake built to catch
+    /// exactly that stays quiet, because the number it compares never moved.
+    ///
+    /// These functions close that hole, and they are the reason to keep them ugly. Every
+    /// `match` is exhaustive with no `_` arm; every struct is destructured with no `..`. So
+    /// **adding a variant or a field stops the build right here**, in the one place that
+    /// says what to do about it: append (never insert), then bump `PROTOCOL_VERSION` and the
+    /// assert above.
+    ///
+    /// They are never called, and must not be. Being forced to edit them is the whole test.
+    #[test]
+    fn a_new_variant_or_field_cannot_reach_the_wire_unnoticed() {
+        #[allow(dead_code)]
+        fn every_cmd(c: Cmd) {
+            match c {
+                Cmd::SplitRight
+                | Cmd::SplitDown
+                | Cmd::ClosePane
+                | Cmd::FocusDir(..)
+                | Cmd::Resize { .. }
+                | Cmd::ToggleZoom
+                | Cmd::SwapDir(..)
+                | Cmd::NewTab
+                | Cmd::NextTab
+                | Cmd::PrevTab
+                | Cmd::GotoTab(..)
+                | Cmd::CloseTab
+                | Cmd::NewSpace { .. }
+                | Cmd::FocusSpace(..)
+                | Cmd::NextSpace
+                | Cmd::PrevSpace
+                | Cmd::ToggleSidebar
+                | Cmd::ToggleBus
+                | Cmd::JumpAttention
+                | Cmd::Scroll { .. }
+                | Cmd::ScrollBottom { .. }
+                | Cmd::FocusPane(..)
+                | Cmd::RenamePane { .. }
+                | Cmd::SpawnAgent { .. }
+                | Cmd::ApplyLayout { .. }
+                | Cmd::RenameSpace { .. }
+                | Cmd::RenameTab { .. }
+                | Cmd::CloseSpace(..)
+                | Cmd::FocusTab(..)
+                | Cmd::NewTabIn(..)
+                | Cmd::RequestDigest
+                | Cmd::Redraw
+                | Cmd::SetSpaceAccent { .. }
+                | Cmd::SetPaneRole { .. }
+                | Cmd::ToggleSpaceCollapsed(..)
+                | Cmd::TogglePanePinned(..)
+                | Cmd::VaultQuery { .. }
+                | Cmd::VaultSave { .. }
+                | Cmd::VaultInit { .. }
+                | Cmd::FileQuery { .. }
+                | Cmd::FileSave { .. }
+                | Cmd::FileRead { .. }
+                | Cmd::OpenProject { .. } => {}
+            }
+        }
+
+        #[allow(dead_code)]
+        fn every_frame(c: ClientFrame, s: ServerFrame, e: Event) {
+            match c {
+                ClientFrame::Input { .. }
+                | ClientFrame::Resize { .. }
+                | ClientFrame::Focus { .. }
+                | ClientFrame::Command(..)
+                | ClientFrame::Ping
+                | ClientFrame::Detach => {}
+            }
+            match s {
+                ServerFrame::Snapshot(..)
+                | ServerFrame::Rows { .. }
+                | ServerFrame::Event(..)
+                | ServerFrame::Digest(..)
+                | ServerFrame::Bye { .. }
+                | ServerFrame::Vault(..)
+                | ServerFrame::Files(..) => {}
+            }
+            match e {
+                Event::AgentStateChanged { .. }
+                | Event::BusMessage(..)
+                | Event::PaneExited { .. }
+                | Event::Notice { .. } => {}
+            }
+        }
+
+        #[allow(dead_code)]
+        fn every_field(snap: &Snapshot, pane: &PaneInfo, space: &SpaceInfo, tab: &TabInfo, view: &ViewState) {
+            let Snapshot {
+                protocol: _,
+                daemon_version: _,
+                spaces: _,
+                tabs: _,
+                panes: _,
+                focused_space: _,
+                focused_tab: _,
+                focused_pane: _,
+                view: _,
+                sidebar: _,
+                bus: _,
+                status: _,
+                tabbar: _,
+                tasks_open: _,
+                tasks_claimed: _,
+                triggers_armed: _,
+                recents: _,
+            } = snap;
+            let PaneInfo {
+                id: _,
+                tab: _,
+                space: _,
+                title: _,
+                cwd: _,
+                cell: _,
+                content: _,
+                cols: _,
+                rows: _,
+                agent: _,
+                spawned_by: _,
+                exited: _,
+                scroll_offset: _,
+                wants_mouse: _,
+                bracketed_paste: _,
+                role: _,
+                pinned: _,
+                board: _,
+                repo: _,
+            } = pane;
+            let SpaceInfo {
+                id: _,
+                name: _,
+                cwd: _,
+                tabs: _,
+                focused_tab: _,
+                agent_count: _,
+                attention_count: _,
+                accent: _,
+                collapsed: _,
+                repo: _,
+                notes: _,
+            } = space;
+            let TabInfo { id: _, space: _, name: _, panes: _, focused_pane: _ } = tab;
+            let ViewState {
+                sidebar_open: _,
+                bus_open: _,
+                sidebar_width: _,
+                bus_width: _,
+                zoom: _,
+            } = view;
+        }
     }
 }

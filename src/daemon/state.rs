@@ -1030,6 +1030,9 @@ impl Session {
                     accent: s.accent,
                     collapsed: s.collapsed,
                     repo: repo_info(repos, &s.cwd),
+                    // Filled in by the daemon, which owns the indexes. The session knows
+                    // where a project is, not what is written down about it.
+                    notes: None,
                 }
             })
             .collect();
@@ -1049,6 +1052,9 @@ impl Session {
             status: self.chrome.status,
             tabbar: self.chrome.tabbar,
             // Filled in by the engine, which owns the board and the trigger set.
+            // Filled in by the daemon, which owns the history. The session knows where a
+            // project is, not which ones have been visited.
+            recents: Vec::new(),
             tasks_open: 0,
             tasks_claimed: 0,
             triggers_armed: 0,
