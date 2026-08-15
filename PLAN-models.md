@@ -182,7 +182,7 @@ Everything here is Linux-side, so it mostly just works — with four specifics.
   gets a thin one. This is the same class of bug as the `/bin/zsh` fallback. Phase 1's `[env]`
   config table is the fix — the key is read from config by the daemon, not inherited by luck.
 
-## Phase 5 — succession: when the agent itself runs out — **the warning half is shipped**
+## Phase 5 — succession: when the agent itself runs out — **shipped**
 
 Phase 3 moves a *model* inside a running agent. This is the harder case: the agent is finished —
 its plan is out of usage, not out of model — and something else has to carry on. "Claude runs out
@@ -190,10 +190,10 @@ overnight, a free opencode picks it up, and when that one dies the next takes ov
 
 ### What is actually detectable
 
-**Shipped:** `[handover]` watches for a warning on an agent's pane and tells that agent to hand
-over while it can still act — it writes its own note and spawns its own successor. What is not
-built is the case where no warning ever appeared and the agent died silently; that still needs
-horde to compose the brief from what it watched.
+**Shipped, both halves.** `handover.warning` tells an agent to hand over while it can still act,
+so it writes its own note and spawns its own successor. `handover.exhausted` is the net: when no
+warning came and the agent stopped mid-sentence, horde spawns the successor and composes the
+brief itself. Chains end at `max_chain`.
 
 **"Out" is detectable. "Nearly out" mostly is not.** A usage limit announces itself in the pane
 as text, which is exactly what manifests already read. Remaining budget does not appear anywhere

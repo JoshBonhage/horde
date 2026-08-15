@@ -934,6 +934,7 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         // second later. Checking it every tick would buy nothing and cost a scan per pane.
         advance_spent_models(eng);
         nudge_handover(eng);
+        succeed_exhausted(eng);
     }
 
     // A freshly spawned pane gets looked at on the very next tick rather than waiting out
@@ -1076,6 +1077,144 @@ fn screen_says(screen: &str, phrase: &str) -> bool {
         s.chars().filter(|c| !c.is_whitespace()).collect()
     }
     !phrase.trim().is_empty() && squash(screen).contains(&squash(phrase))
+}
+
+/// Spawn a successor for an agent that ran out without handing over.
+///
+/// The net under [`nudge_handover`]. That path spends an agent's last usable turn on writing its
+/// own brief, which is always better — but it only works if a warning appeared and the agent was
+/// in a state to act on it. An agent that stopped mid-sentence gets this instead.
+///
+/// horde has to write the brief here, and can only say what it watched: which agent this
+/// replaces, where it was working, what git thinks changed, and the last thing on its screen.
+/// That is less than the agent knew. It is also far more than a successor starting cold.
+fn succeed_exhausted(eng: &mut Engine) {
+    let cfg = eng.cfg.clone();
+    if cfg.handover.exhausted.is_empty() {
+        return;
+    }
+    let Some(profile_name) = cfg.handover.profile.clone() else { return };
+    let Some(profile) = cfg.models.get(&profile_name).cloned() else {
+        log_line(&format!("handover: no model profile {profile_name:?} to succeed with"));
+        return;
+    };
+    let Some(cmd) = profile.command(0) else { return };
+
+    // Chosen before spawning anything, so one pass never starts two.
+    let mut candidate: Option<(PaneId, String, usize)> = None;
+    for (id, pane) in eng.session.panes.iter() {
+        let Some(agent) = pane.agent.as_ref() else { continue };
+        if pane.succeeded || agent.class != crate::proto::AgentClass::Agent {
+            continue;
+        }
+        if pane.succession_depth >= cfg.handover.max_chain {
+            continue;
+        }
+        let screen = pane.detection_snapshot(cfg.detection_lines).join("\n");
+        if cfg.handover.exhausted.iter().any(|pat| screen_says(&screen, pat)) {
+            candidate = Some((*id, agent.name.clone(), pane.succession_depth));
+            break;
+        }
+    }
+    let Some((dead, name, depth)) = candidate else { return };
+
+    // Counted against the same cap as everything else horde starts on its own initiative.
+    let live = super::daemon::triggers::live_spawned(eng);
+    if live >= cfg.max_spawned {
+        if let Some(p) = eng.session.panes.get_mut(&dead) {
+            p.succeeded = true; // Do not retry every tick against a cap that will not move.
+        }
+        log_line(&format!(
+            "{name} ran out, but horde already runs {live} agents (triggers.max_spawned)"
+        ));
+        return;
+    }
+
+    let brief = compose_brief(eng, dead, &name);
+    let successor = format!("{name}-next");
+    let pane = match eng.session.split(&cfg, Some(dead), crate::proto::Dir::Right, Some(&cmd)) {
+        Ok(p) => p,
+        Err(e) => {
+            log_line(&format!("could not start a successor for {name}: {e}"));
+            return;
+        }
+    };
+    if let Some(p) = eng.session.panes.get_mut(&pane) {
+        p.name = Some(successor.clone());
+        // Stamped so the cap counts it, and so a successor that also runs out is one step
+        // further along a chain that has to end.
+        p.spawned_by = Some(0);
+        p.succession_depth = depth + 1;
+        p.model = Some(pane::ModelRun {
+            profile: profile_name.clone(),
+            index: 0,
+            switched: None,
+        });
+    }
+    if let Some(p) = eng.session.panes.get_mut(&dead) {
+        p.succeeded = true;
+    }
+
+    let by = format!("horde (for {name})");
+    eng.bus.hold_for(&successor, &brief, &by);
+    log_line(&format!("{name} ran out; started {successor} on {profile_name} to take over"));
+    // Journalled so the digest can say the work changed hands. Waking to work done by a model
+    // nobody chose, with nothing recording it, is this feature's worst outcome.
+    eng.journal
+        .note(journal::Kind::Notified, &format!("{name} ran out; {successor} took over"));
+    eng.touch();
+    eng.detect_now();
+}
+
+/// Everything horde knows about a dying agent, as a briefing for the one replacing it.
+fn compose_brief(eng: &mut Engine, pane: PaneId, name: &str) -> String {
+    let mut out = format!(
+        "You are taking over from {name}, which ran out mid-task and could not brief you itself.\n"
+    );
+    let Some(p) = eng.session.panes.get(&pane) else { return out };
+    let cwd = p.cwd.clone();
+    // Screen read here, while the immutable borrow is still held; the git lookup below needs
+    // the cache mutably and the two cannot overlap.
+    let tail: Vec<String> = p
+        .detection_snapshot(40)
+        .into_iter()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    out.push_str(&format!("Working directory: {}\n", cwd.display()));
+
+    // If the agent did leave a note, that beats everything below it — say so first.
+    let note = cwd.join(format!(".horde/handoff-{name}.md"));
+    if note.exists() {
+        out.push_str(&format!("It left notes at {} — read those first.\n", note.display()));
+    }
+
+    if let Some(facts) = eng.repos.get(&cwd) {
+        out.push_str(&format!(
+            "Git: branch {}, working tree {}.\n",
+            facts.branch,
+            if facts.dirty { "DIRTY — it stopped mid-edit, check `git diff` before changing anything" } else { "clean" }
+        ));
+    }
+
+    // The last thing it was doing, which is usually the most useful single fact.
+    if !tail.is_empty() {
+        out.push_str("\nThe last of its screen:\n");
+        for l in tail {
+            out.push_str(&format!("  {}\n", l.trim_end()));
+        }
+    }
+
+    out.push_str(
+        "\nRead before writing. Its work is unfinished, not wrong, and undoing it costs more \
+         than finishing it.",
+    );
+    out
 }
 
 /// Tell an agent that is nearly out of budget to hand over, while it still can.
@@ -1645,6 +1784,112 @@ mod tests {
         );
     }
 
+    /// The silent-death path: no warning, no note, and a successor still appears — briefed with
+    /// everything horde could see.
+    #[test]
+    fn an_agent_that_died_without_handing_over_gets_a_successor() {
+        let mut eng = engine_with_shell(Some("echo reached your usage limit"));
+        let dead = *eng.session.panes.keys().next().unwrap();
+        eng.cfg.handover = crate::config::Handover {
+            warning: Vec::new(),
+            exhausted: vec!["reached your usage limit".into()],
+            profile: Some("free".into()),
+            instruct: None,
+            max_chain: 3,
+        };
+        eng.cfg.models.insert(
+            "free".into(),
+            crate::config::ModelProfile {
+                cmd: "cat {model}".into(),
+                order: vec!["/dev/stdin".into()],
+                exhausted: Vec::new(),
+                switch: None,
+            },
+        );
+        give_agent_named(&mut eng.session, dead, "builder");
+
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&dead).unwrap().pump(&theme);
+            if eng.session.panes[&dead].visible_text().join("").contains("usage limit") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let before = eng.session.panes.len();
+        succeed_exhausted(&mut eng);
+        assert_eq!(eng.session.panes.len(), before + 1, "a successor should exist");
+        assert!(eng.session.panes[&dead].succeeded, "and the dead one is marked");
+
+        let successor = eng
+            .session
+            .panes
+            .values()
+            .find(|p| p.name.as_deref() == Some("builder-next"))
+            .expect("named after the agent it replaces");
+        assert_eq!(successor.succession_depth, 1, "one step along the chain");
+
+        // The brief is waiting for it, and says where the work is.
+        let held = eng.bus.recent(20);
+        let brief = held
+            .iter()
+            .find(|m| m.to == "builder-next")
+            .expect("a brief was composed");
+        assert!(brief.body.contains("taking over from builder"), "{}", brief.body);
+        assert!(brief.body.contains("Working directory"), "{}", brief.body);
+
+        // Running again must not start a second one.
+        let now = eng.session.panes.len();
+        succeed_exhausted(&mut eng);
+        assert_eq!(eng.session.panes.len(), now, "one successor, not a queue of them");
+
+        kill_all(&mut eng);
+    }
+
+    /// A lineage that keeps running out has to stop. If three agents in a row have run out, the
+    /// answer is not a fourth.
+    #[test]
+    fn a_succession_chain_stops_at_its_limit() {
+        let mut eng = engine_with_shell(Some("echo reached your usage limit"));
+        let dead = *eng.session.panes.keys().next().unwrap();
+        eng.cfg.handover = crate::config::Handover {
+            warning: Vec::new(),
+            exhausted: vec!["reached your usage limit".into()],
+            profile: Some("free".into()),
+            instruct: None,
+            max_chain: 2,
+        };
+        eng.cfg.models.insert(
+            "free".into(),
+            crate::config::ModelProfile {
+                cmd: "cat {model}".into(),
+                order: vec!["/dev/stdin".into()],
+                exhausted: Vec::new(),
+                switch: None,
+            },
+        );
+        give_agent_named(&mut eng.session, dead, "builder");
+        // Already at the end of a chain.
+        eng.session.panes.get_mut(&dead).unwrap().succession_depth = 2;
+
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&dead).unwrap().pump(&theme);
+            if eng.session.panes[&dead].visible_text().join("").contains("usage limit") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let before = eng.session.panes.len();
+        succeed_exhausted(&mut eng);
+        assert_eq!(eng.session.panes.len(), before, "the chain has run its length");
+        kill_all(&mut eng);
+    }
+
     /// Wrapping must not hide a phrase. This is why the previous opencode manifest, which
     /// looked for "esc to interrupt" as one string, never matched anything.
     #[test]
@@ -1669,8 +1914,10 @@ mod tests {
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: vec!["Approaching usage limit".into()],
+            exhausted: Vec::new(),
             profile: Some("free".into()),
             instruct: None,
+            max_chain: 3,
         };
         give_agent_named(&mut eng.session, pane, "builder");
 
@@ -1710,8 +1957,10 @@ mod tests {
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: vec!["Approaching usage limit".into()],
+            exhausted: Vec::new(),
             profile: None,
             instruct: None,
+            max_chain: 3,
         };
         give_agent_named(&mut eng.session, pane, "builder");
         nudge_handover(&mut eng);

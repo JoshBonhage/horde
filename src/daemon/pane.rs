@@ -182,6 +182,13 @@ pub struct Pane {
     /// The warning stays on screen after it appears, and repeating the instruction every few
     /// seconds would interrupt the very handover it is asking for.
     pub handover_told: bool,
+    /// Set once horde has spawned a successor for this pane, so it does so at most once.
+    pub succeeded: bool,
+    /// How many agents came before this one in the same lineage.
+    ///
+    /// Carried so a chain of agents that keep running out terminates rather than spawning for
+    /// as long as the machine allows.
+    pub succession_depth: usize,
     /// Which model profile this pane was started on, and how far through it it has got.
     ///
     /// Held on the pane rather than in the profile because the profile is shared config and this
@@ -322,6 +329,8 @@ impl Pane {
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
             handover_told: false,
+            succeeded: false,
+            succession_depth: 0,
             model: None,
             last_sent_cursor: None,
             full_repaint: true,
@@ -751,6 +760,8 @@ impl Pane {
             mirror: vec![Row::default(); saved.rows as usize],
             dirty: HashSet::new(),
             handover_told: false,
+            succeeded: false,
+            succession_depth: 0,
             model: None,
             last_sent_cursor: None,
             full_repaint: true,

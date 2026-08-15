@@ -102,8 +102,11 @@ struct RawConfig {
 struct RawHandover {
     #[serde(default)]
     warning: Vec<String>,
+    #[serde(default)]
+    exhausted: Vec<String>,
     profile: Option<String>,
     instruct: Option<String>,
+    max_chain: Option<usize>,
 }
 
 /// One `[models.<name>]` block.
@@ -232,6 +235,17 @@ pub struct ModelProfile {
 pub struct Handover {
     /// Screen text meaning "nearly out".
     pub warning: Vec<String>,
+    /// Screen text meaning "out now, and nobody handed over".
+    ///
+    /// The net under `warning`. An agent that stopped mid-sentence never got the chance to write
+    /// its own note, so horde spawns the successor itself and composes the brief from what it
+    /// watched — which is less than the agent knew, and far more than nothing.
+    pub exhausted: Vec<String>,
+    /// How many successors a single lineage may have.
+    ///
+    /// A chain whose members keep dying would otherwise spawn forever. Small on purpose: if
+    /// three agents in a row have run out, the answer is not a fourth.
+    pub max_chain: usize,
     /// Model profile the successor should start on.
     pub profile: Option<String>,
     /// What the agent is told. `{name}` is its own name, `{profile}` the successor's profile.
@@ -566,16 +580,21 @@ impl Config {
         // advice to give, so the profile is what makes the feature live.
         cfg.handover = Handover {
             warning: raw.handover.warning.clone(),
+            exhausted: raw.handover.exhausted.clone(),
             profile: raw.handover.profile.clone(),
             instruct: raw.handover.instruct.clone(),
+            max_chain: raw.handover.max_chain.unwrap_or(3),
         };
-        if !cfg.handover.warning.is_empty() && cfg.handover.profile.is_none() {
+        if (!cfg.handover.warning.is_empty() || !cfg.handover.exhausted.is_empty())
+            && cfg.handover.profile.is_none()
+        {
             warnings.push(
-                "handover.warning is set but handover.profile is not, so there is nothing to \
+                "handover is configured but handover.profile is not, so there is nothing to \
                  hand over to"
                     .to_string(),
             );
             cfg.handover.warning.clear();
+            cfg.handover.exhausted.clear();
         }
 
         // Roles resolve after the theme, because an undeclared one derives its colour from

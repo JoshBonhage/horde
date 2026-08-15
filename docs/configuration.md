@@ -215,6 +215,26 @@ Override it with `instruct`, where `{name}` and `{profile}` are substituted.
 Told exactly once per agent: the warning stays on screen, and repeating the instruction would
 interrupt the handover it is asking for.
 
+### When no warning ever came
+
+```toml
+[handover]
+exhausted = ["reached your usage limit"]
+max_chain = 3
+```
+
+The net under `warning`. An agent that stopped mid-sentence never got the chance to write its own
+note, so horde spawns the successor itself and composes the brief from what it watched: which
+agent this replaces, where it was working, what git thinks changed, whether the tree was left
+dirty, and the last of its screen. If the agent *did* leave a `.horde/handoff-<name>.md`, the
+brief points at that first — it is better than anything horde can reconstruct.
+
+The successor is named `<name>-next`, starts on `profile`'s first model, counts against
+`triggers.max_spawned`, and is journalled so `horde digest` records that the work changed hands.
+
+`max_chain` (3 by default) ends a lineage that keeps running out. If three agents in a row have
+run out, the answer is not a fourth.
+
 **The warning text is yours to confirm.** horde ships no default for it, because the wording
 belongs to whichever agent you run and inventing one would produce a feature that either never
 fires or fires on the wrong thing. Set it the first time you see a real warning, and check

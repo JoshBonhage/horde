@@ -1257,7 +1257,12 @@ fn print_roster(v: &Value) {
         // An agent you did not start is the one fact about a roster row you would most want
         // volunteered rather than discovered.
         if let Some(by) = a.get("spawned_by").and_then(|x| x.as_u64()) {
-            why.push_str(&format!(" [by trigger #{by}]"));
+            // Zero is horde succeeding an agent that ran out, not a rule — there is no
+            // trigger #0, and printing one sends you looking for a rule that does not exist.
+            why.push_str(&match by {
+                0 => " [succeeded a spent agent]".to_string(),
+                n => format!(" [by trigger #{n}]"),
+            });
         }
         println!(
             "{name:<14} {state:<9} {:<8} {space:<14} {why}",

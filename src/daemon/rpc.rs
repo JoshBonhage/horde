@@ -938,7 +938,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             if let Some(origin) = from.and_then(|p| eng.session.panes.get(&p)) {
                 if let Some(by_trigger) = origin.spawned_by {
                     return Err(bad(format!(
-                        "this pane was started by trigger #{by_trigger}, so it cannot create \
+                        "this pane was started by horde itself (trigger #{by_trigger}), so it cannot create \
                          triggers — put work on the board instead"
                     )));
                 }
