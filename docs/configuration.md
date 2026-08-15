@@ -235,10 +235,32 @@ The successor is named `<name>-next`, starts on `profile`'s first model, counts 
 `max_chain` (3 by default) ends a lineage that keeps running out. If three agents in a row have
 run out, the answer is not a fourth.
 
-**The warning text is yours to confirm.** horde ships no default for it, because the wording
-belongs to whichever agent you run and inventing one would produce a feature that either never
-fires or fires on the wrong thing. Set it the first time you see a real warning, and check
-`horde.log` for `told to hand over`.
+### What Claude Code actually says
+
+The limit message is quoted verbatim in
+[anthropics/claude-code#9236](https://github.com/anthropics/claude-code/issues/9236) and
+[#5977](https://github.com/anthropics/claude-code/issues/5977):
+
+```
+Claude usage limit reached. Your limit will reset at 3pm (America/New_York)
+```
+
+So for Claude Code:
+
+```toml
+[handover]
+exhausted = ["usage limit reached", "Your limit will reset at",
+             "limit reached, resets", "limit reached - resets"]
+warning   = ["Approaching 5-hour limit", "Approaching usage limit"]
+```
+
+The `exhausted` strings are well sourced. **The warning wording is not** — Anthropic's help
+centre describes the behaviour without quoting it, so those two came from third-party write-ups
+and should be treated as a guess until you see one. Both are one-line edits, and `horde.log`
+records `told to hand over` and `ran out; started` so you can tell which fired.
+
+horde ships no defaults for either, because the wording belongs to whichever agent you run and
+inventing one produces a feature that either never fires or fires on the wrong thing.
 
 Matching ignores whitespace, so a phrase still matches when the terminal wrapped it — in a narrow
 pane an agent will split `esc to interrupt` into `in`/`te`/`rr`/`up`/`t` down five lines, and a

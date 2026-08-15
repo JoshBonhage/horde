@@ -1904,6 +1904,40 @@ mod tests {
         assert!(!screen_says("anything at all", "   "));
     }
 
+    /// The shipped patterns have to match what Claude Code actually prints.
+    ///
+    /// The limit line is quoted verbatim in anthropics/claude-code issues #9236 and #5977. This
+    /// is the string the whole feature turns on, and it is the one thing that cannot be checked
+    /// by running horde — so it is checked here instead, wrapped as a narrow pane would wrap it.
+    #[test]
+    fn the_shipped_patterns_match_what_claude_code_prints() {
+        let real = "Claude usage limit reached. Your limit will reset at 3pm (America/New_York)";
+        for pattern in ["usage limit reached", "Your limit will reset at"] {
+            assert!(screen_says(real, pattern), "{pattern:?} should match {real:?}");
+            // And still match once a narrow pane has broken it up.
+            let wrapped = "Claude usage limit\nreached. Your limit\nwill reset at 3pm";
+            assert!(screen_says(wrapped, pattern), "{pattern:?} should survive wrapping");
+        }
+
+        // The enterprise phrasing, which the help centre describes as "limit reached, resets at".
+        assert!(screen_says("5-hour limit reached - resets 4pm", "limit reached - resets"));
+        assert!(screen_says("limit reached, resets at 4pm", "limit reached, resets"));
+
+        // And the warning tier.
+        assert!(screen_says("Approaching 5-hour limit.", "Approaching 5-hour limit"));
+
+        // What must *not* match: horde's own handover instruction mentions the usage limit, and
+        // it lands on the very pane being watched. If that tripped the exhausted patterns, being
+        // told to hand over would immediately count as having run out.
+        let instruction = crate::config::DEFAULT_INSTRUCT;
+        for pattern in ["usage limit reached", "Your limit will reset at"] {
+            assert!(
+                !screen_says(instruction, pattern),
+                "horde's own instruction must not read as an exhausted agent: {pattern:?}"
+            );
+        }
+    }
+
     /// An agent that is nearly out gets told to hand over — once, and with something usable.
     ///
     /// The turn it spends on this is its last usable one, so the instruction has to be concrete:
