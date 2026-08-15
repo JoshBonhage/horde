@@ -353,6 +353,7 @@ mod tests {
                 collapsed: false,
                 repo: None,
                 notes: None,
+            lsp: Vec::new(),
             }],
             tabs: tab_list,
             panes,

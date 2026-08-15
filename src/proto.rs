@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -420,6 +420,40 @@ pub struct SpaceInfo {
     /// vault's contents are unbounded. The notes themselves come back from a query.
     #[serde(default)]
     pub notes: Option<usize>,
+    /// Language servers horde has started for this project.
+    ///
+    /// Empty unless `config.toml` declares one and a file that needs it has been opened.
+    /// Present on the wire at all because a language server is a child process holding real
+    /// memory, and nothing horde starts is allowed to be invisible — least of all in a daemon
+    /// you are detached from.
+    #[serde(default)]
+    pub lsp: Vec<LspInfo>,
+}
+
+/// One language server, as the chrome shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspInfo {
+    /// The name from `[lsp.<name>]`, which is also what it is called on screen.
+    pub lang: String,
+    pub state: LspState,
+    /// Files it is currently watching.
+    pub open: usize,
+    pub errors: usize,
+    pub warnings: usize,
+    /// Why it is not running, when it is not.
+    pub detail: Option<String>,
+}
+
+/// What a language server is doing, for the sidebar.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LspState {
+    /// Spawned, waiting on its answer to `initialize`. rust-analyzer sits here for seconds.
+    Starting,
+    Ready,
+    /// Died, and waiting out a backoff before trying again.
+    Waiting,
+    /// Died too often, or never started at all. Nothing more will happen without a change.
+    Failed,
 }
 
 /// Everything the client needs to draw a frame apart from cell contents.
@@ -1024,7 +1058,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 14, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 15, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the
@@ -1173,6 +1207,7 @@ mod digest_tests {
                 collapsed: _,
                 repo: _,
                 notes: _,
+                lsp: _,
             } = space;
             let TabInfo { id: _, space: _, name: _, panes: _, focused_pane: _ } = tab;
             let ViewState {

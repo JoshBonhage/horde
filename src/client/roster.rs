@@ -535,6 +535,7 @@ pub mod tests {
                     collapsed: false,
                     repo: None,
                     notes: None,
+            lsp: Vec::new(),
                 },
                 SpaceInfo {
                     id: 2,
@@ -548,6 +549,7 @@ pub mod tests {
                     collapsed: false,
                     repo: None,
                     notes: None,
+            lsp: Vec::new(),
                 },
             ],
             tabs: vec![

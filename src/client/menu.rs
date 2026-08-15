@@ -436,6 +436,7 @@ mod tests {
                 collapsed: false,
                 repo: None,
                 notes: None,
+            lsp: Vec::new(),
             }],
             tabs: vec![TabInfo {
                 id: 1,

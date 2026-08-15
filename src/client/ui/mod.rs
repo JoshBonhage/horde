@@ -799,9 +799,9 @@ mod frame_tests {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             spaces: vec![
                 SpaceInfo { id: 1, name: "api-refactor".into(), cwd: "/x".into(),
-                    tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1, accent: 0, collapsed: false, repo: None, notes: None },
+                    tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1, accent: 0, collapsed: false, repo: None, notes: None, lsp: Vec::new() },
                 SpaceInfo { id: 2, name: "docs".into(), cwd: "/y".into(),
-                    tabs: vec![2], focused_tab: Some(2), agent_count: 1, attention_count: 0, accent: 1, collapsed: false, repo: None, notes: None },
+                    tabs: vec![2], focused_tab: Some(2), agent_count: 1, attention_count: 0, accent: 1, collapsed: false, repo: None, notes: None, lsp: Vec::new() },
             ],
             tabs: vec![
                 TabInfo { id: 1, space: 1, name: "agents".into(), panes: vec![1,2,3], focused_pane: Some(1) },

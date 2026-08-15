@@ -97,6 +97,23 @@ struct RawConfig {
     env: HashMap<String, String>,
     #[serde(default)]
     models: HashMap<String, RawModelProfile>,
+    #[serde(default)]
+    lsp: HashMap<String, RawLspServer>,
+}
+
+/// One `[lsp.<language>]` block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLspServer {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    /// Filenames ending in these belong to this language. Overrides the built-in guess, and
+    /// is the whole mechanism for a language horde has never heard of.
+    #[serde(default)]
+    extensions: Vec<String>,
 }
 
 /// The `[handover]` block.
@@ -216,6 +233,33 @@ struct RawTriggers {
 /// cmd = "opencode --model openrouter/{model}"
 /// order = ["qwen/qwen3-coder:free", "deepseek/deepseek-chat-v3.1:free"]
 /// ```
+/// A language server horde may start, and what it is for.
+///
+/// Nothing is assumed. horde ships no server list and no bundled binaries — a language
+/// server is a program on your machine, and this is where you say which one and for what:
+///
+/// ```toml
+/// [lsp.rust]
+/// command = "rust-analyzer"
+///
+/// [lsp.cpp]
+/// command = "clangd"
+/// args = ["--background-index"]
+/// extensions = ["c", "h", "cc", "cpp", "hpp"]
+/// ```
+///
+/// The language name is yours. It is what horde calls the server, what it sends as the
+/// document's `languageId`, and — through `extensions` — how a filename finds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LspServer {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    /// Extensions this language claims, lowercase and without the dot. Empty means the
+    /// built-in guess, which knows the common ones and nothing exotic.
+    pub extensions: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelProfile {
     /// Command template. `{model}` is replaced with an entry from `order`.
@@ -386,6 +430,9 @@ pub struct Config {
     pub env: HashMap<String, String>,
     /// Named model rotations, keyed by profile name. See `ModelProfile`.
     pub models: HashMap<String, ModelProfile>,
+    /// Language servers, keyed by language name. Empty by default, and nothing spawns until
+    /// there is something in here. See `LspServer`.
+    pub lsp: HashMap<String, LspServer>,
     /// Telling an agent to hand over before it runs out. See `Handover`.
     pub handover: Handover,
     pub notify: Notify,
@@ -492,6 +539,7 @@ impl Default for Config {
             max_spawned: 2,
             env: HashMap::new(),
             models: HashMap::new(),
+            lsp: HashMap::new(),
             handover: Handover::default(),
             notify: Notify::Horde,
             notify_command: None,
@@ -621,6 +669,28 @@ impl Config {
                     order: m.order.clone(),
                     exhausted,
                     switch: m.switch.clone(),
+                },
+            );
+        }
+
+        // Language servers. A blank command is refused here rather than presenting later as
+        // "diagnostics never appear", which is the least debuggable symptom there is.
+        for (name, s) in &raw.lsp {
+            if s.command.trim().is_empty() {
+                warnings.push(format!("lsp.{name}: command is empty"));
+                continue;
+            }
+            cfg.lsp.insert(
+                name.clone(),
+                LspServer {
+                    command: s.command.clone(),
+                    args: s.args.clone(),
+                    env: s.env.clone(),
+                    extensions: s
+                        .extensions
+                        .iter()
+                        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+                        .collect(),
                 },
             );
         }

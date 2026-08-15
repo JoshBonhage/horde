@@ -1074,9 +1074,11 @@ impl Session {
                     accent: s.accent,
                     collapsed: s.collapsed,
                     repo: repo_info(repos, &s.cwd),
-                    // Filled in by the daemon, which owns the indexes. The session knows
-                    // where a project is, not what is written down about it.
+                    // Both filled in by the daemon, which owns the indexes and the child
+                    // processes. The session knows where a project is, not what is written
+                    // down about it or what is reading it.
                     notes: None,
+                    lsp: Vec::new(),
                 }
             })
             .collect();

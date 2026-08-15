@@ -12,6 +12,7 @@ pub mod handoff;
 pub mod journal;
 pub mod layout;
 pub mod logfile;
+pub mod lsp;
 pub mod manifest;
 pub mod notify;
 pub mod pane;
@@ -108,6 +109,9 @@ pub struct Engine {
     /// are looking at the same notes, and indexing them twice would be work done to produce
     /// two answers that must agree.
     pub vaults: HashMap<PathBuf, vault::Index>,
+    /// Language servers, one per project and language, started only when a file that needs
+    /// one is opened. Nothing in here exists unless `config.toml` asked for it.
+    pub lsp: lsp::Registry,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
     dirty_shape: bool,
@@ -195,8 +199,42 @@ impl Engine {
         s.recents = self.recent_projects();
         for space in s.spaces.iter_mut() {
             space.notes = self.vault_for(space.id).map(|v| v.len());
+            space.lsp = self.lsp_info(space.id);
         }
         s
+    }
+
+    /// The language servers running for a project, as the chrome shows them.
+    fn lsp_info(&self, space: SpaceId) -> Vec<crate::proto::LspInfo> {
+        let Some(cwd) = self.session.space(space).map(|s| s.cwd.clone()) else { return Vec::new() };
+        self.lsp
+            .serving()
+            .into_iter()
+            .filter(|((root, _), _)| *root == cwd)
+            .map(|((_, lang), s)| {
+                let (errors, warnings) = s.counts();
+                let (state, detail) = match &s.state {
+                    lsp::State::Starting => (crate::proto::LspState::Starting, None),
+                    lsp::State::Ready => (crate::proto::LspState::Ready, None),
+                    lsp::State::Waiting(w) => (crate::proto::LspState::Waiting, Some(w.clone())),
+                    lsp::State::Failed(w) => (crate::proto::LspState::Failed, Some(w.clone())),
+                };
+                crate::proto::LspInfo {
+                    lang: lang.clone(),
+                    state,
+                    open: s.open_count(),
+                    errors,
+                    warnings,
+                    // A server that failed without saying anything on stdout said it on
+                    // stderr, which is the only place the reason exists. Failing that, name
+                    // what horde actually tried to run — which is usually the whole answer.
+                    detail: detail
+                        .or_else(|| s.last_error())
+                        .or_else(|| Some(s.command.clone()))
+                        .filter(|_| !matches!(s.state, lsp::State::Ready)),
+                }
+            })
+            .collect()
     }
 
     /// Where a space's notes live: its own vault if it has one, else the home vault.
@@ -336,6 +374,20 @@ impl Engine {
         }
         std::fs::write(&path, body)?;
         Ok(())
+    }
+
+    /// Tell a language server about a file, starting one if this is the first of its
+    /// language in this project.
+    ///
+    /// Does nothing at all unless `config.toml` declares a server for the language — which is
+    /// the promise that opening horde spawns nothing you did not ask for.
+    pub fn lsp_sync(&mut self, space: SpaceId, rel: &str, text: &str) {
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        let Ok(path) = vault::safe_join(&root, rel) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let cfg = self.cfg.clone();
+        // `did_open` on a file already open is a change, so this one call is both.
+        self.lsp.did_open(&cfg, &root, &lang, &path, text);
     }
 
     /// The recents list as the wire carries it, with the ones already on screen marked.
@@ -700,6 +752,7 @@ async fn engine_loop(
         recents: Vec::new(),
         repos: repo::Cache::default(),
         vaults: HashMap::new(),
+        lsp: lsp::Registry::new(),
         cfg,
         clients: HashMap::new(),
         dirty_shape: true,
@@ -809,6 +862,10 @@ async fn engine_loop(
         }
     }
 
+    // Children do not outlive the daemon that started them. `kill_on_drop` would mostly
+    // handle it, but "mostly" is how a stopped horde leaves a rust-analyzer holding a
+    // gigabyte until the machine reboots.
+    eng.lsp.shutdown();
     if !HANDED_OVER.load(std::sync::atomic::Ordering::SeqCst) {
         let _ = persist::save(&eng, &crate::config::state_path());
     }
@@ -999,6 +1056,11 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
         ClientFrame::Command(Cmd::FileRead { space, path }) => {
             match eng.file_read(space, &path) {
                 Ok(reply) => {
+                    // Opening a file is the moment a language server becomes worth having, and
+                    // the last moment before you would notice it was not there.
+                    if let Some(body) = reply.body.as_deref() {
+                        eng.lsp_sync(space, &path, body);
+                    }
                     if let Some(c) = eng.clients.get(&id) {
                         let _ = c.out.send(ServerFrame::Files(Box::new(reply)));
                     }
@@ -1008,7 +1070,7 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
         }
         ClientFrame::Command(Cmd::FileSave { space, path, body }) => {
             match eng.file_write(space, &path, &body) {
-                Ok(()) => {}
+                Ok(()) => eng.lsp_sync(space, &path, &body),
                 Err(e) => eng.notice(NoticeLevel::Error, format!("could not save {path}: {e}")),
             }
         }
@@ -1032,6 +1094,23 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         Cmd::ClosePane => {
             if let Some(p) = eng.session.focused_pane() {
+                // A file pane closing is a document closing, and a server that is never told
+                // goes on analysing something nobody is looking at.
+                let doc = eng.session.panes.get(&p).and_then(|p| p.doc_path().map(|d| d.to_path_buf()));
+                if let Some(path) = doc {
+                    if let Some(lang) = lsp::language_for(&cfg, &path) {
+                        // The pane being closed is the focused one, so its project is the
+                        // focused project.
+                        let root = eng
+                            .session
+                            .focused_space
+                            .and_then(|s| eng.session.space(s))
+                            .map(|s| s.cwd.clone());
+                        if let Some(root) = root {
+                            eng.lsp.did_close(&root, &lang, &path);
+                        }
+                    }
+                }
                 let _ = eng.session.close_pane(&cfg, p);
             }
         }
@@ -1098,6 +1177,13 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
                 Some(p) => {
                     if let Err(e) = eng.session.split_doc(&cfg, None, Dir::Right, &p) {
                         problems.push((NoticeLevel::Warn, e.to_string()));
+                    } else if let Some(lang) = lsp::language_for(&cfg, &p) {
+                        if let Ok(text) = std::fs::read_to_string(&p) {
+                            let root = eng.session.space(space).map(|s| s.cwd.clone());
+                            if let Some(root) = root {
+                                eng.lsp.did_open(&cfg, &root, &lang, &p, &text);
+                            }
+                        }
                     }
                 }
                 None => problems.push((NoticeLevel::Warn, format!("no file at {path}"))),
@@ -1269,9 +1355,20 @@ fn tick(eng: &mut Engine, detect_due: bool) {
     // Git state, on detection's cadence but with its own much longer staleness window inside
     // the cache. Piggybacking on `detect_due` rather than taking a timer of its own keeps the
     // fork-per-directory work on one clock.
+    // Every tick, because a diagnostic is worth showing the moment it lands and draining a
+    // channel that is almost always empty costs nothing.
+    drain_lsp(eng);
+
     if detect_due {
         refresh_repos(eng);
         refresh_vaults(eng);
+        // The half of a language server's lifecycle that is easy to leave for later: stop the
+        // ones nobody is using and the ones whose project has closed, and give the ones that
+        // died their next attempt.
+        let roots: Vec<PathBuf> = eng.session.spaces.iter().map(|s| s.cwd.clone()).collect();
+        eng.lsp.sweep(|root| roots.iter().any(|cwd| cwd.starts_with(root)));
+        let cfg = eng.cfg.clone();
+        eng.lsp.retry(&cfg);
         // On detection's cadence deliberately: exhaustion is read off the same screen snapshot
         // detection already takes, and a model that has just refused will still be refusing a
         // second later. Checking it every tick would buy nothing and cost a scan per pane.
@@ -1703,6 +1800,48 @@ fn refresh_repos(eng: &mut Engine) {
 /// nobody has asked yet. Small enough to be invisible, large enough that a normal vault is
 /// fully indexed within a pass or two.
 const VAULT_BUDGET: usize = 40;
+
+/// Fold what the language servers have said into the session.
+///
+/// A server that started, died, or changed its mind about a file is something the person at
+/// the keyboard should be able to find out about without reading a log — especially the
+/// death, since the alternative symptom is diagnostics that simply never appear.
+fn drain_lsp(eng: &mut Engine) {
+    let events = eng.lsp.drain();
+    if events.is_empty() {
+        return;
+    }
+    let mut said = Vec::new();
+    let mut changed = false;
+    for ev in events {
+        match ev {
+            lsp::Event::Ready((root, lang)) => {
+                let _ = root;
+                said.push((NoticeLevel::Info, format!("{lang} language server ready")));
+            }
+            lsp::Event::Exited { key, why } => {
+                let (_, lang) = &key;
+                // Which of the two it is has already been decided by the registry, and the
+                // difference matters: one is "wait a moment", the other is "fix your config".
+                let text = match eng.lsp.get(&key).map(|s| s.state.clone()) {
+                    Some(lsp::State::Failed(_)) => {
+                        format!("{lang} language server keeps dying, giving up: {why}")
+                    }
+                    _ => format!("{lang} language server died, restarting: {why}"),
+                };
+                said.push((NoticeLevel::Warn, text));
+            }
+            lsp::Event::Diagnostics { .. } => changed = true,
+        }
+    }
+    for (level, text) in said {
+        eng.notice(level, text);
+    }
+    // Diagnostic counts ride the snapshot, so a fresh set is a reason to send one.
+    if changed {
+        eng.dirty_shape = true;
+    }
+}
 
 /// Reindex each project's notes, and forget vaults no space is looking at any more.
 pub(super) fn refresh_vaults(eng: &mut Engine) {
@@ -2201,6 +2340,7 @@ mod tests {
             recents: Vec::new(),
             repos: repo::Cache::default(),
             vaults: HashMap::new(),
+            lsp: lsp::Registry::new(),
             cfg,
             clients: HashMap::new(),
             dirty_shape: true,
