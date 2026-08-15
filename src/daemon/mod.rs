@@ -7,10 +7,12 @@
 pub mod agents;
 pub mod bus;
 pub mod digest;
+pub mod files;
 pub mod handoff;
 pub mod journal;
 pub mod layout;
 pub mod logfile;
+pub mod lsp;
 pub mod manifest;
 pub mod notify;
 pub mod pane;
@@ -23,6 +25,7 @@ pub mod state;
 pub mod tasks;
 pub mod triggers;
 pub mod upgrade;
+pub mod vault;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -97,9 +100,23 @@ pub struct Engine {
     /// get back is still the whole story. See [`notify`].
     pub last_alert: u64,
     pub agents: agents::Detector,
+    /// Projects opened before, most recent first. What the dashboard offers to reopen.
+    pub recents: Vec<persist::SavedRecent>,
     /// Branch and dirty state per directory, refreshed on its own slow cadence because each
     /// answer costs a fork. Read by every snapshot, written by nothing else.
     pub repos: repo::Cache,
+    /// One note index per vault root, not per space: two spaces opened on the same project
+    /// are looking at the same notes, and indexing them twice would be work done to produce
+    /// two answers that must agree.
+    pub vaults: HashMap<PathBuf, vault::Index>,
+    /// Language servers, one per project and language, started only when a file that needs
+    /// one is opened. Nothing in here exists unless `config.toml` asked for it.
+    pub lsp: lsp::Registry,
+    /// Absolute path to the name the client used for it, for documents the editor has open.
+    lsp_paths: HashMap<PathBuf, String>,
+    /// Which client is waiting on a completion. One at a time, because a second request means
+    /// the cursor moved and the first answer is already wrong.
+    lsp_asked: Option<ClientId>,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
     dirty_shape: bool,
@@ -133,6 +150,300 @@ impl Engine {
     /// Ask for a detection pass on the next tick, after spawning a pane.
     pub fn detect_now(&mut self) {
         self.detect_soon = true;
+    }
+
+    /// How many projects the dashboard remembers.
+    ///
+    /// Small on purpose: this is a list you pick from by eye, and a screen of forgotten
+    /// directories is a worse answer than the six you actually use.
+    pub const MAX_RECENTS: usize = 12;
+
+    /// Record that a project was opened or returned to, most recent first.
+    ///
+    /// Keyed on the directory, not the name: a space can be renamed, and renaming it should
+    /// not make horde think you have two projects.
+    pub fn remember_project(&mut self, name: &str, cwd: &std::path::Path) {
+        let cwd = cwd.to_string_lossy().to_string();
+        self.recents.retain(|r| r.cwd != cwd);
+        self.recents.insert(
+            0,
+            persist::SavedRecent { name: name.to_string(), cwd, last_used: now_millis() },
+        );
+        self.recents.truncate(Self::MAX_RECENTS);
+    }
+
+    /// Move the focused project to the head of the recents list, if it is not already there.
+    ///
+    /// Cheap enough to call every tick because the common case is a string comparison that
+    /// says "already first". That is also what keeps `last_used` from being rewritten sixty
+    /// times a second — the list only changes when the project you are looking at does.
+    pub fn note_focused_project(&mut self) {
+        let Some(space) = self.session.focused_space.and_then(|id| self.session.space(id)) else {
+            return;
+        };
+        let cwd = space.cwd.to_string_lossy().to_string();
+        if self.recents.first().is_some_and(|r| r.cwd == cwd) {
+            return;
+        }
+        let (name, cwd) = (space.name.clone(), space.cwd.clone());
+        self.remember_project(&name, &cwd);
+    }
+
+    /// The whole snapshot, session shape plus everything only the daemon knows.
+    ///
+    /// One assembly point for both channels. The render path and the JSON `session.snapshot`
+    /// used to build this separately, and the JSON one quietly reported zero open tasks and
+    /// no armed triggers however many there were — the kind of drift that only shows up when
+    /// someone believes the answer.
+    pub fn snapshot(&self) -> crate::proto::Snapshot {
+        let cfg = self.cfg.clone();
+        let mut s = self.session.snapshot(&cfg, &self.repos);
+        s.tasks_open = self.board.open_count();
+        s.tasks_claimed = self.board.claimed_count();
+        s.triggers_armed = if self.cfg.unattended { self.triggers.armed_count() } else { 0 };
+        s.recents = self.recent_projects();
+        for space in s.spaces.iter_mut() {
+            space.notes = self.vault_for(space.id).map(|v| v.len());
+            space.lsp = self.lsp_info(space.id);
+        }
+        s
+    }
+
+    /// Where a document the editor has open actually is, and what the client calls it.
+    ///
+    /// `vault` picks the root: a note is relative to the vault and a file to the project, and
+    /// only the client knows which of the two it opened.
+    fn doc_path(&self, space: SpaceId, rel: &str, vault: bool) -> Option<PathBuf> {
+        let root = if vault {
+            self.vault_root(space)?
+        } else {
+            self.session.space(space)?.cwd.clone()
+        };
+        vault::safe_join(&root, rel).ok()
+    }
+
+    /// Hand a buffer to whichever language server wants it.
+    pub fn doc_changed(&mut self, space: SpaceId, rel: &str, body: &str, vault: bool) {
+        let Some(path) = self.doc_path(space, rel, vault) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        // Remembered so diagnostics can come back named the way the client named it. The
+        // daemon deals in absolute paths and the editor knows a relative one; the translation
+        // has to happen somewhere, and here is where both are in hand.
+        self.lsp_paths.insert(path.clone(), rel.to_string());
+        let cfg = self.cfg.clone();
+        self.lsp.did_open(&cfg, &root, &lang, &path, body);
+    }
+
+    /// The editor closed. Stop analysing what nobody is looking at.
+    pub fn doc_closed(&mut self, space: SpaceId, rel: &str, vault: bool) {
+        let Some(path) = self.doc_path(space, rel, vault) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        self.lsp_paths.remove(&path);
+        self.lsp.did_close(&root, &lang, &path);
+    }
+
+    /// The language servers running for a project, as the chrome shows them.
+    fn lsp_info(&self, space: SpaceId) -> Vec<crate::proto::LspInfo> {
+        let Some(cwd) = self.session.space(space).map(|s| s.cwd.clone()) else { return Vec::new() };
+        self.lsp
+            .serving()
+            .into_iter()
+            .filter(|((root, _), _)| *root == cwd)
+            .map(|((_, lang), s)| {
+                let (errors, warnings) = s.counts();
+                let (state, detail) = match &s.state {
+                    lsp::State::Starting => (crate::proto::LspState::Starting, None),
+                    lsp::State::Ready => (crate::proto::LspState::Ready, None),
+                    lsp::State::Waiting(w) => (crate::proto::LspState::Waiting, Some(w.clone())),
+                    lsp::State::Failed(w) => (crate::proto::LspState::Failed, Some(w.clone())),
+                };
+                crate::proto::LspInfo {
+                    lang: lang.clone(),
+                    state,
+                    open: s.open_count(),
+                    errors,
+                    warnings,
+                    // A server that failed without saying anything on stdout said it on
+                    // stderr, which is the only place the reason exists. Failing that, name
+                    // what horde actually tried to run — which is usually the whole answer.
+                    detail: detail
+                        .or_else(|| s.last_error())
+                        .or_else(|| Some(s.command.clone()))
+                        .filter(|_| !matches!(s.state, lsp::State::Ready)),
+                }
+            })
+            .collect()
+    }
+
+    /// Where a space's notes live: its own vault if it has one, else the home vault.
+    pub fn vault_root(&self, space: SpaceId) -> Option<PathBuf> {
+        self.session
+            .space(space)
+            .and_then(|s| vault::locate(&s.cwd, &self.cfg.vault_dir))
+            .or_else(|| self.cfg.vault_home.is_dir().then(|| self.cfg.vault_home.clone()))
+    }
+
+    /// Where a note is about to be written, making the vault if there is not one yet.
+    ///
+    /// Creating a directory on somebody's disk unasked would be rude, so nothing does it at
+    /// startup — but asking for a note *is* the ask. Without this the home vault is a
+    /// promise that only holds once you have already made the directory by hand, which is
+    /// exactly the wrong way round.
+    fn vault_root_for_write(&mut self, space: SpaceId) -> Result<PathBuf> {
+        if let Some(root) = self.vault_root(space) {
+            return Ok(root);
+        }
+        let home = self.cfg.vault_home.clone();
+        vault::init(&home).with_context(|| format!("could not make a vault at {}", home.display()))?;
+        self.notice(NoticeLevel::Info, format!("made a vault at {}", home.display()));
+        refresh_vaults(self);
+        Ok(home)
+    }
+
+    /// The index a space is reading. Falls back to the home vault, so a project with no
+    /// notes of its own is still somewhere you can write one.
+    pub fn vault_for(&self, space: SpaceId) -> Option<&vault::Index> {
+        self.vaults.get(&self.vault_root(space)?)
+    }
+
+    /// Write a note, creating it if it does not exist, and reindex at once.
+    ///
+    /// Synchronous reindex rather than waiting for the next scan: the daemon did the writing,
+    /// so there is nothing to discover — and a note that does not appear in its own vault
+    /// until a timer fires is a note you cannot trust the index about.
+    pub fn vault_write(&mut self, space: SpaceId, rel: &str, body: &str) -> Result<PathBuf> {
+        let root = self.vault_root_for_write(space)?;
+        let path = vault::safe_join(&root, rel)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, body)?;
+        if let Some(idx) = self.vaults.get_mut(&root) {
+            idx.refresh(usize::MAX);
+        }
+        self.touch();
+        Ok(path)
+    }
+
+    /// Answer a vault question. `None` when the space has no vault to ask.
+    pub fn vault_answer(
+        &self,
+        space: SpaceId,
+        kind: &crate::proto::VaultQuery,
+    ) -> Option<crate::proto::VaultReply> {
+        use crate::proto::{NoteLine, VaultQuery};
+        let idx = self.vault_for(space)?;
+        let line = |id: vault::NoteId| -> Option<NoteLine> {
+            let n = idx.note(id)?;
+            Some(NoteLine {
+                path: n.path.to_string_lossy().to_string(),
+                title: n.title.clone(),
+                tags: n.tags.clone(),
+                mtime: n.mtime,
+                backlinks: idx.backlinks(id).len(),
+            })
+        };
+
+        let mut reply = crate::proto::VaultReply {
+            space,
+            root: idx.root.to_string_lossy().to_string(),
+            notes: Vec::new(),
+            body: None,
+            backlinks: Vec::new(),
+            graph: None,
+        };
+        match kind {
+            VaultQuery::List => reply.notes = idx.search("").into_iter().filter_map(line).collect(),
+            VaultQuery::Search { q } => {
+                reply.notes = idx.search(q).into_iter().filter_map(line).collect()
+            }
+            VaultQuery::Note { path } => {
+                let id = idx.notes.iter().position(|n| n.path.to_string_lossy() == path.as_str())?;
+                reply.notes = line(id).into_iter().collect();
+                // Read from disk rather than keeping bodies in memory: the index is a map of
+                // the vault, not a copy of it.
+                reply.body = std::fs::read_to_string(idx.root.join(path)).ok();
+                reply.backlinks = idx.backlinks(id).iter().filter_map(|b| line(*b)).collect();
+            }
+            VaultQuery::Graph => reply.graph = Some(idx.graph()),
+        }
+        Some(reply)
+    }
+
+    /// How many files the browser will list before saying there are too many.
+    const FILE_LIMIT: usize = 4_000;
+
+    /// A project's files.
+    pub fn file_list(&self, space: SpaceId) -> Option<crate::proto::FileList> {
+        let root = self.session.space(space)?.cwd.clone();
+        let (files, truncated) = files::list(&root, Self::FILE_LIMIT);
+        Some(crate::proto::FileList {
+            space,
+            root: root.to_string_lossy().to_string(),
+            files: files.iter().map(|f| f.path.to_string_lossy().to_string()).collect(),
+            truncated,
+            body: None,
+            path: None,
+        })
+    }
+
+    /// One project file's text.
+    pub fn file_read(&self, space: SpaceId, rel: &str) -> Result<crate::proto::FileList> {
+        let root = self.session.space(space).ok_or_else(|| anyhow!("no such space"))?.cwd.clone();
+        let path = vault::safe_join(&root, rel)?;
+        let body = std::fs::read_to_string(&path)?;
+        Ok(crate::proto::FileList {
+            space,
+            root: root.to_string_lossy().to_string(),
+            files: Vec::new(),
+            truncated: false,
+            body: Some(body),
+            path: Some(rel.to_string()),
+        })
+    }
+
+    /// Write a project file, jailed to the project — the same rule notes get, for the same
+    /// reason: a path arriving from a text field must not be able to name anything else.
+    pub fn file_write(&mut self, space: SpaceId, rel: &str, body: &str) -> Result<()> {
+        let root = self.session.space(space).ok_or_else(|| anyhow!("no such space"))?.cwd.clone();
+        let path = vault::safe_join(&root, rel)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, body)?;
+        Ok(())
+    }
+
+    /// Tell a language server about a file, starting one if this is the first of its
+    /// language in this project.
+    ///
+    /// Does nothing at all unless `config.toml` declares a server for the language — which is
+    /// the promise that opening horde spawns nothing you did not ask for.
+    pub fn lsp_sync(&mut self, space: SpaceId, rel: &str, text: &str) {
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        let Ok(path) = vault::safe_join(&root, rel) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let cfg = self.cfg.clone();
+        // `did_open` on a file already open is a change, so this one call is both.
+        self.lsp.did_open(&cfg, &root, &lang, &path, text);
+    }
+
+    /// The recents list as the wire carries it, with the ones already on screen marked.
+    ///
+    /// `live` is computed here rather than stored, because whether a project is open is a
+    /// fact about right now and the list outlives every session it describes.
+    fn recent_projects(&self) -> Vec<crate::proto::RecentProject> {
+        self.recents
+            .iter()
+            .map(|r| crate::proto::RecentProject {
+                name: r.name.clone(),
+                cwd: r.cwd.clone(),
+                last_used: r.last_used,
+                live: self.session.spaces.iter().any(|s| s.cwd.to_string_lossy() == r.cwd),
+            })
+            .collect()
     }
 
     // Field-splitting wrappers. `self.agents.scan(&mut self.session, ...)` cannot borrow
@@ -478,7 +789,12 @@ async fn engine_loop(
         last_seen: 0,
         last_alert: 0,
         agents,
+        recents: Vec::new(),
         repos: repo::Cache::default(),
+        vaults: HashMap::new(),
+        lsp: lsp::Registry::new(),
+        lsp_paths: HashMap::new(),
+        lsp_asked: None,
         cfg,
         clients: HashMap::new(),
         dirty_shape: true,
@@ -588,6 +904,10 @@ async fn engine_loop(
         }
     }
 
+    // Children do not outlive the daemon that started them. `kill_on_drop` would mostly
+    // handle it, but "mostly" is how a stopped horde leaves a rust-analyzer holding a
+    // gigabyte until the machine reboots.
+    eng.lsp.shutdown();
     if !HANDED_OVER.load(std::sync::atomic::Ordering::SeqCst) {
         let _ = persist::save(&eng, &crate::config::state_path());
     }
@@ -721,6 +1041,111 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
                 let _ = c.out.send(ServerFrame::Digest(Box::new(d)));
             }
         }
+        // The second command with a result rather than an effect, and answered the same
+        // way: to the client that asked, never broadcast.
+        ClientFrame::Command(Cmd::VaultQuery { space, kind }) => {
+            if let Some(reply) = eng.vault_answer(space, &kind) {
+                if let Some(c) = eng.clients.get(&id) {
+                    let _ = c.out.send(ServerFrame::Vault(Box::new(reply)));
+                }
+            }
+        }
+        // Writes answer the caller with what is now on disk, so a view never shows a note
+        // it merely hoped had been saved.
+        ClientFrame::Command(Cmd::VaultSave { space, path, body }) => {
+            match eng.vault_write(space, &path, &body) {
+                Ok(_) => {
+                    if let Some(reply) =
+                        eng.vault_answer(space, &crate::proto::VaultQuery::Note { path })
+                    {
+                        if let Some(c) = eng.clients.get(&id) {
+                            let _ = c.out.send(ServerFrame::Vault(Box::new(reply)));
+                        }
+                    }
+                }
+                Err(e) => eng.notice(NoticeLevel::Error, format!("could not save the note: {e}")),
+            }
+        }
+        ClientFrame::Command(Cmd::VaultInit { space }) => {
+            // Where a vault *would* go: the project's configured notes directory, or the
+            // home vault when the project has no opinion.
+            let root = eng
+                .session
+                .space(space)
+                .map(|s| s.cwd.join(&eng.cfg.vault_dir))
+                .unwrap_or_else(|| eng.cfg.vault_home.clone());
+            match vault::init(&root) {
+                Ok(fresh) => {
+                    let msg = if fresh {
+                        format!("made a vault at {}", root.display())
+                    } else {
+                        format!("{} is already a vault", root.display())
+                    };
+                    eng.notice(NoticeLevel::Info, msg);
+                    refresh_vaults(eng);
+                }
+                Err(e) => eng.notice(NoticeLevel::Error, format!("could not make a vault: {e}")),
+            }
+        }
+        // The project's own files. Answered to the asking client, like every other query.
+        ClientFrame::Command(Cmd::FileQuery { space }) => {
+            if let Some(reply) = eng.file_list(space) {
+                if let Some(c) = eng.clients.get(&id) {
+                    let _ = c.out.send(ServerFrame::Files(Box::new(reply)));
+                }
+            }
+        }
+        ClientFrame::Command(Cmd::FileRead { space, path }) => {
+            match eng.file_read(space, &path) {
+                Ok(reply) => {
+                    // Opening a file is the moment a language server becomes worth having, and
+                    // the last moment before you would notice it was not there.
+                    if let Some(body) = reply.body.as_deref() {
+                        eng.lsp_sync(space, &path, body);
+                    }
+                    if let Some(c) = eng.clients.get(&id) {
+                        let _ = c.out.send(ServerFrame::Files(Box::new(reply)));
+                    }
+                }
+                Err(e) => eng.notice(NoticeLevel::Warn, format!("could not open {path}: {e}")),
+            }
+        }
+        // What the editor's buffer says right now, which is not what is on disk and is not
+        // meant to be. The point of this arriving separately from a save is that a language
+        // server should be objecting to the line you are on, not to the last thing you wrote
+        // out.
+        ClientFrame::Command(Cmd::DocChanged { space, path, body, vault }) => {
+            eng.doc_changed(space, &path, &body, vault);
+            // Whatever is already known about it, straight back to the client that asked. A
+            // server answers a document it has already seen with silence, so a file opened a
+            // second time would otherwise look clean until the next edit.
+            let known = eng
+                .doc_path(space, &path, vault)
+                .and_then(|p| eng.lsp.diags_for(&p).cloned());
+            if let (Some(diags), Some(c)) = (known, eng.clients.get(&id)) {
+                let _ = c.out.send(ServerFrame::Diagnostics { path, diags });
+            }
+        }
+        ClientFrame::Command(Cmd::DocClosed { space, path, vault }) => {
+            eng.doc_closed(space, &path, vault);
+        }
+        ClientFrame::Command(Cmd::Complete { space, path, body, line, col, vault }) => {
+            // The buffer goes with the request rather than waiting for the debounce: an
+            // answer about text the server has not been shown yet is an answer about a
+            // different file.
+            eng.doc_changed(space, &path, &body, vault);
+            let Some(full) = eng.doc_path(space, &path, vault) else { return };
+            let Some(lang) = lsp::language_for(&eng.cfg, &full) else { return };
+            let Some(root) = eng.session.space(space).map(|s| s.cwd.clone()) else { return };
+            eng.lsp_asked = Some(id);
+            eng.lsp.complete(&root, &lang, &full, line, col);
+        }
+        ClientFrame::Command(Cmd::FileSave { space, path, body }) => {
+            match eng.file_write(space, &path, &body) {
+                Ok(()) => eng.lsp_sync(space, &path, &body),
+                Err(e) => eng.notice(NoticeLevel::Error, format!("could not save {path}: {e}")),
+            }
+        }
         ClientFrame::Command(cmd) => apply_cmd(eng, cmd),
     }
 }
@@ -741,6 +1166,23 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         Cmd::ClosePane => {
             if let Some(p) = eng.session.focused_pane() {
+                // A file pane closing is a document closing, and a server that is never told
+                // goes on analysing something nobody is looking at.
+                let doc = eng.session.panes.get(&p).and_then(|p| p.doc_path().map(|d| d.to_path_buf()));
+                if let Some(path) = doc {
+                    if let Some(lang) = lsp::language_for(&cfg, &path) {
+                        // The pane being closed is the focused one, so its project is the
+                        // focused project.
+                        let root = eng
+                            .session
+                            .focused_space
+                            .and_then(|s| eng.session.space(s))
+                            .map(|s| s.cwd.clone());
+                        if let Some(root) = root {
+                            eng.lsp.did_close(&root, &lang, &path);
+                        }
+                    }
+                }
                 let _ = eng.session.close_pane(&cfg, p);
             }
         }
@@ -794,6 +1236,51 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         Cmd::FocusSpace(id) => {
             eng.session.focus_space(id);
+        }
+        Cmd::OpenDocPane { space, path } => {
+            // Relative to the project, and jailed to it: this opens a pane on a path that
+            // arrived over a socket, so it gets the same treatment as writing one.
+            let root = eng.session.space(space).map(|s| s.cwd.clone());
+            let full = root.and_then(|r| vault::safe_join(&r, &path).ok()).or_else(|| {
+                // A note lives in the vault rather than the project, so try there too.
+                eng.vault_root(space).and_then(|r| vault::safe_join(&r, &path).ok())
+            });
+            match full.filter(|p| p.is_file()) {
+                Some(p) => {
+                    if let Err(e) = eng.session.split_doc(&cfg, None, Dir::Right, &p) {
+                        problems.push((NoticeLevel::Warn, e.to_string()));
+                    } else if let Some(lang) = lsp::language_for(&cfg, &p) {
+                        if let Ok(text) = std::fs::read_to_string(&p) {
+                            let root = eng.session.space(space).map(|s| s.cwd.clone());
+                            if let Some(root) = root {
+                                eng.lsp.did_open(&cfg, &root, &lang, &p, &text);
+                            }
+                        }
+                    }
+                }
+                None => problems.push((NoticeLevel::Warn, format!("no file at {path}"))),
+            }
+        }
+        Cmd::OpenProject { cwd } => {
+            let path = PathBuf::from(&cwd);
+            // A remembered directory can be gone by the time you pick it. Say so instead of
+            // opening a space whose cwd silently became wherever the daemon was started.
+            if !path.is_dir() {
+                problems.push((NoticeLevel::Warn, format!("{cwd} is no longer a directory")));
+            } else if let Some(existing) =
+                eng.session.spaces.iter().find(|s| s.cwd == path).map(|s| s.id)
+            {
+                // Already open: go there rather than starting a second copy of the project.
+                eng.session.focus_space(existing);
+            } else {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| cwd.clone());
+                if let Err(e) = eng.session.create_space(&cfg, Some(&name), &path) {
+                    problems.push((NoticeLevel::Error, e.to_string()));
+                }
+            }
         }
         Cmd::NextSpace => {
             eng.session.cycle_space(1);
@@ -875,7 +1362,18 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         // Answered in `handle_client_frame`, which knows which client asked. Reaching here
         // means it came from the control API, where `digest` is the method to use.
-        Cmd::RequestDigest => {}
+        // Both handled per-client in `handle_client_frame`, where the asking client is
+        // known. Reaching them here means someone routed a question through a broadcast.
+        Cmd::RequestDigest
+        | Cmd::VaultQuery { .. }
+        | Cmd::VaultSave { .. }
+        | Cmd::VaultInit { .. }
+        | Cmd::FileQuery { .. }
+        | Cmd::FileRead { .. }
+        | Cmd::FileSave { .. }
+        | Cmd::DocChanged { .. }
+        | Cmd::DocClosed { .. }
+        | Cmd::Complete { .. } => {}
         Cmd::ApplyLayout { preset } => {
             if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
                 problems.push((NoticeLevel::Warn, e.to_string()));
@@ -924,11 +1422,28 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         }
     }
 
+    // Whatever project you are looking at is the most recent one. Done here rather than in
+    // the handful of commands that change spaces, because spaces are also created over the
+    // socket and by restore, and one funnel cannot forget a path the way five can.
+    eng.note_focused_project();
+
     // Git state, on detection's cadence but with its own much longer staleness window inside
     // the cache. Piggybacking on `detect_due` rather than taking a timer of its own keeps the
     // fork-per-directory work on one clock.
+    // Every tick, because a diagnostic is worth showing the moment it lands and draining a
+    // channel that is almost always empty costs nothing.
+    drain_lsp(eng);
+
     if detect_due {
         refresh_repos(eng);
+        refresh_vaults(eng);
+        // The half of a language server's lifecycle that is easy to leave for later: stop the
+        // ones nobody is using and the ones whose project has closed, and give the ones that
+        // died their next attempt.
+        let roots: Vec<PathBuf> = eng.session.spaces.iter().map(|s| s.cwd.clone()).collect();
+        eng.lsp.sweep(|root| roots.iter().any(|cwd| cwd.starts_with(root)));
+        let cfg = eng.cfg.clone();
+        eng.lsp.retry(&cfg);
         // On detection's cadence deliberately: exhaustion is read off the same screen snapshot
         // detection already takes, and a model that has just refused will still be refusing a
         // second later. Checking it every tick would buy nothing and cost a scan per pane.
@@ -1353,6 +1868,112 @@ fn refresh_repos(eng: &mut Engine) {
     eng.repos.retain(|k| dirs.iter().any(|d| d == k));
 }
 
+/// How many notes one pass may parse, across every vault.
+///
+/// This shares a tick with pane pumping, so a cold vault of five thousand notes has to
+/// arrive over several seconds rather than stalling the terminal to answer a question
+/// nobody has asked yet. Small enough to be invisible, large enough that a normal vault is
+/// fully indexed within a pass or two.
+const VAULT_BUDGET: usize = 40;
+
+/// Fold what the language servers have said into the session.
+///
+/// A server that started, died, or changed its mind about a file is something the person at
+/// the keyboard should be able to find out about without reading a log — especially the
+/// death, since the alternative symptom is diagnostics that simply never appear.
+fn drain_lsp(eng: &mut Engine) {
+    let events = eng.lsp.drain();
+    if events.is_empty() {
+        return;
+    }
+    let mut said = Vec::new();
+    let mut changed = false;
+    for ev in events {
+        match ev {
+            lsp::Event::Ready((root, lang)) => {
+                let _ = root;
+                said.push((NoticeLevel::Info, format!("{lang} language server ready")));
+            }
+            lsp::Event::Exited { key, why } => {
+                let (_, lang) = &key;
+                // Which of the two it is has already been decided by the registry, and the
+                // difference matters: one is "wait a moment", the other is "fix your config".
+                let text = match eng.lsp.get(&key).map(|s| s.state.clone()) {
+                    Some(lsp::State::Failed(_)) => {
+                        format!("{lang} language server keeps dying, giving up: {why}")
+                    }
+                    _ => format!("{lang} language server died, restarting: {why}"),
+                };
+                said.push((NoticeLevel::Warn, text));
+            }
+            // Straight back to whoever asked, and only to them: an unsolicited completion
+            // popup in somebody else's editor would be a haunting.
+            lsp::Event::Completions { path, items } => {
+                let named = eng.lsp_paths.get(&path).cloned();
+                if let (Some(rel), Some(c)) =
+                    (named, eng.lsp_asked.take().and_then(|id| eng.clients.get(&id)))
+                {
+                    let _ = c.out.send(ServerFrame::Completions { path: rel, items });
+                }
+            }
+            lsp::Event::Reply { .. } => {}
+            lsp::Event::Diagnostics { path, diags, .. } => {
+                changed = true;
+                // Only for files an editor actually has open, and named the way that editor
+                // named them. A server publishes diagnostics for whatever it feels like
+                // looking at — headers, generated code, the whole dependency tree — and none
+                // of that is on anybody's screen.
+                if let Some(rel) = eng.lsp_paths.get(&path).cloned() {
+                    for c in eng.clients.values() {
+                        let _ = c
+                            .out
+                            .send(ServerFrame::Diagnostics { path: rel.clone(), diags: diags.clone() });
+                    }
+                }
+            }
+        }
+    }
+    for (level, text) in said {
+        eng.notice(level, text);
+    }
+    // Diagnostic counts ride the snapshot, so a fresh set is a reason to send one.
+    if changed {
+        eng.dirty_shape = true;
+    }
+}
+
+/// Reindex each project's notes, and forget vaults no space is looking at any more.
+pub(super) fn refresh_vaults(eng: &mut Engine) {
+    if !eng.cfg.vault {
+        eng.vaults.clear();
+        return;
+    }
+    let mut roots: Vec<PathBuf> = eng
+        .session
+        .spaces
+        .iter()
+        .filter_map(|s| vault::locate(&s.cwd, &eng.cfg.vault_dir))
+        .collect();
+    // The home vault is indexed whether or not any project points at it, because notes are
+    // not a feature of whichever directory happens to be open.
+    if eng.cfg.vault_home.is_dir() {
+        roots.push(eng.cfg.vault_home.clone());
+    }
+    roots.sort();
+    roots.dedup();
+
+    let mut changed = false;
+    for root in &roots {
+        let idx = eng.vaults.entry(root.clone()).or_insert_with(|| vault::Index::new(root.clone()));
+        changed |= idx.refresh(VAULT_BUDGET);
+    }
+    eng.vaults.retain(|k, _| roots.iter().any(|r| r == k));
+    if changed {
+        // The note count rides the snapshot, so a changed index is a changed shape.
+        eng.touch();
+    }
+}
+
 /// Cheap summary of every agent, so a detection pass can tell whether anything the client
 /// can see has changed — including an agent disappearing, which emits no event.
 fn agent_fingerprint(session: &Session) -> Vec<(PaneId, String, crate::proto::AgentState)> {
@@ -1393,14 +2014,9 @@ fn broadcast(eng: &mut Engine) {
         return;
     }
 
-    let cfg = eng.cfg.clone();
     let snapshot = if eng.dirty_shape {
         eng.dirty_shape = false;
-        let mut s = eng.session.snapshot(&cfg, &eng.repos);
-        s.tasks_open = eng.board.open_count();
-        s.tasks_claimed = eng.board.claimed_count();
-        s.triggers_armed = if eng.cfg.unattended { eng.triggers.armed_count() } else { 0 };
-        Some(Box::new(s))
+        Some(Box::new(eng.snapshot()))
     } else {
         None
     };
@@ -1549,10 +2165,26 @@ async fn serve_conn(
 
             if protocol != PROTOCOL_VERSION {
                 // Both halves ship in one binary, so this only bites across versions.
+                //
+                // Name the socket when it is not the default one. A daemon on its own
+                // socket is one somebody started deliberately — a sandbox, a second session,
+                // a build under test — and plain `horde stop` would walk past it and stop
+                // whichever daemon the environment points at instead, which is at best
+                // confusing and at worst somebody else's running work.
+                let fix = if std::env::var_os("HORDE_SOCKET").is_some()
+                    || std::env::var_os("HORDE_CONFIG_DIR").is_some()
+                {
+                    format!(
+                        "Stop this one with `HORDE_SOCKET={} horde stop`, then start it again.",
+                        crate::config::socket_path().display()
+                    )
+                } else {
+                    "Run `horde stop`, then `horde`.".to_string()
+                };
                 let bye = ServerFrame::Bye {
                     reason: format!(
                         "protocol mismatch: client speaks v{protocol}, daemon speaks \
-                         v{PROTOCOL_VERSION}. Run `horde stop`, then `horde`."
+                         v{PROTOCOL_VERSION}. {fix}"
                     ),
                 };
                 framing::write_frame(&mut write_half, &bye).await?;
@@ -1649,6 +2281,123 @@ mod tests {
         std::env::temp_dir().join(format!("horde-test-{}-{name}", std::process::id()))
     }
 
+    /// The home vault is a promise that horde makes notes possible anywhere. It has to make
+    /// the directory too, or the promise only holds for people who already made it by hand —
+    /// which is every new user, told they have no vault the first time they write one.
+    #[test]
+    fn writing_the_first_note_makes_the_vault_that_holds_it() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        assert!(!home.exists(), "nothing is created before it is asked for");
+
+        let space = eng.session.focused_space.expect("a space");
+        let written = eng.vault_write(space, "First.md", "# First\n").expect("the write works");
+
+        assert!(written.starts_with(&home), "it landed in the home vault");
+        assert!(vault::is_vault(&home), "which is now a vault horde will find again");
+        assert!(eng.vault_for(space).is_some_and(|v| v.len() >= 1), "and it is indexed");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A note written by horde has to be in horde's index immediately. Waiting for the next
+    /// scan would mean the daemon not knowing about a file it just wrote itself.
+    #[test]
+    fn a_note_written_is_indexed_at_once() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        vault::init(&home).unwrap();
+        eng.cfg.vault_home = home.clone();
+        refresh_vaults(&mut eng);
+
+        let space = eng.session.focused_space.expect("a space");
+        eng.vault_write(space, "Ideas/One.md", "# One\n\nsee [[Welcome]]\n").unwrap();
+
+        let idx = eng.vault_for(space).expect("the home vault answers");
+        let welcome = idx.resolve("Welcome").expect("the starter note");
+        assert_eq!(idx.backlinks(welcome).len(), 1, "the new note's link is already known");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The knowledge layer does not depend on which directory happens to be open. A project
+    /// with no vault of its own still has somewhere to put a thought.
+    #[test]
+    fn a_project_without_a_vault_falls_back_to_the_home_one() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        vault::init(&home).unwrap();
+        eng.cfg.vault_home = home.clone();
+        refresh_vaults(&mut eng);
+
+        let space = eng.session.focused_space.expect("a space");
+        assert_eq!(eng.vault_root(space).as_ref(), Some(&home), "the fallback is the home vault");
+        assert!(eng.vault_for(space).is_some(), "and it is indexed");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The recents list is keyed on the directory, not the name. A renamed space is the
+    /// same project, and remembering it twice would offer you a choice between two rows
+    /// that open the same thing.
+    #[test]
+    fn reopening_a_project_moves_it_up_rather_than_listing_it_twice() {
+        let mut eng = engine();
+        eng.remember_project("alpha", std::path::Path::new("/tmp/alpha"));
+        eng.remember_project("beta", std::path::Path::new("/tmp/beta"));
+        eng.remember_project("renamed-alpha", std::path::Path::new("/tmp/alpha"));
+
+        let cwds: Vec<&str> = eng.recents.iter().map(|r| r.cwd.as_str()).collect();
+        assert_eq!(cwds, vec!["/tmp/alpha", "/tmp/beta"], "one entry each, newest first");
+        assert_eq!(eng.recents[0].name, "renamed-alpha", "and it carries the current name");
+    }
+
+    /// A list you pick from by eye stops being useful long before it stops being possible.
+    #[test]
+    fn the_recents_list_is_capped() {
+        let mut eng = engine();
+        for i in 0..(Engine::MAX_RECENTS + 5) {
+            eng.remember_project(&format!("p{i}"), &std::path::PathBuf::from(format!("/tmp/p{i}")));
+        }
+        assert_eq!(eng.recents.len(), Engine::MAX_RECENTS);
+        assert_eq!(eng.recents[0].name, format!("p{}", Engine::MAX_RECENTS + 4), "newest first");
+    }
+
+    /// Opening a project you already have on screen goes *there*. Starting a second space on
+    /// the same directory would split one project's agents across two rows of the sidebar.
+    #[test]
+    fn opening_a_project_that_is_already_open_focuses_it_instead_of_duplicating_it() {
+        let mut eng = engine();
+        // A directory of its own: the test engine's first space already sits on the temp
+        // root, and matching that one would prove nothing about the one we opened.
+        let dir = std::env::temp_dir().join(format!("horde-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = eng.cfg.clone();
+        let first = eng.session.create_space(&cfg, Some("already-here"), &dir).unwrap();
+        let before = eng.session.spaces.len();
+
+        apply_cmd(&mut eng, Cmd::OpenProject { cwd: dir.to_string_lossy().to_string() });
+
+        assert_eq!(eng.session.spaces.len(), before, "no second space");
+        assert_eq!(eng.session.focused_space, Some(first), "and it went there");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A remembered directory can be deleted between sessions. Say so, rather than opening a
+    /// space whose cwd silently became wherever the daemon happened to start.
+    #[test]
+    fn opening_a_project_that_no_longer_exists_warns_instead_of_guessing() {
+        let mut eng = engine();
+        let before = eng.session.spaces.len();
+        apply_cmd(&mut eng, Cmd::OpenProject { cwd: "/tmp/horde-definitely-not-here".into() });
+        assert_eq!(eng.session.spaces.len(), before, "nothing opened");
+        assert!(
+            eng.pending_events.iter().any(|e| matches!(e, Event::Notice { .. })),
+            "and it said why"
+        );
+    }
+
     pub(super) fn engine() -> Engine {
         engine_with_shell(None)
     }
@@ -1666,6 +2415,12 @@ mod tests {
         }
         // Present for every test engine so the env path is exercised rather than bypassed.
         cfg.env.insert("HORDE_ENV_TEST".into(), "sk-or-test".into());
+        // Point the home vault somewhere that does not exist, so tests never read the notes
+        // of whoever is running them. Without this the suite passes or fails depending on
+        // whether the developer happens to keep a `~/notes` — which is exactly the kind of
+        // difference between a laptop and CI that costs an afternoon to find.
+        cfg.vault_home = std::env::temp_dir()
+            .join(format!("horde-test-novault-{}", std::process::id()));
         let session = Session::new(&cfg);
         let agents = agents::Detector::new(&cfg);
         let mut eng = Engine {
@@ -1681,7 +2436,12 @@ mod tests {
             last_seen: 0,
             last_alert: 0,
             agents,
+            recents: Vec::new(),
             repos: repo::Cache::default(),
+            vaults: HashMap::new(),
+            lsp: lsp::Registry::new(),
+            lsp_paths: HashMap::new(),
+            lsp_asked: None,
             cfg,
             clients: HashMap::new(),
             dirty_shape: true,

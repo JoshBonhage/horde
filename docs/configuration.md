@@ -32,6 +32,7 @@ settings screen.
 
 ```toml
 prefix = "ctrl+b"
+leader = "ctrl+space"       # opens the multi-key leader table
 scrollback = 10000
 shell = "/bin/zsh"          # defaults to $SHELL
 
@@ -87,13 +88,46 @@ command = "~/bin/horde-ping"  # run when something needs you and nothing is atta
 unattended = false          # master switch: no rule fires until this is on
 max_spawned = 2             # agents horde may run that it started itself (0–16)
 
+[vault]
+home = "~/notes"            # the vault that is always there, whatever project you are in
+dir = "notes"               # a project's own notes directory, when it has one
+enabled = true
+
 [keys]
 zoom = "prefix+f"
 detach = "ctrl+alt+q"       # a modified chord binds directly
+leader_window_zoom = "leader w f"   # a leader sequence, keys separated by spaces
 close_pane = "none"         # unbind
 ```
 
 Run `horde keys` for every rebindable action name.
+
+## Languages
+
+Syntax colouring is compiled in rather than configured, because a tree-sitter grammar is C
+that has to be built with the binary. `horde status` reports which languages a build has.
+
+| Build | Knows |
+|---|---|
+| default | markdown, rust, typescript, tsx, javascript, python, json, toml, bash |
+| `--no-default-features` | nothing — every file is plain text |
+| `--no-default-features --features lang-rust,lang-markdown` | just those two |
+
+The full set costs roughly 6.6 MB of binary, unevenly: typescript and tsx are 2.8 MiB of it
+and json is 8 KiB. Colours come from the theme, so nothing needs setting per language.
+
+Three binding forms, and which one you get depends on the spec:
+
+| Spec | Reached by |
+|---|---|
+| `prefix+x` | the prefix, then `x` |
+| `ctrl+alt+q` | the chord on its own, no prefix |
+| `leader w f` | the leader, then `w`, then `f` — up to three keys |
+
+A bare printable like `"f"` is refused as a direct binding, because it would shadow ordinary
+typing. After the leader it is fine, and expected: nothing typed there was going to reach a
+program. Leader sequences stop at three keys — past that a binding is a menu, and a menu
+should be something you read rather than something you memorise.
 
 ## Project colours
 

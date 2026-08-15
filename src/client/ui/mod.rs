@@ -1,10 +1,15 @@
 //! Frame composition and shared drawing helpers.
 
 pub mod bus_drawer;
+pub mod dashboard;
+pub mod graph_view;
 pub mod logo;
+pub mod markdown;
+pub mod notes;
 pub mod overlays;
 pub mod pane_widget;
 pub mod sidebar;
+pub mod setup;
 pub mod statusbar;
 
 use ratatui::buffer::Buffer;
@@ -16,7 +21,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use super::{App, Mode};
-use crate::proto::{AgentState, Rect, Rgb};
+use crate::proto::{AgentState, Rect, Rgb, Severity};
 use crate::theme::{mix, Theme};
 
 pub fn color(c: Rgb) -> Color {
@@ -226,6 +231,401 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     };
 
+    // The dashboard is the one view that *replaces* the panes rather than floating over
+    // them. Everything else in horde is an overlay over a dimmed frame, because everything
+    // else is something you do to a session you can still see. A start screen is not.
+    if let Mode::Graph { sel } = app.mode {
+        if let (Some(sim), Some(g)) = (app.sim.as_ref(), app.vault.as_ref().and_then(|v| v.graph.as_ref()))
+        {
+            app.graph_hits = graph_view::draw(
+                f.buffer_mut(), area, &theme, g, sim, sel, app.graph_zoom, app.graph_centre,
+            );
+        }
+        statusbar::StatusBar {
+            snap: &snap,
+            theme: &theme,
+            mode: app.mode.clone(),
+            prefix: app.cfg.prefix.describe(),
+        }
+        .render(trect(snap.status), f.buffer_mut());
+        overlays::toasts(f, area, app);
+        return;
+    }
+
+    if let Mode::Setup { step } = app.mode {
+        setup::draw(f.buffer_mut(), area, &theme, step, &app.setup);
+        overlays::toasts(f, area, app);
+        return;
+    }
+
+    if let Mode::Editor { ref path, scroll, vim: ref vim_mode, .. } = app.mode {
+        let vim_mode = vim_mode.clone();
+        let theme2 = theme.clone();
+        fill(f.buffer_mut(), area, theme2.ui.bg);
+        let col = area.width.saturating_sub(6).min(96);
+        let x = area.x + (area.width.saturating_sub(col)) / 2;
+        let dirty = app.buffer.as_ref().is_some_and(|b| b.dirty);
+        // What a language server has said about this file, if one is watching it.
+        let diags: &[crate::proto::Diag] =
+            app.diags.get(path).map(|v| v.as_slice()).unwrap_or(&[]);
+        let errors = diags.iter().filter(|d| d.severity == Severity::Error).count();
+        let warnings = diags.iter().filter(|d| d.severity == Severity::Warning).count();
+        let mut head = vec![ratatui::text::Span::styled(
+            format!("{}{}", path, if dirty { "  •" } else { "" }),
+            Style::default()
+                .fg(color(if dirty { theme2.ui.working } else { theme2.ui.text_faint }))
+                .bg(color(theme2.ui.bg)),
+        )];
+        // Counted in the header as well as marked in the margin, because the margin only
+        // says what is on this screen and the file is longer than the screen.
+        if errors > 0 {
+            head.push(ratatui::text::Span::styled(
+                format!("   {errors}◍"),
+                Style::default().fg(color(theme2.ui.blocked)).bg(color(theme2.ui.bg)),
+            ));
+        }
+        if warnings > 0 {
+            head.push(ratatui::text::Span::styled(
+                format!("  {warnings}△"),
+                Style::default().fg(color(theme2.ui.working)).bg(color(theme2.ui.bg)),
+            ));
+        }
+        put_line(f.buffer_mut(), x, area.y, col, Line::from(head));
+
+        if let Some(buf) = app.buffer.as_ref() {
+            let rows = area.height.saturating_sub(4);
+            let top = area.y + 2;
+            // Live preview: every line renders as it will read, except the one the cursor
+            // is on, which shows its source. Hiding characters under a cursor would make the
+            // arrow keys lie about where they are going — so the line you are working on
+            // tells the truth, and the rest of the page shows you what you are making.
+            // Live preview is a markdown thing. Applying it to source would style `**p` as
+            // bold and eat the asterisks — a renderer confidently rewriting code it does not
+            // understand, which is worse than showing it plainly.
+            let markdownish = path.rsplit('.').next().is_some_and(|e| {
+                matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx")
+            });
+            // Code gets colour instead. Recomputed only when the text changes, which is what
+            // keeps typing feeling like typing.
+            if !markdownish {
+                let rev = app.buffer.as_ref().map(|b| b.rev).unwrap_or(0);
+                let stale =
+                    app.highlight.as_ref().is_none_or(|(p, r, _)| *r != rev || p != path);
+                if stale {
+                    let text = app.buffer.as_ref().map(|b| b.text()).unwrap_or_default();
+                    app.highlight = crate::client::syntax::highlight(path, &text, &theme2)
+                        .map(|lines| (path.clone(), rev, lines));
+                }
+            }
+            for (i, line) in buf.lines.iter().skip(scroll).take(rows as usize).enumerate() {
+                let n = scroll + i;
+                let rendered = if markdownish && n != buf.line {
+                    markdown::live_line(line, &theme2)
+                } else if let Some(hl) =
+                    app.highlight.as_ref().and_then(|(_, _, ls)| ls.get(n)).filter(|_| !markdownish)
+                {
+                    hl.clone()
+                } else {
+                    Line::from(ratatui::text::Span::styled(
+                        line.clone(),
+                        Style::default().fg(color(theme2.ui.text)).bg(color(theme2.ui.bg)),
+                    ))
+                };
+                put_line(f.buffer_mut(), x, top + i as u16, col, rendered);
+                // The mark goes in the margin rather than under the text: a squiggle drawn
+                // into an already-styled line means splitting spans the highlighter just
+                // built, and the margin is where the eye looks for "which line" anyway.
+                if let Some(worst) = diags
+                    .iter()
+                    .filter(|d| d.line as usize == n)
+                    .min_by_key(|d| d.severity)
+                {
+                    put_line(
+                        f.buffer_mut(),
+                        x.saturating_sub(2),
+                        top + i as u16,
+                        2,
+                        Line::from(ratatui::text::Span::styled(
+                            worst.severity.glyph().to_string(),
+                            Style::default()
+                                .fg(color(match worst.severity {
+                                    Severity::Error => theme2.ui.blocked,
+                                    Severity::Warning => theme2.ui.working,
+                                    _ => theme2.ui.text_faint,
+                                }))
+                                .bg(color(theme2.ui.bg)),
+                        )),
+                    );
+                }
+            }
+            // The cursor belongs to whichever line is being typed into. While the `:` line is
+            // open that is the prompt, not the text — put it in both places and the one you
+            // are actually editing is anybody's guess.
+            if vim_mode.prompt().is_none()
+                && buf.line >= scroll
+                && buf.line < scroll + rows as usize
+            {
+                let cx = x + (buf.col as u16).min(col.saturating_sub(1));
+                f.set_cursor_position((cx, top + (buf.line - scroll) as u16));
+            }
+        }
+
+        // One row up from the bottom, because the bottom row is the status bar and it is
+        // drawn after this. The hint row had been landing underneath it, which is why nobody
+        // had ever seen it.
+        // The completion list, over the text and under the cursor's line.
+        if let (Some(c), Some(buf)) = (app.completions.as_ref(), app.buffer.as_ref()) {
+            let prefix = buf.text_from(c.from);
+            let items = c.matching(&prefix);
+            if !items.is_empty() && buf.line >= scroll {
+                let cursor_row = area.y + 2 + (buf.line - scroll) as u16;
+                let below = area.y + area.height.saturating_sub(2) - cursor_row.min(area.y + area.height);
+                // Below the line normally; above it when the line is near the bottom, so the
+                // list never covers the thing being completed.
+                let want = (items.len() as u16).min(8);
+                let (list_y, room) = if below > want + 1 {
+                    (cursor_row + 1, want)
+                } else {
+                    (cursor_row.saturating_sub(want.min(cursor_row - area.y)), want.min(cursor_row - area.y))
+                };
+                let widest = items
+                    .iter()
+                    .take(room as usize)
+                    .map(|i| width(&i.label) + i.kind.as_deref().map(|k| width(k) + 2).unwrap_or(0))
+                    .max()
+                    .unwrap_or(10);
+                let w = (widest as u16 + 3).min(col.saturating_sub(2)).max(12);
+                let lx = (x + buf.word_start() as u16).min(x + col.saturating_sub(w));
+                let top_at = c.sel.saturating_sub(room.saturating_sub(1) as usize);
+                for (i, item) in items.iter().skip(top_at).take(room as usize).enumerate() {
+                    let selected = top_at + i == c.sel;
+                    let bg = if selected { theme2.ui.selection } else { theme2.ui.panel_bg };
+                    let y = list_y + i as u16;
+                    fill(f.buffer_mut(), TRect { x: lx, y, width: w, height: 1 }, bg);
+                    let mut spans = vec![ratatui::text::Span::styled(
+                        format!(" {}", truncate(&item.label, w as usize - 2)),
+                        Style::default()
+                            .fg(color(if selected { theme2.ui.text } else { theme2.ui.text_dim }))
+                            .bg(color(bg)),
+                    )];
+                    // The kind is worth a column of its own: `fn` against `field` is most of
+                    // what you are choosing between when two names look alike.
+                    if let Some(kind) = item.kind.as_deref() {
+                        let used = width(&item.label) + 1;
+                        if used + kind.len() + 2 < w as usize {
+                            spans.push(ratatui::text::Span::styled(
+                                format!("{}{kind} ", " ".repeat(w as usize - used - kind.len() - 1)),
+                                Style::default().fg(color(theme2.ui.text_faint)).bg(color(bg)),
+                            ));
+                        }
+                    }
+                    put_line(f.buffer_mut(), lx, y, w, Line::from(spans));
+                }
+            }
+        }
+
+        let foot = area.y + area.height.saturating_sub(2);
+        match vim_mode.prompt() {
+            // The line being typed *is* the hint: it shows the command as it is written, the
+            // way it does in the editor everyone learned this from.
+            Some((glyph, typed)) => {
+                put_line(
+                    f.buffer_mut(),
+                    x,
+                    foot,
+                    col,
+                    Line::from(ratatui::text::Span::styled(
+                        format!("{glyph}{typed}"),
+                        Style::default().fg(color(theme2.ui.text)).bg(color(theme2.ui.bg)),
+                    )),
+                );
+                let cx = x + 1 + typed.chars().count() as u16;
+                f.set_cursor_position((cx.min(x + col.saturating_sub(1)), foot));
+            }
+            // What is wrong with the line you are on outranks the list of keys: the keys do
+            // not change, and this does. Nowhere else has room for the message — the margin
+            // holds one glyph and the line itself is the text you are writing.
+            None => {
+                let here = app.buffer.as_ref().map(|b| b.line).unwrap_or(0);
+                let on_line: Vec<&crate::proto::Diag> =
+                    diags.iter().filter(|d| d.line as usize == here).collect();
+                let line = match on_line.first() {
+                    Some(d) => {
+                        let more = match on_line.len() {
+                            1 => String::new(),
+                            n => format!("   (+{} more)", n - 1),
+                        };
+                        let source = d.source.as_deref().map(|s| format!("{s}: ")).unwrap_or_default();
+                        Line::from(ratatui::text::Span::styled(
+                            truncate(&format!("{source}{}{more}", d.message), col as usize),
+                            Style::default()
+                                .fg(color(match d.severity {
+                                    Severity::Error => theme2.ui.blocked,
+                                    Severity::Warning => theme2.ui.working,
+                                    _ => theme2.ui.text_dim,
+                                }))
+                                .bg(color(theme2.ui.bg)),
+                        ))
+                    }
+                    None => {
+                        let hint = if vim_mode.typing() {
+                            "esc normal   ctrl+s save   ctrl+z undo   ctrl+r read"
+                        } else if diags.is_empty() {
+                            "i insert   : command   / search   dd yy p   u undo   :wq write and go"
+                        } else {
+                            "i insert   : command   / search   ]d [d next problem   :wq write and go"
+                        };
+                        Line::from(ratatui::text::Span::styled(
+                            hint.to_string(),
+                            Style::default()
+                                .fg(color(theme2.ui.text_faint))
+                                .bg(color(theme2.ui.bg)),
+                        ))
+                    }
+                };
+                put_line(f.buffer_mut(), x, foot, col, line);
+            }
+        }
+        statusbar::StatusBar {
+            snap: &snap,
+            theme: &theme,
+            mode: app.mode.clone(),
+            prefix: app.cfg.prefix.describe(),
+        }
+        .render(trect(snap.status), f.buffer_mut());
+        overlays::toasts(f, area, app);
+        return;
+    }
+
+    if let Mode::Reader { scroll, link } = app.mode {
+        let theme2 = theme.clone();
+        let body = app.vault.as_ref().and_then(|v| v.body.clone()).unwrap_or_default();
+        let title = app
+            .vault
+            .as_ref()
+            .and_then(|v| v.notes.first().map(|n| n.title.clone()))
+            .unwrap_or_default();
+        let backlinks = app.vault.as_ref().map(|v| v.backlinks.len()).unwrap_or(0);
+        // A column, not a wall. Prose is read at a comfortable measure whatever the terminal
+        // is doing, which is the one typographic rule a terminal can still honour.
+        let col = area.width.saturating_sub(6).min(96);
+        let x = area.x + (area.width.saturating_sub(col)) / 2;
+        fill(f.buffer_mut(), area, theme2.ui.bg);
+
+        let head = if backlinks == 0 {
+            title.clone()
+        } else if backlinks == 1 {
+            format!("{title}   ← 1 note links here")
+        } else {
+            format!("{title}   ← {backlinks} notes link here")
+        };
+        put_line(
+            f.buffer_mut(),
+            x,
+            area.y,
+            col,
+            Line::from(ratatui::text::Span::styled(
+                head,
+                Style::default()
+                    .fg(color(theme2.ui.text_faint))
+                    .bg(color(theme2.ui.bg)),
+            )),
+        );
+
+        let rendered = markdown::render(&body, col, &theme2);
+        let selected_line = rendered.links.get(link).map(|(l, _)| *l);
+        let body_top = area.y + 2;
+        let rows = area.height.saturating_sub(4);
+        for (i, line) in rendered.lines.iter().skip(scroll).take(rows as usize).enumerate() {
+            let y = body_top + i as u16;
+            // The link under the cursor is marked in the margin: the reader has to know
+            // which one `enter` will follow before pressing it.
+            if selected_line == Some(scroll + i) {
+                put_line(
+                    f.buffer_mut(),
+                    x.saturating_sub(2),
+                    y,
+                    2,
+                    Line::from(ratatui::text::Span::styled(
+                        "▸".to_string(),
+                        Style::default().fg(color(theme2.ui.accent)).bg(color(theme2.ui.bg)),
+                    )),
+                );
+            }
+            put_line(f.buffer_mut(), x, y, col, line.clone());
+        }
+
+        let more = rendered.lines.len().saturating_sub(scroll + rows as usize);
+        let hint = if more > 0 {
+            format!("tab links   enter follow   e edit   esc back   {more} more lines")
+        } else {
+            "tab links   enter follow   e edit   esc back".to_string()
+        };
+        put_line(
+            f.buffer_mut(),
+            x,
+            area.y + area.height.saturating_sub(1),
+            col,
+            Line::from(ratatui::text::Span::styled(
+                hint,
+                Style::default().fg(color(theme2.ui.text_faint)).bg(color(theme2.ui.bg)),
+            )),
+        );
+        statusbar::StatusBar {
+            snap: &snap,
+            theme: &theme,
+            mode: app.mode.clone(),
+            prefix: app.cfg.prefix.describe(),
+        }
+        .render(trect(snap.status), f.buffer_mut());
+        overlays::toasts(f, area, app);
+        return;
+    }
+
+    if let Mode::Files { ref query, sel } = app.mode {
+        let rows = notes::file_rows(app.files.as_ref(), query, &app.open_dirs);
+        app.notes_hits =
+            notes::draw_files(f.buffer_mut(), area, &theme, app.files.as_ref(), &rows, query, sel);
+        statusbar::StatusBar {
+            snap: &snap,
+            theme: &theme,
+            mode: app.mode.clone(),
+            prefix: app.cfg.prefix.describe(),
+        }
+        .render(trect(snap.status), f.buffer_mut());
+        overlays::toasts(f, area, app);
+        return;
+    }
+
+    if let Mode::Notes { ref query, sel } = app.mode {
+        let rows = notes::rows(app.vault.as_ref(), query);
+        app.notes_hits =
+            notes::draw(f.buffer_mut(), area, &theme, app.vault.as_ref(), &rows, query, sel);
+        statusbar::StatusBar {
+            snap: &snap,
+            theme: &theme,
+            mode: app.mode.clone(),
+            prefix: app.cfg.prefix.describe(),
+        }
+        .render(trect(snap.status), f.buffer_mut());
+        overlays::toasts(f, area, app);
+        return;
+    }
+
+    if let Mode::Dashboard { sel } = app.mode {
+        let rows = dashboard::rows(&snap, now_millis());
+        app.dashboard_hits = dashboard::draw(f.buffer_mut(), area, &theme, &rows, sel);
+        statusbar::StatusBar {
+            snap: &snap,
+            theme: &theme,
+            mode: app.mode.clone(),
+            prefix: app.cfg.prefix.describe(),
+        }
+        .render(trect(snap.status), f.buffer_mut());
+        overlays::toasts(f, area, app);
+        return;
+    }
+
     // Panes
     let mut cursor_at: Option<(u16, u16)> = None;
     for pane in &snap.panes {
@@ -316,6 +716,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Terminal => {}
         Mode::Prefix => {}
+        // Drawn above instead of here: it replaces the frame rather than sitting on it, and
+        // this arm is only reached when there is a frame to sit on.
+        Mode::Dashboard { .. }
+        | Mode::Notes { .. }
+        | Mode::Graph { .. }
+        | Mode::Reader { .. }
+        | Mode::Editor { .. }
+        | Mode::Setup { .. }
+        | Mode::Files { .. } => {}
+        // No dimming: which-key is a hint you read while still looking at your work, not a
+        // panel that takes the screen. It also has to be legible the instant it appears.
+        Mode::Leader { pending, .. } => overlays::which_key(f, area, app, pending),
         // The panel is already on screen and already drew its own cursor; there is no overlay
         // to put in front of it.
         Mode::Sidebar => {}
@@ -503,9 +915,9 @@ mod frame_tests {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             spaces: vec![
                 SpaceInfo { id: 1, name: "api-refactor".into(), cwd: "/x".into(),
-                    tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1, accent: 0, collapsed: false, repo: None },
+                    tabs: vec![1], focused_tab: Some(1), agent_count: 2, attention_count: 1, accent: 0, collapsed: false, repo: None, notes: None, lsp: Vec::new() },
                 SpaceInfo { id: 2, name: "docs".into(), cwd: "/y".into(),
-                    tabs: vec![2], focused_tab: Some(2), agent_count: 1, attention_count: 0, accent: 1, collapsed: false, repo: None },
+                    tabs: vec![2], focused_tab: Some(2), agent_count: 1, attention_count: 0, accent: 1, collapsed: false, repo: None, notes: None, lsp: Vec::new() },
             ],
             tabs: vec![
                 TabInfo { id: 1, space: 1, name: "agents".into(), panes: vec![1,2,3], focused_pane: Some(1) },
@@ -521,6 +933,7 @@ mod frame_tests {
             tasks_open: 2,
             tasks_claimed: 1,
             triggers_armed: 0,
+            recents: Vec::new(),
         };
 
         app.rows.insert(1, vec![

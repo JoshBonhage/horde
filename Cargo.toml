@@ -40,6 +40,45 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 toml_edit = "0.25.13"
+# Markdown parsing for the vault index. Default features off: the `html` renderer and
+# `getopts` are for a CLI that turns markdown into web pages, which is the one thing horde
+# will never do.
+pulldown-cmark = { version = "0.13.4", default-features = false }
+tree-sitter = "0.26.12"
+tree-sitter-highlight = "0.26.12"
+tree-sitter-md = { version = "0.5.3", optional = true }
+tree-sitter-rust = { version = "0.24.2", optional = true }
+tree-sitter-typescript = { version = "0.23.2", optional = true }
+tree-sitter-javascript = { version = "0.25.0", optional = true }
+tree-sitter-python = { version = "0.25.0", optional = true }
+tree-sitter-json = { version = "0.24.8", optional = true }
+tree-sitter-toml-ng = { version = "0.7.0", optional = true }
+tree-sitter-bash = { version = "0.25.1", optional = true }
+
+# Language recognition. Each grammar is compiled C and costs real binary size — measured,
+# not guessed: typescript and its tsx twin are 2.8 MiB between them, bash 1.4, rust 1.1,
+# while json is 8 KiB. So they are features, and the default set is the languages horde is
+# most likely to be pointed at rather than everything that exists.
+#
+#   cargo build --no-default-features --features lang-markdown
+#     ... for a build that only knows notes, about 1 MiB of grammars.
+[features]
+default = ["languages"]
+languages = [
+    "lang-markdown", "lang-rust", "lang-typescript", "lang-javascript",
+    "lang-python", "lang-json", "lang-toml", "lang-bash",
+]
+lang-markdown = ["dep:tree-sitter-md"]
+lang-rust = ["dep:tree-sitter-rust"]
+# TypeScript's grammar extends JavaScript's, and so does its highlight query: it
+# assumes JS's is in front of it. Pulling both in is what makes a comment in a
+# `.ts` file a comment.
+lang-typescript = ["dep:tree-sitter-typescript", "dep:tree-sitter-javascript"]
+lang-javascript = ["dep:tree-sitter-javascript"]
+lang-python = ["dep:tree-sitter-python"]
+lang-json = ["dep:tree-sitter-json"]
+lang-toml = ["dep:tree-sitter-toml-ng"]
+lang-bash = ["dep:tree-sitter-bash"]
 
 [profile.release]
 lto = "thin"

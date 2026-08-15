@@ -72,12 +72,15 @@ pub fn log_path() -> PathBuf {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     prefix: Option<String>,
+    leader: Option<String>,
     scrollback: Option<usize>,
     shell: Option<String>,
     #[serde(default)]
     theme: RawTheme,
     #[serde(default)]
     ui: RawUi,
+    #[serde(default)]
+    vault: RawVault,
     #[serde(default)]
     keys: HashMap<String, String>,
     #[serde(default)]
@@ -94,6 +97,23 @@ struct RawConfig {
     env: HashMap<String, String>,
     #[serde(default)]
     models: HashMap<String, RawModelProfile>,
+    #[serde(default)]
+    lsp: HashMap<String, RawLspServer>,
+}
+
+/// One `[lsp.<language>]` block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLspServer {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    /// Filenames ending in these belong to this language. Overrides the built-in guess, and
+    /// is the whole mechanism for a language horde has never heard of.
+    #[serde(default)]
+    extensions: Vec<String>,
 }
 
 /// The `[handover]` block.
@@ -146,6 +166,15 @@ struct RawTheme {
     space_accents: Option<Vec<String>>,
 }
 
+/// Where a project's notes live, and whether to look for them at all.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawVault {
+    dir: Option<String>,
+    enabled: Option<bool>,
+    home: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawUi {
@@ -154,6 +183,7 @@ struct RawUi {
     bus: Option<bool>,
     bus_width: Option<u16>,
     pane_titles: Option<bool>,
+    dashboard: Option<bool>,
     tab_bar: Option<bool>,
     status_bar: Option<bool>,
     animate: Option<bool>,
@@ -203,6 +233,33 @@ struct RawTriggers {
 /// cmd = "opencode --model openrouter/{model}"
 /// order = ["qwen/qwen3-coder:free", "deepseek/deepseek-chat-v3.1:free"]
 /// ```
+/// A language server horde may start, and what it is for.
+///
+/// Nothing is assumed. horde ships no server list and no bundled binaries — a language
+/// server is a program on your machine, and this is where you say which one and for what:
+///
+/// ```toml
+/// [lsp.rust]
+/// command = "rust-analyzer"
+///
+/// [lsp.cpp]
+/// command = "clangd"
+/// args = ["--background-index"]
+/// extensions = ["c", "h", "cc", "cpp", "hpp"]
+/// ```
+///
+/// The language name is yours. It is what horde calls the server, what it sends as the
+/// document's `languageId`, and — through `extensions` — how a filename finds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LspServer {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    /// Extensions this language claims, lowercase and without the dot. Empty means the
+    /// built-in guess, which knows the common ones and nothing exotic.
+    pub extensions: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelProfile {
     /// Command template. `{model}` is replaced with an entry from `order`.
@@ -299,6 +356,11 @@ impl Notify {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub prefix: Chord,
+    /// Opens the leader table from a terminal pane, where a bare key would be typing.
+    ///
+    /// Inside horde's own views the leader is bare `space` as well, because there no
+    /// keystroke is reaching a program — see [`Trigger::Leader`].
+    pub leader: Chord,
     pub scrollback: usize,
     pub shell: String,
     pub theme: Theme,
@@ -307,6 +369,23 @@ pub struct Config {
     pub bus: bool,
     pub bus_width: u16,
     pub pane_titles: bool,
+    /// Show the start screen when attaching to a session that began from nothing.
+    pub dashboard: bool,
+    /// Directory under a project that holds its notes, when it is not a real Obsidian vault.
+    ///
+    /// Tracked, human-owned content — which is why it is not under `.horde/`. That directory
+    /// is excluded from git on purpose, and notes are the opposite of scratch: they are the
+    /// part you want reviewed, committed, and read by someone else.
+    pub vault_dir: String,
+    /// Whether to index notes at all.
+    pub vault: bool,
+    /// The vault that is always there, whatever project you are in.
+    ///
+    /// The knowledge layer is not a feature of the multiplexer, so it does not depend on
+    /// having the right directory open: a thought worth writing down rarely arrives while
+    /// you happen to be in the project it belongs to. Projects may still have vaults of
+    /// their own; this is the one that answers when they do not.
+    pub vault_home: std::path::PathBuf,
     pub tab_bar: bool,
     pub status_bar: bool,
     pub animate: bool,
@@ -351,6 +430,9 @@ pub struct Config {
     pub env: HashMap<String, String>,
     /// Named model rotations, keyed by profile name. See `ModelProfile`.
     pub models: HashMap<String, ModelProfile>,
+    /// Language servers, keyed by language name. Empty by default, and nothing spawns until
+    /// there is something in here. See `LspServer`.
+    pub lsp: HashMap<String, LspServer>,
     /// Telling an agent to hand over before it runs out. See `Handover`.
     pub handover: Handover,
     pub notify: Notify,
@@ -426,6 +508,10 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             prefix: Chord::new(KeyModifiers::CONTROL, KeyCode::Char('b')),
+            // ctrl+space, because bare space is typing and every unmodified alternative is
+            // either taken by a shell or reserved by a desktop. Emacs users who want a real
+            // NUL can still send one with `send_leader`.
+            leader: Chord::new(KeyModifiers::CONTROL, KeyCode::Char(' ')),
             scrollback: 10_000,
             shell: crate::daemon::pane::default_shell(),
             theme: Theme::horde(),
@@ -434,6 +520,10 @@ impl Default for Config {
             bus: false,
             bus_width: 30,
             pane_titles: true,
+            dashboard: true,
+            vault_dir: "notes".into(),
+            vault: true,
+            vault_home: dirs::home_dir().unwrap_or_default().join("notes"),
             tab_bar: true,
             status_bar: true,
             animate: true,
@@ -449,6 +539,7 @@ impl Default for Config {
             max_spawned: 2,
             env: HashMap::new(),
             models: HashMap::new(),
+            lsp: HashMap::new(),
             handover: Handover::default(),
             notify: Notify::Horde,
             notify_command: None,
@@ -460,7 +551,7 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> (Config, Vec<String>) {
-        Self::load_from(&config_dir().join("config.toml"))
+        Self::load_from(&config_path())
     }
 
     /// Returns the config plus any non-fatal complaints, so a typo in one key doesn't
@@ -490,6 +581,12 @@ impl Config {
             match Chord::parse(p) {
                 Ok(c) => cfg.prefix = c,
                 Err(e) => warnings.push(format!("prefix: {e}")),
+            }
+        }
+        if let Some(l) = &raw.leader {
+            match Chord::parse(l) {
+                Ok(c) => cfg.leader = c,
+                Err(e) => warnings.push(format!("leader: {e}")),
             }
         }
         if let Some(s) = raw.scrollback {
@@ -576,6 +673,28 @@ impl Config {
             );
         }
 
+        // Language servers. A blank command is refused here rather than presenting later as
+        // "diagnostics never appear", which is the least debuggable symptom there is.
+        for (name, s) in &raw.lsp {
+            if s.command.trim().is_empty() {
+                warnings.push(format!("lsp.{name}: command is empty"));
+                continue;
+            }
+            cfg.lsp.insert(
+                name.clone(),
+                LspServer {
+                    command: s.command.clone(),
+                    args: s.args.clone(),
+                    env: s.env.clone(),
+                    extensions: s
+                        .extensions
+                        .iter()
+                        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+                        .collect(),
+                },
+            );
+        }
+
         // Handover. A warning list with nothing to hand over *to* would fire and then have no
         // advice to give, so the profile is what makes the feature live.
         cfg.handover = Handover {
@@ -637,6 +756,26 @@ impl Config {
         cfg.bus = ui.bus.unwrap_or(cfg.bus);
         cfg.bus_width = ui.bus_width.unwrap_or(cfg.bus_width).clamp(18, 70);
         cfg.pane_titles = ui.pane_titles.unwrap_or(cfg.pane_titles);
+        cfg.dashboard = ui.dashboard.unwrap_or(cfg.dashboard);
+        if let Some(d) = raw.vault.dir.as_deref() {
+            let d = d.trim();
+            // An absolute path would make one project's notes another's, and an empty one
+            // would index the whole working directory.
+            if d.is_empty() || std::path::Path::new(d).is_absolute() {
+                warnings.push(format!("vault.dir {d:?}: must be a relative directory name"));
+            } else {
+                cfg.vault_dir = d.to_string();
+            }
+        }
+        cfg.vault = raw.vault.enabled.unwrap_or(cfg.vault);
+        if let Some(h) = raw.vault.home.as_deref() {
+            let h = h.trim();
+            if h.is_empty() {
+                warnings.push("vault.home: must be a path".to_string());
+            } else {
+                cfg.vault_home = expand_home(h);
+            }
+        }
         cfg.tab_bar = ui.tab_bar.unwrap_or(cfg.tab_bar);
         cfg.status_bar = ui.status_bar.unwrap_or(cfg.status_bar);
         cfg.animate = ui.animate.unwrap_or(cfg.animate);
@@ -682,6 +821,20 @@ impl Config {
 // ---------------------------------------------------------------------------
 // Keys
 // ---------------------------------------------------------------------------
+
+/// Where the config file lives. Its absence is how horde knows it has never been set up.
+pub fn config_path() -> std::path::PathBuf {
+    config_dir().join("config.toml")
+}
+
+/// Expand a leading `~`, which is what a person writes in a config file and not a path any
+/// system call understands.
+fn expand_home(s: &str) -> std::path::PathBuf {
+    match s.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
+        None => std::path::PathBuf::from(s),
+    }
+}
 
 /// A single key plus modifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -848,16 +1001,79 @@ pub enum Action {
     Settings,
     /// Send the prefix key itself to the pane.
     SendPrefix,
+    /// Send the leader chord itself to the pane, for programs that want it — `ctrl+space` is
+    /// `set-mark` in emacs and readline, and taking it away with no way back would be rude.
+    SendLeader,
     /// Give the sidebar the keyboard, so its list can be walked without the prefix.
     SidebarFocus,
     /// Pin or unpin the focused pane, from anywhere.
     TogglePin,
+    /// Open the leader table and wait for the sequence.
+    Leader,
+    /// Open the start screen.
+    Dashboard,
+    /// Open this project's notes.
+    Notes,
+    /// Write a new note, from wherever you are.
+    NoteNew,
+    /// This project's files.
+    Files,
+    /// Open the link graph.
+    Graph,
     /// Open the full-screen roster.
     Roster,
     /// Open the approval queue: every agent blocked on a decision, in one list.
     Approvals,
     /// Step the agent list's filter.
     CycleLens,
+}
+
+/// The chords typed after the leader.
+///
+/// A fixed array rather than a `Vec` so [`Trigger`] stays `Copy` — and because three is a
+/// real ceiling, not an implementation limit: past three keys a binding is a menu, and a
+/// menu should be a view you can read rather than a sequence you have to remember.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Seq {
+    keys: [Option<Chord>; Seq::MAX],
+}
+
+impl Seq {
+    pub const MAX: usize = 3;
+
+    pub fn new(chords: &[Chord]) -> Result<Self> {
+        if chords.is_empty() {
+            return Err(anyhow!("a leader binding needs at least one key after the leader"));
+        }
+        if chords.len() > Self::MAX {
+            return Err(anyhow!("a leader binding is at most {} keys after the leader", Self::MAX));
+        }
+        let mut keys = [None; Self::MAX];
+        for (slot, c) in keys.iter_mut().zip(chords) {
+            *slot = Some(*c);
+        }
+        Ok(Self { keys })
+    }
+
+    pub fn chords(&self) -> impl Iterator<Item = Chord> + '_ {
+        self.keys.iter().flatten().copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.iter().flatten().count()
+    }
+
+    /// True when `pressed` is this sequence so far — including the whole of it.
+    ///
+    /// This is what keeps a half-typed sequence alive: `leader f` is not a binding, but it
+    /// is the start of one, so the keys stay held instead of falling through to a pane.
+    pub fn starts_with(&self, pressed: &[Chord]) -> bool {
+        pressed.len() <= self.len() && self.chords().zip(pressed).all(|(a, b)| a == *b)
+    }
+
+    pub fn describe(&self) -> String {
+        self.chords().map(|c| c.describe()).collect::<Vec<_>>().join(" ")
+    }
 }
 
 /// How a binding is reached.
@@ -867,6 +1083,55 @@ pub enum Trigger {
     Prefix(Chord),
     /// Modified chord that works without the prefix.
     Direct(Chord),
+    /// Press the leader, then this sequence.
+    ///
+    /// Bare printable keys are fine here, unlike [`Trigger::Direct`], because the leader has
+    /// already taken the keyboard away from the pane: nothing typed after it was ever going
+    /// to reach a program.
+    Leader(Seq),
+}
+
+/// What the keys typed since the leader add up to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LeaderMatch<'a> {
+    /// A complete binding. Run it and leave the mode.
+    Action(&'a Action),
+    /// The start of at least one binding. Keep the keys and wait.
+    Partial,
+    /// Nothing starts this way. Give up — and say so, rather than leaking the keys.
+    None,
+}
+
+/// How many leading `_`-separated segments every one of these names shares.
+fn shared_segments(names: &[String]) -> usize {
+    let Some((first, rest)) = names.split_first() else { return 0 };
+    first
+        .split('_')
+        .enumerate()
+        .take_while(|(i, seg)| rest.iter().all(|n| n.split('_').nth(*i) == Some(*seg)))
+        .count()
+}
+
+/// What to call the bindings behind one key, given how many segments the path already used.
+///
+/// One name keeps what is left of its own; several collapse to the segments they share, so
+/// `leader_window_zoom` and `leader_window_split_right` become "window". Cutting on segment
+/// boundaries is the point: the raw common prefix of `..._attention` and `..._approvals` is
+/// `..._a`, and a group called "agent a" is worse than no name at all.
+fn group_label(names: &[String], walked: usize) -> String {
+    let Some(first) = names.first() else { return "…".into() };
+    let depth = if names.len() == 1 { usize::MAX } else { shared_segments(names) };
+    let label = first
+        .split('_')
+        .skip(walked)
+        .take(depth.saturating_sub(walked))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.is_empty() {
+        "…".to_string()
+    } else {
+        label
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -880,6 +1145,10 @@ impl Default for Keymap {
     fn default() -> Self {
         use Cmd::*;
         let d = |s: &str| Chord::parse(s).expect("built-in binding must parse");
+        let seq = |ks: &[&str]| {
+            Seq::new(&ks.iter().map(|s| d(s)).collect::<Vec<_>>())
+                .expect("built-in leader binding must be 1..=3 keys")
+        };
         let table: Vec<(&str, Trigger, Action)> = vec![
             // Panes
             ("split_right", Trigger::Prefix(d("|")), Action::Cmd(SplitRight)),
@@ -934,6 +1203,56 @@ impl Default for Keymap {
             ("help", Trigger::Prefix(d("?")), Action::Help),
             ("detach", Trigger::Prefix(d("d")), Action::Detach),
             ("send_prefix", Trigger::Prefix(d("ctrl+b")), Action::SendPrefix),
+            // Doors into the leader table that do not depend on the leader chord itself.
+            // `prefix space` always works, whatever `ctrl+space` is doing in your terminal.
+            ("leader", Trigger::Prefix(d("space")), Action::Leader),
+            ("dashboard", Trigger::Prefix(d("0")), Action::Dashboard),
+            ("notes", Trigger::Prefix(d("N")), Action::Notes),
+            ("note_new", Trigger::Prefix(d("w")), Action::NoteNew),
+            ("graph", Trigger::Prefix(d("G")), Action::Graph),
+            ("files", Trigger::Prefix(d("F")), Action::Files),
+            ("send_leader", Trigger::Leader(seq(&["ctrl+space"])), Action::SendLeader),
+            // -- leader tables ------------------------------------------------------------
+            // Mnemonic groups, at most two keys past the leader. Every entry is a canonical
+            // name, so all of it is rebindable and all of it shows up in which-key.
+            //
+            // Names carry the grouping: which-key labels a group from the segment its
+            // members share, so `leader_window_*` renders as "+window" with no second table
+            // to drift out of step with these bindings.
+            //
+            // Agents: the multiplexer's own surfaces, reachable without the prefix.
+            ("leader_agent_attention", Trigger::Leader(seq(&["a", "a"])), Action::Cmd(JumpAttention)),
+            ("leader_agent_approvals", Trigger::Leader(seq(&["a", "q"])), Action::Approvals),
+            ("leader_agent_roster", Trigger::Leader(seq(&["a", "r"])), Action::Roster),
+            ("leader_agent_digest", Trigger::Leader(seq(&["a", "d"])), Action::Cmd(RequestDigest)),
+            ("leader_agent_bus", Trigger::Leader(seq(&["a", "b"])), Action::Cmd(ToggleBus)),
+            // Find: one finder, several doors.
+            ("leader_find_actions", Trigger::Leader(seq(&["f", "a"])), Action::Palette),
+            ("leader_find_spaces", Trigger::Leader(seq(&["f", "s"])), Action::SpaceSwitcher),
+            // Project.
+            ("leader_project_files", Trigger::Leader(seq(&["p", "f"])), Action::Files),
+            ("leader_project_switch", Trigger::Leader(seq(&["p", "p"])), Action::SpaceSwitcher),
+            ("leader_project_new", Trigger::Leader(seq(&["p", "n"])), Action::Cmd(NewSpace { name: None })),
+            ("leader_project_rename", Trigger::Leader(seq(&["p", "r"])), Action::RenamePane),
+            // Windows: a mirror of the prefix splits, for the hand that lives on the leader.
+            ("leader_window_split_right", Trigger::Leader(seq(&["w", "v"])), Action::Cmd(SplitRight)),
+            ("leader_window_split_down", Trigger::Leader(seq(&["w", "s"])), Action::Cmd(SplitDown)),
+            ("leader_window_zoom", Trigger::Leader(seq(&["w", "z"])), Action::Cmd(ToggleZoom)),
+            ("leader_window_close", Trigger::Leader(seq(&["w", "x"])), Action::Cmd(ClosePane)),
+            ("leader_window_left", Trigger::Leader(seq(&["w", "h"])), Action::Cmd(FocusDir(Dir::Left))),
+            ("leader_window_down", Trigger::Leader(seq(&["w", "j"])), Action::Cmd(FocusDir(Dir::Down))),
+            ("leader_window_up", Trigger::Leader(seq(&["w", "k"])), Action::Cmd(FocusDir(Dir::Up))),
+            ("leader_window_right", Trigger::Leader(seq(&["w", "l"])), Action::Cmd(FocusDir(Dir::Right))),
+            // Single-key leaves.
+            ("leader_dashboard", Trigger::Leader(seq(&["d"])), Action::Dashboard),
+            ("leader_note_new", Trigger::Leader(seq(&["n", "n"])), Action::NoteNew),
+            ("leader_note_browser", Trigger::Leader(seq(&["n", "o"])), Action::Notes),
+            ("leader_note_find", Trigger::Leader(seq(&["n", "f"])), Action::Notes),
+            ("leader_note_graph", Trigger::Leader(seq(&["n", "g"])), Action::Graph),
+            ("leader_graph", Trigger::Leader(seq(&["g", "g"])), Action::Graph),
+            ("leader_finder", Trigger::Leader(seq(&["space"])), Action::Palette),
+            ("leader_help", Trigger::Leader(seq(&["?"])), Action::Help),
+            ("leader_settings", Trigger::Leader(seq(&["."])), Action::Settings),
         ];
 
         let mut bindings = Vec::new();
@@ -973,6 +1292,15 @@ impl Keymap {
             return Ok(());
         }
 
+        // `leader n d` — space-separated, because a sequence is keys pressed in turn and
+        // `leader+n+d` would read as one chord with two modifiers.
+        if let Some(rest) = spec.strip_prefix("leader ").or_else(|| spec.strip_prefix("leader+")) {
+            let chords: Vec<Chord> =
+                rest.split_whitespace().map(Chord::parse).collect::<Result<_>>()?;
+            self.bindings[idx].0 = Trigger::Leader(Seq::new(&chords)?);
+            return Ok(());
+        }
+
         let trigger = match spec.strip_prefix("prefix+") {
             Some(rest) => Trigger::Prefix(Chord::parse(rest)?),
             None => {
@@ -995,6 +1323,72 @@ impl Keymap {
         self.bindings.iter().find(|(t, _)| t == trigger).map(|(_, a)| a)
     }
 
+    /// What the keys pressed since the leader amount to, so far.
+    ///
+    /// The three answers are the whole state machine: run it, keep waiting, or give up. The
+    /// middle one is the reason this is not a plain `lookup` — `leader w` matches nothing,
+    /// but abandoning there would strand a user one key from `leader w v`.
+    pub fn leader_match(&self, pressed: &[Chord]) -> LeaderMatch<'_> {
+        let mut partial = false;
+        for (trigger, action) in &self.bindings {
+            let Trigger::Leader(seq) = trigger else { continue };
+            if !seq.starts_with(pressed) {
+                continue;
+            }
+            if seq.len() == pressed.len() {
+                return LeaderMatch::Action(action);
+            }
+            partial = true;
+        }
+        if partial {
+            LeaderMatch::Partial
+        } else {
+            LeaderMatch::None
+        }
+    }
+
+    /// Every leader binding that continues `pressed`, for the which-key popup.
+    ///
+    /// Returns the *next* chord to press and where it leads, so a group like `w` renders as
+    /// one row rather than as the eight bindings hiding behind it.
+    pub fn leader_continuations(&self, pressed: &[Chord]) -> Vec<(Chord, String, bool)> {
+        // Collect every name behind each next key first, then label once. Merging labels
+        // pairwise as they arrive would fold an already-shortened label back into a raw
+        // name and shorten it again, until a group of eight is called "…".
+        let mut buckets: Vec<(Chord, Vec<String>)> = Vec::new();
+        for (name, trigger, _) in self.described() {
+            let Trigger::Leader(seq) = trigger else { continue };
+            if !seq.starts_with(pressed) || seq.len() == pressed.len() {
+                continue;
+            }
+            let Some(next) = seq.chords().nth(pressed.len()) else { continue };
+            // `leader_` is a namespace, not a path segment, and not every leader binding
+            // wears it (`send_leader` pairs with `send_prefix`). Dropping it here keeps it
+            // from being mistaken for a shared segment — or from defeating the sharing.
+            let name = name.strip_prefix("leader_").unwrap_or(&name).to_string();
+            match buckets.iter_mut().find(|(c, _)| *c == next) {
+                Some((_, names)) => names.push(name),
+                None => buckets.push((next, vec![name])),
+            }
+        }
+        // Segments every continuation shares are the path already walked, so drop them:
+        // inside `w`, the rows should read "zoom" and "split right", not "window zoom" and
+        // "window split right" under a heading that already says window.
+        let all: Vec<String> =
+            buckets.iter().flat_map(|(_, names)| names.iter().cloned()).collect();
+        let walked = shared_segments(&all);
+
+        let mut out: Vec<(Chord, String, bool)> = buckets
+            .into_iter()
+            .map(|(chord, names)| {
+                let is_group = names.len() > 1;
+                (chord, group_label(&names, walked), is_group)
+            })
+            .collect();
+        out.sort_by_key(|(c, _, _)| c.describe());
+        out
+    }
+
     /// Bindings paired with their canonical names, for the help overlay.
     pub fn described(&self) -> Vec<(String, Trigger, Action)> {
         let mut by_idx: Vec<(usize, String)> =
@@ -1011,6 +1405,85 @@ impl Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three answers a pending sequence can get. The middle one is the whole reason
+    /// `leader_match` exists instead of a plain lookup: `w` is bound to nothing, but giving
+    /// up there would strand a user one key short of `leader w v`.
+    #[test]
+    fn a_half_typed_leader_sequence_keeps_waiting_instead_of_failing() {
+        let km = Keymap::default();
+        let c = |s: &str| Chord::parse(s).unwrap();
+
+        assert_eq!(km.leader_match(&[c("w")]), LeaderMatch::Partial, "a group holds");
+        assert!(
+            matches!(km.leader_match(&[c("w"), c("v")]), LeaderMatch::Action(_)),
+            "the whole sequence runs"
+        );
+        assert_eq!(km.leader_match(&[c("y")]), LeaderMatch::None, "an unknown key gives up");
+        assert_eq!(
+            km.leader_match(&[c("w"), c("y")]),
+            LeaderMatch::None,
+            "a wrong second key gives up rather than waiting forever"
+        );
+    }
+
+    /// `rebind` refuses a bare printable bound *directly* because it would shadow typing.
+    /// After the leader there is nothing to shadow — the keyboard has already been taken —
+    /// so the same key is fine, and that difference is the point of having a leader at all.
+    #[test]
+    fn leader_sequences_may_use_the_bare_keys_direct_bindings_refuse() {
+        let mut km = Keymap::default();
+        assert!(km.rebind("zoom", "z").is_err(), "a bare direct key still shadows typing");
+        km.rebind("zoom", "leader z z").expect("the same key is fine behind the leader");
+        let c = |s: &str| Chord::parse(s).unwrap();
+        assert!(matches!(km.leader_match(&[c("z"), c("z")]), LeaderMatch::Action(_)));
+    }
+
+    /// Three keys past the leader is a menu, not a binding, and the parser says so rather
+    /// than silently keeping the first three.
+    #[test]
+    fn a_leader_sequence_longer_than_three_keys_is_refused() {
+        let mut km = Keymap::default();
+        assert!(km.rebind("zoom", "leader a b c").is_ok());
+        let err = km.rebind("zoom", "leader a b c d").unwrap_err().to_string();
+        assert!(err.contains("at most"), "{err}");
+    }
+
+    /// which-key has to collapse the eight bindings behind `w` into one row, or the popup is
+    /// a wall of keys nobody reads.
+    #[test]
+    fn which_key_shows_a_group_once_rather_than_every_binding_behind_it() {
+        let km = Keymap::default();
+        let top = km.leader_continuations(&[]);
+        let w = top.iter().find(|(c, _, _)| c.describe() == "w").expect("a w group");
+        assert!(w.2, "w leads to more keys, so it is a group");
+        assert_eq!(top.iter().filter(|(c, _, _)| c.describe() == "w").count(), 1, "listed once");
+
+        let inside = km.leader_continuations(&[Chord::parse("w").unwrap()]);
+        assert!(
+            inside.iter().any(|(c, _, is_group)| c.describe() == "v" && !is_group),
+            "one level in, the leaves show: {inside:?}"
+        );
+    }
+
+    /// Two actions on one trigger means the second is unreachable, and `lookup` takes the
+    /// first match without a word about it. Caught the honest way: `note_new` was bound to
+    /// `prefix n`, which has been `next_tab` since long before notes existed.
+    #[test]
+    fn no_two_bindings_share_a_trigger() {
+        let km = Keymap::default();
+        let mut seen: Vec<(Trigger, String)> = Vec::new();
+        for (name, trigger, _) in km.described() {
+            // An unbound action parks on a null chord, and any number may share it.
+            if matches!(trigger, Trigger::Direct(c) if c.code == KeyCode::Null) {
+                continue;
+            }
+            if let Some((_, other)) = seen.iter().find(|(t, _)| *t == trigger) {
+                panic!("{name} and {other} are both bound to {trigger:?}");
+            }
+            seen.push((trigger, name));
+        }
+    }
 
     #[test]
     fn parses_modifiers_and_named_keys() {
@@ -1200,6 +1673,7 @@ order = ["a", "b"]
             "full",
             r##"
 prefix = "ctrl+a"
+leader = "alt+space"
 scrollback = 500
 
 [theme]
@@ -1215,6 +1689,7 @@ bus = true
 
 [keys]
 zoom = "prefix+f"
+leader_window_zoom = "leader z"
 
 [notifications]
 delivery = "system"
@@ -1236,6 +1711,12 @@ command = "  ~/bin/horde-ping  "
         assert_eq!(
             cfg.keys.lookup(&Trigger::Prefix(Chord::parse("f").unwrap())),
             Some(&Action::Cmd(Cmd::ToggleZoom))
+        );
+        assert_eq!(cfg.leader, Chord::parse("alt+space").unwrap());
+        assert_eq!(
+            cfg.keys.leader_match(&[Chord::parse("z").unwrap()]),
+            LeaderMatch::Action(&Action::Cmd(Cmd::ToggleZoom)),
+            "a leader sequence set from config resolves"
         );
         let _ = std::fs::remove_file(p);
     }

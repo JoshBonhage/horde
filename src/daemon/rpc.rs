@@ -156,6 +156,10 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             "socket": crate::config::socket_path().to_string_lossy(),
             "theme": eng.cfg.theme.name,
             "agent_manifests": eng.agents.manifest_names(),
+            // Which languages this binary can colour. Grammars are compile-time features,
+            // so "why is my Rust not highlighted" is answerable without guessing at how it
+            // was built.
+            "languages": crate::client::syntax::available(),
             // The clock triggers actually fire on. `--at 09:00` means nine *here*, and a distro
             // whose timezone was never set sits on UTC while the person setting the trigger does
             // not — which looks like triggers firing at random rather than like a wrong clock.
@@ -170,8 +174,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
 
         // -- session -----------------------------------------------------
         "session.snapshot" => {
-            let cfg = eng.cfg.clone();
-            serde_json::to_value(eng.session.snapshot(&cfg, &eng.repos)).map_err(|e| failed(e.to_string()))
+            serde_json::to_value(eng.snapshot()).map_err(|e| failed(e.to_string()))
         }
 
         // -- spaces ------------------------------------------------------
@@ -295,6 +298,8 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         }
 
         // -- panes -------------------------------------------------------
+        // A pane showing a file reports the file, so `pane.list` answers "what is this"
+        // for both kinds rather than only for programs.
         "pane.list" => {
             let cfg = eng.cfg.clone();
             Ok(json!(eng.session.snapshot(&cfg, &eng.repos).panes))
@@ -991,6 +996,71 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             }
             eng.touch();
             Ok(json!({ "trigger": id, "did": what }))
+        }
+
+        // -- vault -------------------------------------------------------
+        // The read side of a project's notes, for agents. JSON rather than the render
+        // channel because this is the surface an agent drives, and `nc` has to be enough to
+        // debug it. `space` defaults to the focused one, like every other space argument.
+        "vault.list" | "vault.search" | "vault.read" => {
+            let space = match str_arg(req, "space") {
+                Some(name) => eng
+                    .session
+                    .find_space_by_name(name)
+                    .ok_or_else(|| not_found(format!("no space called {name:?}")))?,
+                None => eng.session.focused_space.ok_or_else(|| bad("no focused space"))?,
+            };
+            let kind = match req.method.as_str() {
+                "vault.search" => crate::proto::VaultQuery::Search {
+                    q: str_arg(req, "q").ok_or_else(|| bad("q required"))?.to_string(),
+                },
+                "vault.read" => crate::proto::VaultQuery::Note {
+                    path: str_arg(req, "path").ok_or_else(|| bad("path required"))?.to_string(),
+                },
+                _ => crate::proto::VaultQuery::List,
+            };
+            let reply = eng.vault_answer(space, &kind).ok_or_else(|| {
+                not_found("this project has no vault — see `vault.dir` in the config")
+            })?;
+            // `vault.read` on a path that is not in the index answers with an empty list
+            // rather than a body, which would be a confusing way to say "no such note".
+            if matches!(kind, crate::proto::VaultQuery::Note { .. }) && reply.body.is_none() {
+                return Err(not_found("no such note in this vault"));
+            }
+            serde_json::to_value(reply).map_err(|e| failed(e.to_string()))
+        }
+
+        // Setting one up, and writing to it. Separate from the read verbs because these
+        // are the ones that touch a disk: everything they take is jailed to the vault, and
+        // "write a note" must never be a way to write anything else.
+        "vault.init" => {
+            let root = match str_arg(req, "path") {
+                Some(p) => std::path::PathBuf::from(p),
+                None => {
+                    let space = eng.session.focused_space.ok_or_else(|| bad("no focused space"))?;
+                    eng.session
+                        .space(space)
+                        .map(|s| s.cwd.join(&eng.cfg.vault_dir))
+                        .unwrap_or_else(|| eng.cfg.vault_home.clone())
+                }
+            };
+            let fresh = super::vault::init(&root).map_err(|e| failed(e.to_string()))?;
+            super::refresh_vaults(eng);
+            Ok(json!({ "root": root.to_string_lossy(), "created": fresh }))
+        }
+        "vault.write" => {
+            let path = str_arg(req, "path").ok_or_else(|| bad("path required"))?.to_string();
+            let body = str_arg(req, "body").ok_or_else(|| bad("body required"))?.to_string();
+            let space = match str_arg(req, "space") {
+                Some(name) => eng
+                    .session
+                    .find_space_by_name(name)
+                    .ok_or_else(|| not_found(format!("no space called {name:?}")))?,
+                None => eng.session.focused_space.ok_or_else(|| bad("no focused space"))?,
+            };
+            let written =
+                eng.vault_write(space, &path, &body).map_err(|e| failed(e.to_string()))?;
+            Ok(json!({ "path": written.to_string_lossy() }))
         }
 
         // -- digest ------------------------------------------------------
