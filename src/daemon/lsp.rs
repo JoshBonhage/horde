@@ -60,38 +60,16 @@ const STDERR_KEEP: usize = 20;
 /// A language server, as identified by the project it serves and the language it speaks.
 pub type Key = (PathBuf, String);
 
-/// How bad a diagnostic is. Mirrors LSP's numbering, which is 1-based and error-first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-pub enum Severity {
-    Error,
-    Warning,
-    Info,
-    Hint,
-}
+pub use crate::proto::{Diag, Severity};
 
-impl Severity {
-    fn from_lsp(n: u64) -> Severity {
-        match n {
-            1 => Severity::Error,
-            2 => Severity::Warning,
-            3 => Severity::Info,
-            _ => Severity::Hint,
-        }
+/// LSP numbers its severities, error-first, and a server may leave the number out.
+fn severity_from_lsp(n: u64) -> Severity {
+    match n {
+        1 => Severity::Error,
+        2 => Severity::Warning,
+        3 => Severity::Info,
+        _ => Severity::Hint,
     }
-}
-
-/// One thing a language server has to say about a line.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Diag {
-    /// Zero-based, as LSP counts and as the editor's buffer counts.
-    pub line: u32,
-    pub col: u32,
-    pub end_line: u32,
-    pub end_col: u32,
-    pub severity: Severity,
-    pub message: String,
-    /// Which tool said so — `rustc`, `clippy`, `typescript`. Servers that front several.
-    pub source: Option<String>,
 }
 
 /// What a supervised server is doing.
@@ -408,6 +386,16 @@ impl Registry {
         let mut out: Vec<(&Key, &Server)> = self.servers.iter().collect();
         out.sort_by(|a, b| a.0.cmp(b.0));
         out
+    }
+
+    /// What is already known about a file, from whichever server is watching it.
+    ///
+    /// Needed because a language server publishes when something *changes*. Handing it a
+    /// document it already has, at text it has already seen, is answered with silence — so a
+    /// client that opens a file a moment after another one did would otherwise see a clean
+    /// editor over a file full of errors.
+    pub fn diags_for(&self, path: &Path) -> Option<&Vec<Diag>> {
+        self.servers.values().find_map(|s| s.diags.get(path))
     }
 
     /// Start a server for this project and language, unless one is already up or the last
@@ -884,7 +872,7 @@ fn parse_diag(v: &Value) -> Option<Diag> {
         col: start.get("character")?.as_u64().unwrap_or(0) as u32,
         end_line: end.get("line")?.as_u64().unwrap_or(0) as u32,
         end_col: end.get("character")?.as_u64().unwrap_or(0) as u32,
-        severity: Severity::from_lsp(v.get("severity").and_then(|s| s.as_u64()).unwrap_or(1)),
+        severity: severity_from_lsp(v.get("severity").and_then(|s| s.as_u64()).unwrap_or(1)),
         message: v.get("message")?.as_str()?.trim().to_string(),
         source: v.get("source").and_then(|s| s.as_str()).map(|s| s.to_string()),
     })
@@ -959,14 +947,6 @@ mod tests {
             assert_eq!(from_uri(&uri).as_deref(), Some(Path::new(p)), "round trip of {p}");
         }
         assert_eq!(from_uri("http://example.com"), None, "and only file URIs");
-    }
-
-    /// Diagnostics for one file, whichever server is watching it. Only the tests need this
-    /// yet; the editor asks the daemon rather than reaching in here.
-    impl Registry {
-        fn diags_of(&self, path: &Path) -> Option<&Vec<Diag>> {
-            self.servers.values().find_map(|s| s.diags.get(path))
-        }
     }
 
     fn cfg_with(lang: &str, command: &str, args: &[&str]) -> crate::config::Config {
@@ -1092,12 +1072,12 @@ mod tests {
         assert_eq!(reg.serving().len(), 1, "one server, and it is visible");
 
         let found = wait_for(&mut reg, |r| {
-            r.diags_of(&file).is_some_and(|d| d.iter().any(|d| d.severity == Severity::Error))
+            r.diags_for(&file).is_some_and(|d| d.iter().any(|d| d.severity == Severity::Error))
         })
         .await;
         assert!(found, "clangd should have objected to an undeclared identifier");
 
-        let diags = reg.diags_of(&file).unwrap().clone();
+        let diags = reg.diags_for(&file).unwrap().clone();
         let d = diags.iter().find(|d| d.severity == Severity::Error).unwrap();
         assert_eq!(d.line, 0, "on the line the mistake is on");
         assert!(!d.message.is_empty());
@@ -1109,7 +1089,7 @@ mod tests {
         // Fix it in the buffer only — the file on disk is not touched, which is the point:
         // diagnostics have to follow what you are typing, not what you last saved.
         reg.did_change(&root, "c", &file, "int main(void) { return 0; }\n");
-        let cleared = wait_for(&mut reg, |r| r.diags_of(&file).is_none()).await;
+        let cleared = wait_for(&mut reg, |r| r.diags_for(&file).is_none()).await;
         assert!(cleared, "and they clear when the mistake goes");
 
         reg.did_close(&root, "c", &file);

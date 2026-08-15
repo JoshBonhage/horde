@@ -50,6 +50,54 @@ const TOAST_LIFE: Duration = Duration::from_secs(6);
 /// Bus messages kept client-side for the drawer.
 const BUS_CAP: usize = 300;
 
+/// When to hand the daemon the buffer so a language server can look at it.
+///
+/// Every keystroke would be a whole file down a socket and a reparse per character. Waiting
+/// for a save would mean diagnostics that describe the last thing you wrote out rather than
+/// the line you are on — which is the whole reason this is not just [`Cmd::FileSave`].
+///
+/// So: shortly after you stop typing, and at least every couple of seconds regardless, since
+/// somebody writing a paragraph without pausing should still be told about it.
+#[derive(Debug, Default)]
+pub struct DocSync {
+    /// Revision last sent. `None` means this buffer has never gone out at all.
+    sent: Option<usize>,
+    /// Revision last seen here, for noticing that typing is still going on.
+    seen: usize,
+    changed_at: Option<Instant>,
+    sent_at: Option<Instant>,
+}
+
+/// How long a pause counts as having stopped typing.
+const DOC_SETTLE: Duration = Duration::from_millis(400);
+/// The longest a change may go unsent while someone types without pausing.
+const DOC_MAX_WAIT: Duration = Duration::from_secs(2);
+
+impl DocSync {
+    /// Whether this revision should go now. Records that it did.
+    fn due(&mut self, rev: usize) -> bool {
+        if rev != self.seen {
+            self.seen = rev;
+            self.changed_at = Some(Instant::now());
+        }
+        if self.sent == Some(rev) {
+            return false;
+        }
+        // A buffer that has never been sent goes immediately: that first message is what
+        // starts the language server, and waiting to open a file nobody has typed in yet
+        // would be a pause for no reason.
+        let first = self.sent.is_none();
+        let quiet = self.changed_at.is_some_and(|t| t.elapsed() >= DOC_SETTLE);
+        let overdue = self.sent_at.is_some_and(|t| t.elapsed() >= DOC_MAX_WAIT);
+        if first || quiet || overdue {
+            self.sent = Some(rev);
+            self.sent_at = Some(Instant::now());
+            return true;
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     /// Keystrokes go to the focused pane.
@@ -187,6 +235,11 @@ pub struct App {
     pub highlight: Option<(String, usize, Vec<ratatui::text::Line<'static>>)>,
     /// The note being written, alive only while the editor is open.
     pub buffer: Option<editor::Buffer>,
+    /// Keeping the daemon's copy of that buffer roughly in step with this one.
+    pub doc: DocSync,
+    /// What a language server thinks of the file being edited, keyed by the path the editor
+    /// knows it as. Cleared when the editor closes, because it is about one open file.
+    pub diags: HashMap<String, Vec<crate::proto::Diag>>,
     /// The line held by `dd`, `yy` or `cc`, for `p` to put down. One unnamed register: named
     /// ones are a filing system, and this is an editor you keep a note open in.
     pub yank: Option<String>,
@@ -250,6 +303,8 @@ impl App {
             setup: ui::setup::Answers::default(),
             highlight: None,
             buffer: None,
+            doc: DocSync::default(),
+            diags: HashMap::new(),
             yank: None,
             search: String::new(),
             sim: None,
@@ -549,6 +604,27 @@ async fn run_loop(
             _ = anim.tick() => {
                 app.tick = app.tick.wrapping_add(1);
                 app.expire_toasts();
+                // Hand the buffer over when the typing settles. Here rather than in the key
+                // handler because "has stopped typing" is a fact about time passing, which is
+                // the one thing a key handler never hears about.
+                if let (Mode::Editor { path, project, .. }, Some(rev)) =
+                    (&app.mode, app.buffer.as_ref().map(|b| b.rev))
+                {
+                    if app.doc.due(rev) {
+                        let (path, vault) = (path.clone(), !*project);
+                        if let (Some(space), Some(body)) = (
+                            app.snapshot.as_ref().and_then(|s| s.focused_space),
+                            app.buffer.as_ref().map(|b| b.text()),
+                        ) {
+                            let _ = out.send(ClientFrame::Command(Cmd::DocChanged {
+                                space,
+                                path,
+                                body,
+                                vault,
+                            }));
+                        }
+                    }
+                }
                 // Only the spinner and elapsed timers change, and only when something is
                 // actually animating.
                 let animating = app.snapshot.as_ref().is_some_and(|s| {
@@ -591,6 +667,16 @@ fn apply_frame(
     out: &mpsc::UnboundedSender<ClientFrame>,
 ) -> Option<String> {
     match frame {
+        // Unsolicited, and about whatever file the daemon was told about. Kept by path
+        // rather than replacing one list, because a save and a change can be in flight for
+        // different files at once.
+        ServerFrame::Diagnostics { path, diags } => {
+            if diags.is_empty() {
+                app.diags.remove(&path);
+            } else {
+                app.diags.insert(path, diags);
+            }
+        }
         ServerFrame::Digest(d) => {
             // Nothing to report is worth saying out loud rather than opening an empty panel.
             if d.is_empty() {
@@ -703,6 +789,7 @@ fn apply_frame(
                 // A body means this was asked for in order to edit it.
                 (Some(body), Some(path)) => {
                     app.buffer = Some(editor::Buffer::new(&body));
+                    app.doc = DocSync::default();
                     app.mode = Mode::Editor { path, scroll: 0, project: true, vim: Vim::Insert };
                 }
                 _ => app.files = Some(*f),
@@ -733,6 +820,7 @@ fn apply_frame(
                 app.opening_editor = false;
                 if let (Some(body), Some(note)) = (v.body.clone(), v.notes.first()) {
                     app.buffer = Some(editor::Buffer::new(&body));
+                    app.doc = DocSync::default();
                     app.mode =
                         Mode::Editor { path: note.path.clone(), scroll: 0, project: false, vim: Vim::Insert };
                 }
@@ -2134,9 +2222,25 @@ fn editor_save(
 }
 
 /// Put the editor away, back to whichever browser opened it.
-fn editor_close(app: &mut App, project: bool) {
+fn editor_close(
+    app: &mut App,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    path: &str,
+    project: bool,
+) {
+    // Whatever was analysing this can stop. Without it a language server goes on holding a
+    // file nobody is looking at until the idle timer notices.
+    if let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) {
+        let _ = out.send(ClientFrame::Command(Cmd::DocClosed {
+            space,
+            path: path.to_string(),
+            vault: !project,
+        }));
+    }
     app.buffer = None;
     app.highlight = None;
+    app.doc = DocSync::default();
+    app.diags.clear();
     app.mode = if project {
         Mode::Files { query: String::new(), sel: 0 }
     } else {
@@ -2264,6 +2368,30 @@ fn editor_normal(
                     return Some(Vim::Insert);
                 }
             }
+            // Walking the problems. Worth having because the margin only marks the screen,
+            // and the one you need is usually not on it.
+            (b @ (']' | '['), KeyCode::Char('d')) => {
+                let forward = b == ']';
+                let here = app.buffer.as_ref().map(|b| b.line as u32).unwrap_or(0);
+                let mut lines: Vec<u32> =
+                    app.diags.get(path).map(|d| d.iter().map(|d| d.line).collect()).unwrap_or_default();
+                lines.sort_unstable();
+                lines.dedup();
+                let to = if forward {
+                    lines.iter().find(|l| **l > here).or_else(|| lines.first())
+                } else {
+                    lines.iter().rev().find(|l| **l < here).or_else(|| lines.last())
+                };
+                match to.copied() {
+                    Some(l) => {
+                        if let Some(b) = app.buffer.as_mut() {
+                            b.goto(l as usize, 0);
+                            b.first_nonblank();
+                        }
+                    }
+                    None => app.toast(NoticeLevel::Info, "nothing to fix here"),
+                }
+            }
             _ => {}
         }
         return Some(Vim::Normal);
@@ -2277,7 +2405,7 @@ fn editor_normal(
         // without writing is spelled `:q!`, deliberately and on purpose.
         (KeyCode::Esc, _) => {
             editor_save(app, out, path, project);
-            editor_close(app, project);
+            editor_close(app, out, path, project);
             return None;
         }
         (KeyCode::Char('s'), true) => {
@@ -2390,7 +2518,7 @@ fn editor_normal(
         }
 
         // the first half of a pair
-        (KeyCode::Char(c @ ('g' | 'd' | 'y' | 'c')), false) => next = Vim::Pending(c),
+        (KeyCode::Char(c @ ('g' | 'd' | 'y' | 'c' | ']' | '[')), false) => next = Vim::Pending(c),
 
         // the search again, in both directions
         (KeyCode::Char(c @ ('n' | 'N')), false) => {
@@ -2484,7 +2612,7 @@ fn editor_run(
             // A failed write must not close the note: that is the one path where quitting
             // would throw away work while looking like it saved it.
             if editor_save(app, out, path, project) {
-                editor_close(app, project);
+                editor_close(app, out, path, project);
                 return None;
             }
             Some(Vim::Normal)
@@ -2497,11 +2625,11 @@ fn editor_run(
                 );
                 return Some(Vim::Normal);
             }
-            editor_close(app, project);
+            editor_close(app, out, path, project);
             None
         }
         "q!" | "qa!" => {
-            editor_close(app, project);
+            editor_close(app, out, path, project);
             None
         }
         other => {
@@ -3198,6 +3326,16 @@ mod tests {
         out
     }
 
+    /// Did any of this write the file? The question every `:q` test is really asking, and
+    /// one that must not be confused with "did anything at all go to the daemon" — closing
+    /// the editor also tells the daemon to stop analysing it.
+    fn wrote(frames: Vec<ClientFrame>) -> Vec<Cmd> {
+        cmds(frames)
+            .into_iter()
+            .filter(|c| matches!(c, Cmd::VaultSave { .. } | Cmd::FileSave { .. }))
+            .collect()
+    }
+
     fn cmds(frames: Vec<ClientFrame>) -> Vec<Cmd> {
         frames
             .into_iter()
@@ -3305,7 +3443,7 @@ mod tests {
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Esc);
         typed(&mut app, ":q");
-        let sent = cmds(press(&mut app, KeyCode::Enter));
+        let sent = wrote(press(&mut app, KeyCode::Enter));
 
         assert!(sent.is_empty(), "nothing written: {sent:?}");
         assert_eq!(vim_of(&app), Vim::Normal, "and nothing closed");
@@ -3321,7 +3459,7 @@ mod tests {
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Esc);
         typed(&mut app, ":q!");
-        let sent = cmds(press(&mut app, KeyCode::Enter));
+        let sent = wrote(press(&mut app, KeyCode::Enter));
         assert!(sent.is_empty(), "the file on disk is untouched: {sent:?}");
         assert!(matches!(app.mode, Mode::Notes { .. }));
     }
@@ -3332,7 +3470,7 @@ mod tests {
         let mut app = editing();
         press(&mut app, KeyCode::Esc);
         typed(&mut app, ":q");
-        let sent = cmds(press(&mut app, KeyCode::Enter));
+        let sent = wrote(press(&mut app, KeyCode::Enter));
         assert!(sent.is_empty());
         assert!(matches!(app.mode, Mode::Notes { .. }));
     }
@@ -3423,6 +3561,120 @@ mod tests {
             let b = app.buffer.as_ref().unwrap();
             assert_eq!((b.line, b.col), (line, col), "`{key}` landed wrong");
         }
+    }
+
+    // -- diagnostics -------------------------------------------------------
+
+    fn diag(line: u32, sev: crate::proto::Severity, msg: &str) -> crate::proto::Diag {
+        crate::proto::Diag {
+            line,
+            col: 0,
+            end_line: line,
+            end_col: 4,
+            severity: sev,
+            message: msg.to_string(),
+            source: Some("rustc".into()),
+        }
+    }
+
+    /// The first send goes at once — it is what starts the language server — and after that
+    /// the buffer only goes when the typing settles. Every keystroke would be a whole file
+    /// down a socket and a reparse per character.
+    #[test]
+    fn the_buffer_goes_over_once_immediately_and_then_only_when_typing_settles() {
+        let mut sync = DocSync::default();
+        assert!(sync.due(0), "the first one goes straight away");
+        assert!(!sync.due(0), "and not again for the same revision");
+
+        assert!(!sync.due(1), "a keystroke does not");
+        assert!(!sync.due(2), "nor the next one");
+        // Pretend the typing stopped.
+        sync.changed_at = Some(Instant::now() - DOC_SETTLE * 2);
+        assert!(sync.due(2), "but a pause does");
+        assert!(!sync.due(2), "once");
+    }
+
+    /// Somebody writing a paragraph without ever pausing still has to be told what is wrong
+    /// with it, so the debounce has a ceiling.
+    #[test]
+    fn a_typist_who_never_pauses_is_not_left_without_diagnostics() {
+        let mut sync = DocSync::default();
+        sync.due(0);
+        sync.sent_at = Some(Instant::now() - DOC_MAX_WAIT * 2);
+        assert!(sync.due(1), "overdue, even mid-keystroke");
+    }
+
+    /// An empty list is a file with nothing wrong with it, and it has to erase the marks
+    /// rather than be stored as "no diagnostics" — otherwise a fixed error stays on screen.
+    #[test]
+    fn clearing_diagnostics_removes_them_rather_than_storing_an_empty_list() {
+        let mut app = editing();
+        apply_frame(
+            &mut app,
+            ServerFrame::Diagnostics {
+                path: "note.md".into(),
+                diags: vec![diag(1, crate::proto::Severity::Error, "bad")],
+            },
+            &sink(),
+        );
+        assert_eq!(app.diags.get("note.md").map(|d| d.len()), Some(1));
+
+        apply_frame(
+            &mut app,
+            ServerFrame::Diagnostics { path: "note.md".into(), diags: Vec::new() },
+            &sink(),
+        );
+        assert!(!app.diags.contains_key("note.md"), "the marks go with the mistake");
+    }
+
+    /// The margin only marks what is on screen, so walking the list has to work from the
+    /// list rather than from what is visible — and wrap, because the last problem in a file
+    /// is not the last one you want to look at.
+    #[test]
+    fn bracket_d_walks_the_problems_and_wraps() {
+        let mut app = editing();
+        app.buffer = Some(editor::Buffer::new("a\nb\nc\nd\ne"));
+        app.diags.insert(
+            "note.md".into(),
+            vec![
+                diag(3, crate::proto::Severity::Warning, "later"),
+                diag(1, crate::proto::Severity::Error, "earlier"),
+            ],
+        );
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, "]d");
+        assert_eq!(app.buffer.as_ref().unwrap().line, 1, "the first one after the cursor");
+        typed(&mut app, "]d");
+        assert_eq!(app.buffer.as_ref().unwrap().line, 3);
+        typed(&mut app, "]d");
+        assert_eq!(app.buffer.as_ref().unwrap().line, 1, "and round again");
+        typed(&mut app, "[d");
+        assert_eq!(app.buffer.as_ref().unwrap().line, 3, "backwards wraps too");
+    }
+
+    #[test]
+    fn walking_the_problems_of_a_clean_file_says_there_are_none() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, "]d");
+        assert_eq!(app.buffer.as_ref().unwrap().line, 0, "the cursor stayed put");
+        let said = app.toasts.back().map(|t| t.text.clone()).unwrap_or_default();
+        assert!(said.contains("nothing to fix"), "{said}");
+    }
+
+    /// Diagnostics are about the file that is open. Leaving takes them with it, or the next
+    /// file inherits the last one's mistakes.
+    #[test]
+    fn closing_the_editor_forgets_its_diagnostics_and_says_so() {
+        let mut app = editing();
+        app.diags.insert("note.md".into(), vec![diag(0, crate::proto::Severity::Error, "bad")]);
+        press(&mut app, KeyCode::Esc);
+        let sent = cmds(press(&mut app, KeyCode::Esc));
+        assert!(app.diags.is_empty(), "gone with the buffer");
+        assert!(
+            sent.iter().any(|c| matches!(c, Cmd::DocClosed { path, .. } if path == "note.md")),
+            "and the daemon is told, so the server can stop: {sent:?}"
+        );
     }
 
     /// Opening horde is arriving, and arriving shows you the state of things. Every attach

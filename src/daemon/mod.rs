@@ -112,6 +112,8 @@ pub struct Engine {
     /// Language servers, one per project and language, started only when a file that needs
     /// one is opened. Nothing in here exists unless `config.toml` asked for it.
     pub lsp: lsp::Registry,
+    /// Absolute path to the name the client used for it, for documents the editor has open.
+    lsp_paths: HashMap<PathBuf, String>,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
     dirty_shape: bool,
@@ -202,6 +204,41 @@ impl Engine {
             space.lsp = self.lsp_info(space.id);
         }
         s
+    }
+
+    /// Where a document the editor has open actually is, and what the client calls it.
+    ///
+    /// `vault` picks the root: a note is relative to the vault and a file to the project, and
+    /// only the client knows which of the two it opened.
+    fn doc_path(&self, space: SpaceId, rel: &str, vault: bool) -> Option<PathBuf> {
+        let root = if vault {
+            self.vault_root(space)?
+        } else {
+            self.session.space(space)?.cwd.clone()
+        };
+        vault::safe_join(&root, rel).ok()
+    }
+
+    /// Hand a buffer to whichever language server wants it.
+    pub fn doc_changed(&mut self, space: SpaceId, rel: &str, body: &str, vault: bool) {
+        let Some(path) = self.doc_path(space, rel, vault) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        // Remembered so diagnostics can come back named the way the client named it. The
+        // daemon deals in absolute paths and the editor knows a relative one; the translation
+        // has to happen somewhere, and here is where both are in hand.
+        self.lsp_paths.insert(path.clone(), rel.to_string());
+        let cfg = self.cfg.clone();
+        self.lsp.did_open(&cfg, &root, &lang, &path, body);
+    }
+
+    /// The editor closed. Stop analysing what nobody is looking at.
+    pub fn doc_closed(&mut self, space: SpaceId, rel: &str, vault: bool) {
+        let Some(path) = self.doc_path(space, rel, vault) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        self.lsp_paths.remove(&path);
+        self.lsp.did_close(&root, &lang, &path);
     }
 
     /// The language servers running for a project, as the chrome shows them.
@@ -753,6 +790,7 @@ async fn engine_loop(
         repos: repo::Cache::default(),
         vaults: HashMap::new(),
         lsp: lsp::Registry::new(),
+        lsp_paths: HashMap::new(),
         cfg,
         clients: HashMap::new(),
         dirty_shape: true,
@@ -1068,6 +1106,25 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
                 Err(e) => eng.notice(NoticeLevel::Warn, format!("could not open {path}: {e}")),
             }
         }
+        // What the editor's buffer says right now, which is not what is on disk and is not
+        // meant to be. The point of this arriving separately from a save is that a language
+        // server should be objecting to the line you are on, not to the last thing you wrote
+        // out.
+        ClientFrame::Command(Cmd::DocChanged { space, path, body, vault }) => {
+            eng.doc_changed(space, &path, &body, vault);
+            // Whatever is already known about it, straight back to the client that asked. A
+            // server answers a document it has already seen with silence, so a file opened a
+            // second time would otherwise look clean until the next edit.
+            let known = eng
+                .doc_path(space, &path, vault)
+                .and_then(|p| eng.lsp.diags_for(&p).cloned());
+            if let (Some(diags), Some(c)) = (known, eng.clients.get(&id)) {
+                let _ = c.out.send(ServerFrame::Diagnostics { path, diags });
+            }
+        }
+        ClientFrame::Command(Cmd::DocClosed { space, path, vault }) => {
+            eng.doc_closed(space, &path, vault);
+        }
         ClientFrame::Command(Cmd::FileSave { space, path, body }) => {
             match eng.file_write(space, &path, &body) {
                 Ok(()) => eng.lsp_sync(space, &path, &body),
@@ -1298,7 +1355,9 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         | Cmd::VaultInit { .. }
         | Cmd::FileQuery { .. }
         | Cmd::FileRead { .. }
-        | Cmd::FileSave { .. } => {}
+        | Cmd::FileSave { .. }
+        | Cmd::DocChanged { .. }
+        | Cmd::DocClosed { .. } => {}
         Cmd::ApplyLayout { preset } => {
             if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
                 problems.push((NoticeLevel::Warn, e.to_string()));
@@ -1831,7 +1890,20 @@ fn drain_lsp(eng: &mut Engine) {
                 };
                 said.push((NoticeLevel::Warn, text));
             }
-            lsp::Event::Diagnostics { .. } => changed = true,
+            lsp::Event::Diagnostics { path, diags, .. } => {
+                changed = true;
+                // Only for files an editor actually has open, and named the way that editor
+                // named them. A server publishes diagnostics for whatever it feels like
+                // looking at — headers, generated code, the whole dependency tree — and none
+                // of that is on anybody's screen.
+                if let Some(rel) = eng.lsp_paths.get(&path).cloned() {
+                    for c in eng.clients.values() {
+                        let _ = c
+                            .out
+                            .send(ServerFrame::Diagnostics { path: rel.clone(), diags: diags.clone() });
+                    }
+                }
+            }
         }
     }
     for (level, text) in said {
@@ -2341,6 +2413,7 @@ mod tests {
             repos: repo::Cache::default(),
             vaults: HashMap::new(),
             lsp: lsp::Registry::new(),
+            lsp_paths: HashMap::new(),
             cfg,
             clients: HashMap::new(),
             dirty_shape: true,

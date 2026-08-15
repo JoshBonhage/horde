@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -675,6 +675,15 @@ pub enum Cmd {
     /// and remembered ones in the same list, and pressing enter on the one you are already
     /// running should take you there rather than start a second copy of it.
     OpenProject { cwd: String },
+    /// What the editor's buffer currently says, without writing it anywhere.
+    ///
+    /// Separate from [`Cmd::FileSave`] on purpose: diagnostics have to follow what you are
+    /// typing rather than what you last saved, and the file on disk is not horde's to change
+    /// until you ask. `vault` says which root the path is relative to — a note lives in the
+    /// vault, a file lives in the project, and only the client knows which one it opened.
+    DocChanged { space: SpaceId, path: String, body: String, vault: bool },
+    /// The editor closed. Whatever was analysing it can stop.
+    DocClosed { space: SpaceId, path: String, vault: bool },
 }
 
 // Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
@@ -794,6 +803,50 @@ pub enum ServerFrame {
     Vault(Box<VaultReply>),
     /// Answer to [`Cmd::FileQuery`] and friends, for the file browser and editor.
     Files(Box<FileList>),
+    /// What a language server thinks of one file, as the client last named it.
+    ///
+    /// Unsolicited: diagnostics arrive when the server has something to say, which is some
+    /// time after the typing that prompted them and never in reply to a request.
+    Diagnostics { path: String, diags: Vec<Diag> },
+}
+
+// -- diagnostics ----------------------------------------------------------
+// Shared because both halves need them: the daemon parses them out of a language server, and
+// the client draws them in the margin.
+
+/// How bad a diagnostic is. Mirrors LSP's numbering, which is error-first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+impl Severity {
+    /// The margin mark. Plain Unicode geometrics, like every other glyph horde draws.
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            Severity::Error => "◍",
+            Severity::Warning => "△",
+            Severity::Info => "·",
+            Severity::Hint => "·",
+        }
+    }
+}
+
+/// One thing a language server has to say about a line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diag {
+    /// Zero-based, as LSP counts and as the editor's buffer counts.
+    pub line: u32,
+    pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub severity: Severity,
+    pub message: String,
+    /// Which tool said so — `rustc`, `clippy`, `typescript`. Servers that front several.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1058,7 +1111,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 15, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 16, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the
@@ -1122,7 +1175,9 @@ mod digest_tests {
                 | Cmd::FileSave { .. }
                 | Cmd::FileRead { .. }
                 | Cmd::OpenDocPane { .. }
-                | Cmd::OpenProject { .. } => {}
+                | Cmd::OpenProject { .. }
+                | Cmd::DocChanged { .. }
+                | Cmd::DocClosed { .. } => {}
             }
         }
 
@@ -1143,7 +1198,8 @@ mod digest_tests {
                 | ServerFrame::Digest(..)
                 | ServerFrame::Bye { .. }
                 | ServerFrame::Vault(..)
-                | ServerFrame::Files(..) => {}
+                | ServerFrame::Files(..)
+                | ServerFrame::Diagnostics { .. } => {}
             }
             match e {
                 Event::AgentStateChanged { .. }

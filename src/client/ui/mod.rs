@@ -21,7 +21,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use super::{App, Mode};
-use crate::proto::{AgentState, Rect, Rgb};
+use crate::proto::{AgentState, Rect, Rgb, Severity};
 use crate::theme::{mix, Theme};
 
 pub fn color(c: Rgb) -> Color {
@@ -265,19 +265,32 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let col = area.width.saturating_sub(6).min(96);
         let x = area.x + (area.width.saturating_sub(col)) / 2;
         let dirty = app.buffer.as_ref().is_some_and(|b| b.dirty);
-        let head = format!("{}{}", path, if dirty { "  •" } else { "" });
-        put_line(
-            f.buffer_mut(),
-            x,
-            area.y,
-            col,
-            Line::from(ratatui::text::Span::styled(
-                head,
-                Style::default()
-                    .fg(color(if dirty { theme2.ui.working } else { theme2.ui.text_faint }))
-                    .bg(color(theme2.ui.bg)),
-            )),
-        );
+        // What a language server has said about this file, if one is watching it.
+        let diags: &[crate::proto::Diag] =
+            app.diags.get(path).map(|v| v.as_slice()).unwrap_or(&[]);
+        let errors = diags.iter().filter(|d| d.severity == Severity::Error).count();
+        let warnings = diags.iter().filter(|d| d.severity == Severity::Warning).count();
+        let mut head = vec![ratatui::text::Span::styled(
+            format!("{}{}", path, if dirty { "  •" } else { "" }),
+            Style::default()
+                .fg(color(if dirty { theme2.ui.working } else { theme2.ui.text_faint }))
+                .bg(color(theme2.ui.bg)),
+        )];
+        // Counted in the header as well as marked in the margin, because the margin only
+        // says what is on this screen and the file is longer than the screen.
+        if errors > 0 {
+            head.push(ratatui::text::Span::styled(
+                format!("   {errors}◍"),
+                Style::default().fg(color(theme2.ui.blocked)).bg(color(theme2.ui.bg)),
+            ));
+        }
+        if warnings > 0 {
+            head.push(ratatui::text::Span::styled(
+                format!("  {warnings}△"),
+                Style::default().fg(color(theme2.ui.working)).bg(color(theme2.ui.bg)),
+            ));
+        }
+        put_line(f.buffer_mut(), x, area.y, col, Line::from(head));
 
         if let Some(buf) = app.buffer.as_ref() {
             let rows = area.height.saturating_sub(4);
@@ -319,6 +332,31 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     ))
                 };
                 put_line(f.buffer_mut(), x, top + i as u16, col, rendered);
+                // The mark goes in the margin rather than under the text: a squiggle drawn
+                // into an already-styled line means splitting spans the highlighter just
+                // built, and the margin is where the eye looks for "which line" anyway.
+                if let Some(worst) = diags
+                    .iter()
+                    .filter(|d| d.line as usize == n)
+                    .min_by_key(|d| d.severity)
+                {
+                    put_line(
+                        f.buffer_mut(),
+                        x.saturating_sub(2),
+                        top + i as u16,
+                        2,
+                        Line::from(ratatui::text::Span::styled(
+                            worst.severity.glyph().to_string(),
+                            Style::default()
+                                .fg(color(match worst.severity {
+                                    Severity::Error => theme2.ui.blocked,
+                                    Severity::Warning => theme2.ui.working,
+                                    _ => theme2.ui.text_faint,
+                                }))
+                                .bg(color(theme2.ui.bg)),
+                        )),
+                    );
+                }
             }
             // The cursor belongs to whichever line is being typed into. While the `:` line is
             // open that is the prompt, not the text — put it in both places and the one you
@@ -332,7 +370,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             }
         }
 
-        let foot = area.y + area.height.saturating_sub(1);
+        // One row up from the bottom, because the bottom row is the status bar and it is
+        // drawn after this. The hint row had been landing underneath it, which is why nobody
+        // had ever seen it.
+        let foot = area.y + area.height.saturating_sub(2);
         match vim_mode.prompt() {
             // The line being typed *is* the hint: it shows the command as it is written, the
             // way it does in the editor everyone learned this from.
@@ -350,24 +391,48 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 let cx = x + 1 + typed.chars().count() as u16;
                 f.set_cursor_position((cx.min(x + col.saturating_sub(1)), foot));
             }
-            // Different modes, different keys, so different hints. The row always describes
-            // the keyboard you have, not the one you had a moment ago.
+            // What is wrong with the line you are on outranks the list of keys: the keys do
+            // not change, and this does. Nowhere else has room for the message — the margin
+            // holds one glyph and the line itself is the text you are writing.
             None => {
-                let hint = if vim_mode.typing() {
-                    "esc normal   ctrl+s save   ctrl+z undo   ctrl+r read"
-                } else {
-                    "i insert   : command   / search   dd yy p   u undo   :wq write and go"
+                let here = app.buffer.as_ref().map(|b| b.line).unwrap_or(0);
+                let on_line: Vec<&crate::proto::Diag> =
+                    diags.iter().filter(|d| d.line as usize == here).collect();
+                let line = match on_line.first() {
+                    Some(d) => {
+                        let more = match on_line.len() {
+                            1 => String::new(),
+                            n => format!("   (+{} more)", n - 1),
+                        };
+                        let source = d.source.as_deref().map(|s| format!("{s}: ")).unwrap_or_default();
+                        Line::from(ratatui::text::Span::styled(
+                            truncate(&format!("{source}{}{more}", d.message), col as usize),
+                            Style::default()
+                                .fg(color(match d.severity {
+                                    Severity::Error => theme2.ui.blocked,
+                                    Severity::Warning => theme2.ui.working,
+                                    _ => theme2.ui.text_dim,
+                                }))
+                                .bg(color(theme2.ui.bg)),
+                        ))
+                    }
+                    None => {
+                        let hint = if vim_mode.typing() {
+                            "esc normal   ctrl+s save   ctrl+z undo   ctrl+r read"
+                        } else if diags.is_empty() {
+                            "i insert   : command   / search   dd yy p   u undo   :wq write and go"
+                        } else {
+                            "i insert   : command   / search   ]d [d next problem   :wq write and go"
+                        };
+                        Line::from(ratatui::text::Span::styled(
+                            hint.to_string(),
+                            Style::default()
+                                .fg(color(theme2.ui.text_faint))
+                                .bg(color(theme2.ui.bg)),
+                        ))
+                    }
                 };
-                put_line(
-                    f.buffer_mut(),
-                    x,
-                    foot,
-                    col,
-                    Line::from(ratatui::text::Span::styled(
-                        hint.to_string(),
-                        Style::default().fg(color(theme2.ui.text_faint)).bg(color(theme2.ui.bg)),
-                    )),
-                );
+                put_line(f.buffer_mut(), x, foot, col, line);
             }
         }
         statusbar::StatusBar {
