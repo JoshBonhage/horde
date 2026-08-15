@@ -195,6 +195,8 @@ mod tests {
                     degree: 0,
                     group: "g".into(),
                     ghost: false,
+                    by: None,
+                    mtime: 0,
                 })
                 .collect(),
             edges: edges.to_vec(),

@@ -726,6 +726,17 @@ pub struct GraphNode {
     /// A link target with no note behind it. Drawn hollow: it is a note somebody meant to
     /// write, and that is worth seeing rather than hiding.
     pub ghost: bool,
+    /// Whoever signed this note, when it was not a person.
+    ///
+    /// The graph is the one view that shows the vault as a whole, so it is the one place
+    /// where "how much of this did I write" is answerable at a glance. Colouring rather than
+    /// hiding: an agent's notes are part of the vault, and pretending otherwise is how you
+    /// end up surprised by what is in it.
+    #[serde(default)]
+    pub by: Option<String>,
+    /// Unix millis of the last write, for showing what has just changed.
+    #[serde(default)]
+    pub mtime: u64,
 }
 
 /// A project's files, as the file browser shows them.

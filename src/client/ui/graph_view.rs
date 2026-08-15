@@ -31,6 +31,17 @@ use crate::theme::Theme;
 /// by the lines between them.
 const EDGE_LIMIT: usize = 160;
 
+/// How recently a note has to have been written to read as "just now".
+///
+/// An hour, which is about the span of "while I was doing something else". Longer and every
+/// note an agent has ever written looks urgent; shorter and a fleet working through the
+/// morning shows nothing.
+const FRESH: u64 = 60 * 60 * 1000;
+
+fn fresh(mtime: u64, now: u64) -> bool {
+    mtime > 0 && now.saturating_sub(mtime) < FRESH
+}
+
 /// Colour for a cluster, from the six project accents.
 ///
 /// Reusing the space ramp rather than inventing a palette: the point of a group colour is
@@ -55,6 +66,7 @@ pub fn draw(
     sel: usize,
     zoom: f64,
     centre: Point,
+    now: u64,
 ) -> Vec<(u16, u16, usize)> {
     fill(buf, area, theme.ui.bg);
     let mut hits = Vec::new();
@@ -138,6 +150,12 @@ pub fn draw(
         // it does not belong to one yet.
         let (glyph, fg) = if node.ghost {
             ("○", theme.ui.text_faint)
+        } else if node.by.is_some() {
+            // Written on somebody's behalf rather than by them. The graph is the one view
+            // that shows the vault whole, so it is the one place "how much of this did I
+            // write" is answerable at a glance. A diamond, for the same reason a service
+            // gets one: it is not in the same cycle as the rest.
+            ("◆", if fresh(node.mtime, now) { theme.ui.working } else { theme.ui.serving })
         } else if node.degree >= 6 {
             ("●", group_color(&node.group, theme))
         } else {
@@ -187,7 +205,11 @@ pub fn draw(
                 .iter()
                 .filter(|(a, b)| *a as usize == sel || *b as usize == sel)
                 .count();
-            let kind = if n.ghost { "  (not written yet)" } else { "" };
+            let kind = match (&n.by, n.ghost) {
+                (_, true) => "  (not written yet)".to_string(),
+                (Some(by), _) => format!("  (by {by})"),
+                _ => String::new(),
+            };
             let dense = if graph.edges.len() > EDGE_LIMIT { "   showing this node's links" } else { "" };
             format!("{}{kind}   {links} links   {} notes{dense}", n.label, graph.nodes.len())
         }
@@ -231,6 +253,8 @@ mod tests {
             degree,
             group: "dev".into(),
             ghost,
+            by: None,
+            mtime: 0,
         };
         VaultGraph {
             nodes: vec![
@@ -248,7 +272,7 @@ mod tests {
         sim.settle(200);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &g, &sim, sel, 1.0, sim.centre());
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, sel, 1.0, sim.centre(), 0);
         (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect()
@@ -263,6 +287,36 @@ mod tests {
         let ghost = render(2);
         assert!(ghost.contains("Unwritten"), "{ghost}");
         assert!(ghost.contains("not written yet"), "a ghost says so: {ghost}");
+    }
+
+    /// The graph is the one view that shows the vault whole, so it is the one place "how
+    /// much of this did I write" is answerable at a glance. A note written on somebody's
+    /// behalf has to look different from one they wrote — and say whose it is when selected.
+    #[test]
+    fn a_note_written_by_an_agent_is_marked_as_one() {
+        let mut g = graph();
+        g.nodes[0].by = Some("reviewer".into());
+        let mut sim = Sim::new(&g);
+        sim.settle(200);
+        let area = TRect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0);
+        let text: String = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+
+        assert!(text.contains('◆'), "marked apart from the notes a person wrote:\n{text}");
+        assert!(text.contains("(by reviewer)"), "and the header says whose:\n{text}");
+    }
+
+    /// An hour, which is about the span of "while I was doing something else". A note with no
+    /// mtime at all is not fresh, or a graph built from a fixture would glow.
+    #[test]
+    fn freshness_is_about_the_last_hour() {
+        let now = 10 * FRESH;
+        assert!(fresh(now - 1000, now), "a minute ago");
+        assert!(!fresh(now - FRESH - 1, now), "and not two hours ago");
+        assert!(!fresh(0, now), "nor a note that never said when");
     }
 
     /// Something has to actually be drawn — edges as braille, nodes as glyphs. A canvas that
@@ -290,6 +344,8 @@ mod tests {
                 degree: 4,
                 group: "g".into(),
                 ghost: false,
+                by: None,
+                mtime: 0,
             });
         }
         // Well past EDGE_LIMIT, with node 0 in only one of them.
@@ -306,7 +362,7 @@ mod tests {
         sim.settle(300);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre());
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0);
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();
@@ -329,7 +385,7 @@ mod tests {
         let sim = Sim::new(&empty);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &empty, &sim, 0, 1.0, Point { x: 0.0, y: 0.0 });
+        draw(&mut buf, area, &Theme::horde(), &empty, &sim, 0, 1.0, Point { x: 0.0, y: 0.0 }, 0);
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect();

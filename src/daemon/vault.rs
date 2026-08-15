@@ -53,6 +53,9 @@ pub struct Note {
     pub tags: Vec<String>,
     pub aliases: Vec<String>,
     pub links: Vec<Link>,
+    /// The `by:` property, when the note carries one. Set by everything horde writes on
+    /// somebody's behalf; absent from anything a person wrote themselves.
+    pub by: Option<String>,
 }
 
 impl Note {
@@ -106,9 +109,10 @@ fn target_stem(target: &str) -> String {
 /// of 170 notes in the reference vault use) and a `-` list under the key. Deliberately not a
 /// YAML parser — a dependency for two keys would be a poor trade, and anything it could not
 /// read it would have to guess at.
-fn parse_frontmatter(block: &str) -> (Vec<String>, Vec<String>) {
+fn parse_frontmatter(block: &str) -> (Vec<String>, Vec<String>, Option<String>) {
     let mut tags = Vec::new();
     let mut aliases = Vec::new();
+    let mut by = None;
     let mut collecting: Option<&mut Vec<String>> = None;
 
     for line in block.lines() {
@@ -120,6 +124,10 @@ fn parse_frontmatter(block: &str) -> (Vec<String>, Vec<String>) {
         if is_new_key {
             let (k, rest) = line.split_once(':').unwrap();
             let rest = rest.trim();
+            // A scalar, not a list, so it is taken here rather than through the bucket.
+            if k.trim() == "by" && !rest.is_empty() {
+                by = Some(rest.trim_matches(['"', '\'']).to_string());
+            }
             let bucket = match k.trim() {
                 "tags" => Some(&mut tags),
                 "aliases" | "alias" => Some(&mut aliases),
@@ -152,7 +160,7 @@ fn parse_frontmatter(block: &str) -> (Vec<String>, Vec<String>) {
             }
         }
     }
-    (tags, aliases)
+    (tags, aliases, by)
 }
 
 /// Everything the index keeps about one file, from its text.
@@ -166,9 +174,10 @@ pub fn parse(text: &str, stem: &str) -> Note {
     let body = match text.strip_prefix("---\n") {
         Some(rest) => match rest.split_once("\n---") {
             Some((front, after)) => {
-                let (tags, aliases) = parse_frontmatter(front);
+                let (tags, aliases, by) = parse_frontmatter(front);
                 note.tags = tags;
                 note.aliases = aliases;
+                note.by = by;
                 after.trim_start_matches('\n').trim_start_matches("-\n")
             }
             None => text,
@@ -419,6 +428,8 @@ impl Index {
                                     degree: 0,
                                     group: String::new(),
                                     ghost: true,
+                                    by: None,
+                                    mtime: 0,
                                 });
                                 ghosts.len() - 1
                             }
@@ -447,6 +458,8 @@ impl Index {
                         .unwrap_or_else(|| "·".into())
                 }),
                 ghost: false,
+                by: n.by.clone(),
+                mtime: n.mtime,
             });
         }
         for (i, node) in g.nodes.iter_mut().enumerate().take(ghost_count) {

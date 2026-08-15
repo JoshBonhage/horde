@@ -238,7 +238,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if let (Some(sim), Some(g)) = (app.sim.as_ref(), app.vault.as_ref().and_then(|v| v.graph.as_ref()))
         {
             app.graph_hits = graph_view::draw(
-                f.buffer_mut(), area, &theme, g, sim, sel, app.graph_zoom, app.graph_centre,
+                f.buffer_mut(),
+                area,
+                &theme,
+                g,
+                sim,
+                sel,
+                app.graph_zoom,
+                app.graph_centre,
+                // The client's own clock rather than the daemon's: "recently" means recently
+                // to the person looking at the screen.
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
             );
         }
         statusbar::StatusBar {
