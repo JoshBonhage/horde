@@ -192,6 +192,40 @@ toast, so that `horde digest` afterwards still has the detail.
 With no `since` and no previous read, the window starts at daemon start rather than at the
 beginning of the logs; the returned `fresh` flag says when that happened.
 
+### Vault
+
+The read side of a project's notes.
+
+| Method | Params | Notes |
+|---|---|---|
+| `vault.list` | `space?` | every note, newest first |
+| `vault.search` | `q`, `space?` | ranked: exact name, then prefix, then substring, then tag |
+| `vault.read` | `path`, `space?` | one note's text, plus what links to it |
+| `vault.write` | `path`, `body`, `space?` | write a note, creating it and its folders |
+| `vault.init` | `path?` | set a directory up as a vault |
+
+`vault.write` takes a path **relative to the vault** and refuses anything that climbs out of
+it: `../../.ssh/authorized_keys` is a note title someone could send, and writing a note must
+never be a way to write something else. The index updates before the call returns, so a note
+is searchable the moment it exists.
+
+`space` is a name, defaulting to the focused one. `path` is relative to the vault root and
+is the `path` a list returns, not an absolute path.
+
+Every reply carries `root`, so a caller knows which directory it is reading. A project with
+no vault answers `not_found` rather than an empty list — "there are no notes" and "there is
+nowhere to keep notes" are different answers, and only one of them is worth writing a note
+to fix.
+
+```sh
+horde() { printf '%s' "$1" | nc -U ~/.config/horde/horde.sock; }
+horde '{"id":"1","method":"vault.search","params":{"q":"handover"}}'
+```
+
+Where the notes live: a directory containing `.obsidian/` if there is one, else `notes/`
+inside the project (`vault.dir`). Notes are tracked content the human owns — deliberately
+not under `.horde/`, which git is told to ignore.
+
 ### Commands
 
 | Method | Params |
