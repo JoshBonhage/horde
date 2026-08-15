@@ -298,6 +298,8 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         }
 
         // -- panes -------------------------------------------------------
+        // A pane showing a file reports the file, so `pane.list` answers "what is this"
+        // for both kinds rather than only for programs.
         "pane.list" => {
             let cfg = eng.cfg.clone();
             Ok(json!(eng.session.snapshot(&cfg, &eng.repos).panes))

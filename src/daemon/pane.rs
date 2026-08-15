@@ -117,6 +117,31 @@ impl EventListener for EventProxy {
     }
 }
 
+/// What a pane holds.
+///
+/// The bet this makes: `proto::Row` is already the universal content type and the client is
+/// a blitter, so anything that can fill a row mirror renders correctly with no client
+/// change at all. A pane showing a file is then a pane in every way that matters -- it
+/// splits, zooms, swaps and resizes, because the layout never knew what was inside one.
+enum Content {
+    Pty(PtyContent),
+    Doc(DocContent),
+}
+
+/// A pane showing a file instead of a program.
+///
+/// Read-only, deliberately: this arrives with the refactor that makes it possible, and a
+/// viewer is the smallest payload that proves the refactor works. Writing already has a
+/// place -- the editor -- and moving that in here is its own change.
+struct DocContent {
+    path: PathBuf,
+    lines: Vec<String>,
+    /// First line on screen.
+    scroll: usize,
+    /// Set when the view moved and the mirror has not caught up.
+    stale: bool,
+}
+
 /// The parts of a pane that are a running program: its tty, its child, and the buffers
 /// between them.
 ///
@@ -194,8 +219,8 @@ pub struct Pane {
     /// project reached an agent you had left thinking in another.
     pub board: bool,
 
-    /// Everything that makes this pane a running program.
-    content: PtyContent,
+    /// A running program, or a file.
+    content: Content,
 
     /// Visible grid as of the last `pump`. Authoritative for both rendering and detection.
     mirror: Vec<Row>,
@@ -245,6 +270,34 @@ pub struct ModelRun {
 }
 
 impl Pane {
+    /// The tty, when this pane has one.
+    fn pty(&self) -> Option<&PtyContent> {
+        match &self.content {
+            Content::Pty(p) => Some(p),
+            Content::Doc(_) => None,
+        }
+    }
+
+    fn pty_mut(&mut self) -> Option<&mut PtyContent> {
+        match &mut self.content {
+            Content::Pty(p) => Some(p),
+            Content::Doc(_) => None,
+        }
+    }
+
+    /// True when this pane is a file rather than a program.
+    pub fn is_doc(&self) -> bool {
+        matches!(self.content, Content::Doc(_))
+    }
+
+    /// The file a doc pane is showing.
+    pub fn doc_path(&self) -> Option<&Path> {
+        match &self.content {
+            Content::Doc(d) => Some(&d.path),
+            Content::Pty(_) => None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: PaneId,
@@ -330,7 +383,7 @@ impl Pane {
             pinned: false,
             board: false,
             spawned_by_pane: None,
-            content: PtyContent {
+            content: Content::Pty(PtyContent {
                 term,
                 parser: Processor::new(),
                 master,
@@ -340,7 +393,7 @@ impl Pane {
                 signal_rx,
                 deferred: Vec::new(),
                 outbound: Vec::new(),
-            },
+            }),
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
             handover_told: false,
@@ -352,15 +405,59 @@ impl Pane {
         })
     }
 
-    /// Drain the PTY, advance the emulator, refresh the mirror. Returns true if anything
-    /// changed. Called once per daemon tick.
+    /// Bring the mirror up to date. Returns true if anything changed.
+    ///
+    /// The one method every pane must answer, whatever is inside it: the tick loop calls it
+    /// for each pane and broadcasts whatever rows came out.
     pub fn pump(&mut self, theme: &Theme) -> bool {
+        match self.content {
+            Content::Pty(_) => self.pump_pty(theme),
+            Content::Doc(_) => self.pump_doc(theme),
+        }
+    }
+
+    /// Rebuild a doc's visible window when it has moved.
+    ///
+    /// No draining and no emulator: a file does not change under the pane, so there is
+    /// nothing to poll and the work only happens when the view itself moved.
+    fn pump_doc(&mut self, theme: &Theme) -> bool {
+        let rows = self.rows as usize;
+        if self.mirror.len() != rows {
+            self.mirror.resize(rows, Row::default());
+            self.full_repaint = true;
+        }
+        let cols = self.cols as usize;
+        let Content::Doc(doc) = &self.content else { return false };
+        if !doc.stale && !self.full_repaint {
+            return false;
+        }
+        let built: Vec<Row> = (0..rows).map(|y| doc_row(doc, y, cols, theme)).collect();
+        if let Content::Doc(doc) = &mut self.content {
+            doc.stale = false;
+        }
+        self.full_repaint = false;
+
+        let mut changed = false;
+        for (y, row) in built.into_iter().enumerate() {
+            if self.mirror[y] != row {
+                self.mirror[y] = row;
+                self.dirty.insert(y as u16);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Drain the PTY, advance the emulator, refresh the mirror.
+    fn pump_pty(&mut self, theme: &Theme) -> bool {
         let mut got_bytes = false;
         // Bounded per tick so one firehosing pane cannot starve the others.
         for _ in 0..256 {
-            match self.content.reader.rx.try_recv() {
+            let Content::Pty(pty) = &mut self.content else { return false };
+            match pty.reader.rx.try_recv() {
                 Ok(chunk) => {
-                    self.content.parser.advance(&mut self.content.term, &chunk);
+                    let Content::Pty(pty) = &mut self.content else { break };
+                    pty.parser.advance(&mut pty.term, &chunk);
                     got_bytes = true;
                 }
                 Err(_) => break,
@@ -368,7 +465,7 @@ impl Pane {
         }
 
         let mut signals = Vec::new();
-        while let Ok(sig) = self.content.signal_rx.try_recv() {
+        while let Some(sig) = self.pty_mut().and_then(|p| p.signal_rx.try_recv().ok()) {
             signals.push(sig);
         }
         for sig in signals {
@@ -385,20 +482,25 @@ impl Pane {
         let now = Instant::now();
         let due: Vec<Vec<u8>> = {
             let (due, pending): (Vec<_>, Vec<_>) =
-                std::mem::take(&mut self.content.deferred).into_iter().partition(|(at, _)| *at <= now);
-            self.content.deferred = pending;
+                match self.pty_mut() {
+                    Some(p) => std::mem::take(&mut p.deferred).into_iter().partition(|(at, _)| *at <= now),
+                    None => (Vec::new(), Vec::new()),
+                };
+            if let Some(p) = self.pty_mut() {
+                p.deferred = pending;
+            }
             due.into_iter().map(|(_, b)| b).collect()
         };
         for bytes in due {
             let _ = self.write(&bytes);
         }
         // Whatever the tty could not take last tick goes out now.
-        if !self.content.outbound.is_empty() {
+        if self.pty().is_some_and(|p| !p.outbound.is_empty()) {
             self.push_outbound();
         }
 
         if self.exited.is_none() {
-            if let Some(code) = self.content.child.try_wait() {
+            if let Some(code) = self.pty_mut().and_then(|p| p.child.try_wait()) {
                 self.exited = Some(code);
             }
         }
@@ -417,8 +519,9 @@ impl Pane {
 
         // Which viewport rows to rebuild. Damage is reported relative to the live view, so
         // while scrolled back it does not describe what is on screen — rebuild everything.
-        let scrolled = self.content.term.grid().display_offset() != 0;
-        let targets: Vec<usize> = match self.content.term.damage() {
+        let Content::Pty(pty) = &mut self.content else { return false };
+        let scrolled = pty.term.grid().display_offset() != 0;
+        let targets: Vec<usize> = match pty.term.damage() {
             TermDamage::Full => (0..rows).collect(),
             TermDamage::Partial(iter) => {
                 let lines: Vec<usize> = iter.map(|d| d.line).collect();
@@ -429,7 +532,9 @@ impl Pane {
                 }
             }
         };
-        self.content.term.reset_damage();
+        if let Some(p) = self.pty_mut() {
+            p.term.reset_damage();
+        }
 
         let targets = if self.full_repaint { (0..rows).collect() } else { targets };
         self.full_repaint = false;
@@ -448,7 +553,7 @@ impl Pane {
 
     /// Read one viewport row out of the grid and run-length encode it by style.
     fn build_row(&self, y: usize, theme: &Theme) -> Row {
-        let grid = self.content.term.grid();
+        let Some(grid) = self.pty().map(|p| p.term.grid()) else { return Row::default() };
         let offset = grid.display_offset() as i32;
         // Viewport row 0 is `Line(-offset)`; scrolling back shows history above it.
         let line = Line(y as i32 - offset);
@@ -545,6 +650,12 @@ impl Pane {
     /// Detection reads from here rather than the scrolled viewport, so scrolling back
     /// never changes what horde thinks an agent is doing.
     pub fn detection_snapshot(&self, n: usize) -> Vec<String> {
+        // A doc pane shows a file, not a program's output. Handing its text to the detector
+        // would have manifests matching against whatever somebody happened to write down —
+        // a note mentioning "Claude Code" would become an agent.
+        if self.is_doc() {
+            return Vec::new();
+        }
         let all = self.visible_text();
         let end = all.iter().rposition(|l| !l.is_empty()).map(|i| i + 1).unwrap_or(0);
         let start = end.saturating_sub(n);
@@ -552,7 +663,12 @@ impl Pane {
     }
 
     pub fn cursor(&self) -> CursorPos {
-        let grid = self.content.term.grid();
+        let Some(pty) = self.pty() else {
+            // A doc has no cursor. Reporting one would put a block on a file nobody is
+            // typing into.
+            return CursorPos { x: 0, y: 0, visible: false };
+        };
+        let grid = pty.term.grid();
         let Point { line, column } = grid.cursor.point;
         let offset = grid.display_offset() as i32;
         let y = line.0 + offset;
@@ -560,37 +676,57 @@ impl Pane {
             x: column.0 as u16,
             y: y.max(0) as u16,
             // Hidden by the program, or scrolled out of view.
-            visible: self.content.term.mode().contains(TermMode::SHOW_CURSOR)
+            visible: pty.term.mode().contains(TermMode::SHOW_CURSOR)
                 && y >= 0
                 && y < self.rows as i32,
         }
     }
 
     pub fn scroll_offset(&self) -> usize {
-        self.content.term.grid().display_offset()
+        match &self.content {
+            Content::Pty(p) => p.term.grid().display_offset(),
+            Content::Doc(d) => d.scroll,
+        }
     }
 
     pub fn bracketed_paste(&self) -> bool {
-        self.content.term.mode().contains(TermMode::BRACKETED_PASTE)
+        self.pty().is_some_and(|p| p.term.mode().contains(TermMode::BRACKETED_PASTE))
     }
 
     /// True when the program asked to receive mouse events, in which case the client should
     /// forward them instead of using the mouse for horde's own UI.
     pub fn wants_mouse(&self) -> bool {
-        self.content.term.mode().intersects(TermMode::MOUSE_MODE)
+        self.pty().is_some_and(|p| p.term.mode().intersects(TermMode::MOUSE_MODE))
     }
 
     pub fn scroll(&mut self, lines: i32) {
         use alacritty_terminal::grid::Scroll;
-        // Scrolling changes which grid lines are visible without generating damage, so
-        // force a repaint explicitly.
-        self.content.term.scroll_display(Scroll::Delta(lines));
+        let rows = self.rows as usize;
+        match &mut self.content {
+            // Scrolling changes which grid lines are visible without generating damage, so
+            // force a repaint explicitly.
+            Content::Pty(p) => p.term.scroll_display(Scroll::Delta(lines)),
+            Content::Doc(d) => {
+                // Down is a larger line number here and a negative delta in a terminal,
+                // whose history sits above the view rather than below it.
+                let last = d.lines.len().saturating_sub(rows.max(1));
+                d.scroll = (d.scroll as i64 - lines as i64).clamp(0, last as i64) as usize;
+                d.stale = true;
+            }
+        }
         self.full_repaint = true;
     }
 
     pub fn scroll_bottom(&mut self) {
         use alacritty_terminal::grid::Scroll;
-        self.content.term.scroll_display(Scroll::Bottom);
+        match &mut self.content {
+            Content::Pty(p) => p.term.scroll_display(Scroll::Bottom),
+            // The bottom of a file is its end, which is where a terminal's bottom is too.
+            Content::Doc(d) => {
+                d.scroll = d.lines.len().saturating_sub(self.rows.max(1) as usize);
+                d.stale = true;
+            }
+        }
         self.full_repaint = true;
     }
 
@@ -602,35 +738,43 @@ impl Pane {
         if self.exited.is_some() {
             return Ok(());
         }
+        // A doc has nothing to write to. Silently, because every caller that could reach
+        // here already checks `accepts_input`, and the bus never resolves to a doc at all.
+        if self.pty().is_none() {
+            return Ok(());
+        }
         // A pane that has stopped reading entirely must not grow this without limit. The bus
         // gate normally prevents it from getting close; this is the backstop.
-        if self.content.outbound.len() + bytes.len() > MAX_OUTBOUND {
-            return Err(anyhow!("pane {} is not reading its input", self.id));
+        let id = self.id;
+        let Some(pty) = self.pty_mut() else { return Ok(()) };
+        if pty.outbound.len() + bytes.len() > MAX_OUTBOUND {
+            return Err(anyhow!("pane {id} is not reading its input"));
         }
-        self.content.outbound.extend_from_slice(bytes);
+        pty.outbound.extend_from_slice(bytes);
         self.push_outbound();
         Ok(())
     }
 
     /// Hand the buffer to the tty until it stops accepting.
     fn push_outbound(&mut self) {
-        while !self.content.outbound.is_empty() {
-            match self.content.writer.write(&self.content.outbound) {
+        let Some(pty) = self.pty_mut() else { return };
+        while !pty.outbound.is_empty() {
+            match pty.writer.write(&pty.outbound) {
                 Ok(0) => break,
                 Ok(n) => {
-                    self.content.outbound.drain(..n);
+                    pty.outbound.drain(..n);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 // The tty is full. The rest waits for a later tick.
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 // The pane is gone; holding its bytes forever would leak.
                 Err(_) => {
-                    self.content.outbound.clear();
+                    pty.outbound.clear();
                     break;
                 }
             }
         }
-        let _ = self.content.writer.flush();
+        let _ = pty.writer.flush();
     }
 
     /// Typing into a pane implies you want to see the live view again.
@@ -647,12 +791,16 @@ impl Pane {
     ///
     /// Returns false on timeout. A caller that cannot get confirmation must abandon the
     /// handoff: two processes reading one master would tear the output stream apart.
+    /// A doc has no reader to pause, and answers true: there is nothing that could still
+    /// be reading, which is exactly the condition the caller is waiting for.
     pub fn pause_reader(&self, timeout: std::time::Duration) -> bool {
-        self.content.reader.pause(timeout)
+        self.pty().is_none_or(|p| p.reader.pause(timeout))
     }
 
     pub fn resume_reader(&self) {
-        self.content.reader.resume();
+        if let Some(p) = self.pty() {
+            p.reader.resume();
+        }
     }
 
     /// Everything a successor daemon needs to take this pane over, plus a duplicate of the
@@ -662,15 +810,23 @@ impl Pane {
     pub fn export(&mut self) -> Result<(super::handoff::HPane, std::os::fd::OwnedFd)> {
         // Anything already read but not yet fed to the emulator travels with the manifest;
         // dropping it would lose whatever the pane printed in the last instant.
+        // A doc pane is state rather than a process, so it has no descriptor to pass and
+        // does not survive an upgrade this way. It reopens from its path instead, which is
+        // strictly better than a PTY's grid replay -- but that is the next change, not this
+        // one, and refusing here is honest until then.
         let mut pending = Vec::new();
-        while let Ok(chunk) = self.content.reader.rx.try_recv() {
+        while let Some(chunk) = self.pty_mut().and_then(|p| p.reader.rx.try_recv().ok()) {
             pending.extend(chunk);
         }
         let cursor = self.cursor();
-        let fd = self.content.master.dup_for_handoff()?;
+        let Some(pty) = self.pty_mut() else {
+            return Err(anyhow!("pane {} shows a file and cannot be handed over", self.id));
+        };
+        let fd = pty.master.dup_for_handoff()?;
+        let pid = pty.child.pid().unwrap_or(0);
         Ok((
             super::handoff::HPane {
-                pid: self.content.child.pid().unwrap_or(0),
+                pid,
                 cmd: self.cmd.clone(),
                 cwd: self.cwd.to_string_lossy().to_string(),
                 name: self.name.clone(),
@@ -763,7 +919,7 @@ impl Pane {
                 nudged_since: None,
                 alerted_since: None,
             }),
-            content: PtyContent {
+            content: Content::Pty(PtyContent {
                 term,
                 parser: Processor::new(),
                 master,
@@ -773,7 +929,7 @@ impl Pane {
                 signal_rx,
                 deferred: Vec::new(),
                 outbound: Vec::new(),
-            },
+            }),
             mirror: vec![Row::default(); saved.rows as usize],
             dirty: HashSet::new(),
             handover_told: false,
@@ -789,9 +945,11 @@ impl Pane {
         // whatever is running happened to redraw.
         let replay =
             super::handoff::screen_to_ansi(&saved.screen, saved.cursor_x, saved.cursor_y);
-        pane.content.parser.advance(&mut pane.content.term, &replay);
-        if !saved.pending.is_empty() {
-            pane.content.parser.advance(&mut pane.content.term, &saved.pending);
+        if let Content::Pty(pty) = &mut pane.content {
+            pty.parser.advance(&mut pty.term, &replay);
+            if !saved.pending.is_empty() {
+                pty.parser.advance(&mut pty.term, &saved.pending);
+            }
         }
         pane.refresh_mirror(theme);
         pane.request_full_repaint();
@@ -800,7 +958,9 @@ impl Pane {
 
     /// Queue bytes to be written after `delay`.
     pub fn write_later(&mut self, bytes: Vec<u8>, delay: std::time::Duration) {
-        self.content.deferred.push((Instant::now() + delay, bytes));
+        if let Some(p) = self.pty_mut() {
+            p.deferred.push((Instant::now() + delay, bytes));
+        }
     }
 
     /// Whether the pty will take a write now. See [`Master::writable`].
@@ -808,8 +968,9 @@ impl Pane {
     /// The timeout is deliberately tiny: this runs on the engine thread once per delivery, and
     /// a target that cannot take input within a few milliseconds is better queued than waited
     /// on. It flushes on a later pass at no cost.
+    /// A doc takes no input, which is also what keeps the bus from ever writing into one.
     pub fn accepts_input(&self) -> bool {
-        self.content.master.writable(5)
+        self.pty().is_some_and(|p| p.master.writable(5))
     }
 
     /// Longest text this pane can accept in one line without the tty discarding the tail.
@@ -819,7 +980,7 @@ impl Pane {
     /// `MAX_CANON` and drops the rest silently, so a long message has to be refused rather
     /// than half-delivered.
     pub fn max_input_line(&self) -> Option<usize> {
-        match self.content.master.input_is_canonical() {
+        match self.pty().and_then(|p| p.master.input_is_canonical()) {
             // A little headroom under MAX_CANON (1024): the limit counts the whole line, and
             // anything already typed at that prompt counts against it too.
             Some(true) => Some(900),
@@ -833,7 +994,7 @@ impl Pane {
     /// Anything about to type into this pane must wait for both, or its text would land inside
     /// the previous message or in front of a submit that has not fired.
     pub fn has_deferred(&self) -> bool {
-        !self.content.deferred.is_empty() || !self.content.outbound.is_empty()
+        self.pty().is_some_and(|p| !p.deferred.is_empty() || !p.outbound.is_empty())
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
@@ -844,8 +1005,14 @@ impl Pane {
         }
         self.cols = cols;
         self.rows = rows;
-        self.content.master.resize(cols, rows)?;
-        self.content.term.resize(TermSize { cols: cols as usize, rows: rows as usize });
+        match &mut self.content {
+            Content::Pty(p) => {
+                p.master.resize(cols, rows)?;
+                p.term.resize(TermSize { cols: cols as usize, rows: rows as usize });
+            }
+            // A doc has no program to tell, only a window that changed shape.
+            Content::Doc(d) => d.stale = true,
+        }
         self.mirror.clear();
         self.mirror.resize(rows as usize, Row::default());
         self.full_repaint = true;
@@ -887,6 +1054,10 @@ impl Pane {
         if let Some(n) = &self.name {
             return n.clone();
         }
+        // A doc pane has no command to fall back to, so its file is the name.
+        if let Some(p) = self.doc_path() {
+            return p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        }
         if !self.osc_title.is_empty() {
             return self.osc_title.clone();
         }
@@ -901,12 +1072,84 @@ impl Pane {
     /// Foreground process group of the PTY. Detection uses this to work out which program
     /// is actually in charge, which is not necessarily what we spawned.
     pub fn foreground_pgid(&self) -> Option<i32> {
-        self.content.master.foreground_pgid()
+        self.pty()?.master.foreground_pgid()
     }
 
     pub fn kill(&mut self) {
-        let _ = self.content.child.kill();
+        match &mut self.content {
+            Content::Pty(p) => {
+                let _ = p.child.kill();
+            }
+            // Closing a doc is closing a window onto a file. Marked exited so the session's
+            // reaper takes it away on the next tick, the same as any pane whose program
+            // ended -- one path for "this pane is finished" rather than two.
+            Content::Doc(_) => self.exited = Some(0),
+        }
     }
+
+    /// Open a file as a pane.
+    ///
+    /// The whole point of the split: this returns a `Pane` like any other, so the layout
+    /// tree, the resize path and the row broadcast never learn that anything changed.
+    pub fn open_doc(
+        id: PaneId,
+        tab: TabId,
+        space: SpaceId,
+        path: &Path,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Pane> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        let lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+        Ok(Pane {
+            id,
+            tab,
+            space,
+            name: name.clone(),
+            osc_title: name.unwrap_or_default(),
+            cwd: path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+            cmd: String::new(),
+            cols,
+            rows,
+            exited: None,
+            agent: None,
+            spawned_by: None,
+            role: None,
+            pinned: false,
+            board: false,
+            spawned_by_pane: None,
+            content: Content::Doc(DocContent {
+                path: path.to_path_buf(),
+                lines,
+                scroll: 0,
+                stale: true,
+            }),
+            mirror: vec![Row::default(); rows as usize],
+            dirty: HashSet::new(),
+            handover_told: false,
+            succeeded: false,
+            succession_depth: 0,
+            model: None,
+            last_sent_cursor: None,
+            full_repaint: true,
+        })
+    }
+}
+
+/// One row of a doc's visible window.
+///
+/// Plain text in the theme's foreground. Styling a file by its language belongs here
+/// eventually -- the row is the same shape either way -- but a viewer that shows the file
+/// is what proves the refactor, and colour is a change that can be read on its own.
+fn doc_row(doc: &DocContent, y: usize, cols: usize, theme: &Theme) -> Row {
+    let Some(text) = doc.lines.get(doc.scroll + y) else { return Row::default() };
+    let text: String = text.chars().take(cols).collect();
+    if text.is_empty() {
+        return Row::default();
+    }
+    Row { runs: vec![Run { text, fg: theme.ui.text, bg: theme.ui.bg, attrs: 0 }] }
 }
 
 /// Split a command string into a program plus arguments.

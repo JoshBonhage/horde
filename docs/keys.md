@@ -92,7 +92,13 @@ Set `dashboard = false` under `[ui]` to attach straight into the terminal instea
 
 `enter` on a project — on the start screen, or `ctrl+b F` any time — shows you **the
 project**: its files, as a tree, filtered as you type. `enter` on a file opens it for editing
-inside horde. `ctrl+t` gives you a terminal in it.
+inside horde. `ctrl+t` gives you a terminal in it, and `ctrl+p` opens the file in a pane of its own.
+
+A pane showing a file is a pane in every way that matters: it splits, zooms, swaps and
+resizes with everything else, so an agent working in one half and the file it is working on
+in the other is just a normal layout. It is read-only for now — writing has a place already,
+and moving that into a pane is its own change. It takes no input, is never mistaken for an
+agent, and does not survive `horde upgrade`, which reopens from the path instead.
 
 That way round on purpose. Opening a project is usually about a file, and the multiplexer is
 a keystroke away rather than the thing you go through to reach anything else.
@@ -166,6 +172,7 @@ The cursor walks past folders, since there is nothing to do to one.
 | `↑` `↓` | move |
 | `enter` | **read the note**, rendered |
 | `ctrl+e` | **write in it**, in horde |
+| `ctrl+p` | open it **in a pane**, beside what is already there |
 | `ctrl+n` | new note |
 | `backspace` | delete a character of the filter |
 | `esc` | close |

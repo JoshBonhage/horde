@@ -275,7 +275,7 @@ pub fn draw_files(
         area.y + area.height.saturating_sub(1),
         w,
         Line::from(Span::styled(
-            "enter open   ←→ fold   type to find   ctrl+t a terminal here   esc back"
+            "enter open   ctrl+p as a pane   ←→ fold   ctrl+t terminal   esc back"
                 .to_string(),
             Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.bg)),
         )),
@@ -479,7 +479,7 @@ pub fn draw(
         area.y + area.height.saturating_sub(1),
         area.width.saturating_sub(4),
         Line::from(Span::styled(
-            "enter read   ctrl+e write   ctrl+n new   ↑↓ move   type to filter   esc close"
+            "enter read   ctrl+e write   ctrl+p as a pane   ctrl+n new   esc close"
                 .to_string(),
             Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.bg)),
         )),

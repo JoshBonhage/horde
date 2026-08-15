@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -633,6 +633,8 @@ pub enum Cmd {
     FileSave { space: SpaceId, path: String, body: String },
     /// One project file's text, for editing.
     FileRead { space: SpaceId, path: String },
+    /// Show a file in a pane of its own, beside whatever is already there.
+    OpenDocPane { space: SpaceId, path: String },
     /// Open a project directory: focus the space already on it, or make one if there is none.
     ///
     /// Focus-or-create rather than always-create, because the dashboard offers live projects
@@ -1022,7 +1024,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 13, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 14, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the
@@ -1085,6 +1087,7 @@ mod digest_tests {
                 | Cmd::FileQuery { .. }
                 | Cmd::FileSave { .. }
                 | Cmd::FileRead { .. }
+                | Cmd::OpenDocPane { .. }
                 | Cmd::OpenProject { .. } => {}
             }
         }

@@ -1397,6 +1397,19 @@ fn handle_key(
                 KeyCode::Char('t') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = Mode::Terminal
                 }
+                // Beside the terminal rather than instead of it: the point of the pane split
+                // is having the file and the agent working on it on screen at once.
+                KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let (Some(row), Some(space)) =
+                        (rows.get(sel).filter(|r| !r.folder), app.files.as_ref().map(|f| f.space))
+                    {
+                        let _ = out.send(ClientFrame::Command(Cmd::OpenDocPane {
+                            space,
+                            path: row.path.clone(),
+                        }));
+                        app.mode = Mode::Terminal;
+                    }
+                }
                 KeyCode::Backspace => {
                     let mut q = query;
                     q.pop();
@@ -1450,6 +1463,18 @@ fn handle_key(
                 // one under the cursor. Reading is what plain enter does.
                 KeyCode::Char('n') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = Mode::Prompt { prompt: Prompt::NewNote, value: String::new() }
+                }
+                KeyCode::Char('p') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let (Some(row), Some(space)) = (
+                        rows.get(sel).filter(|r| !r.folder),
+                        app.snapshot.as_ref().and_then(|s| s.focused_space),
+                    ) {
+                        let _ = out.send(ClientFrame::Command(Cmd::OpenDocPane {
+                            space,
+                            path: row.path.clone(),
+                        }));
+                        app.mode = Mode::Terminal;
+                    }
                 }
                 KeyCode::Char(c) => {
                     let mut q = query;

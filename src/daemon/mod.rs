@@ -1086,6 +1086,23 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         Cmd::FocusSpace(id) => {
             eng.session.focus_space(id);
         }
+        Cmd::OpenDocPane { space, path } => {
+            // Relative to the project, and jailed to it: this opens a pane on a path that
+            // arrived over a socket, so it gets the same treatment as writing one.
+            let root = eng.session.space(space).map(|s| s.cwd.clone());
+            let full = root.and_then(|r| vault::safe_join(&r, &path).ok()).or_else(|| {
+                // A note lives in the vault rather than the project, so try there too.
+                eng.vault_root(space).and_then(|r| vault::safe_join(&r, &path).ok())
+            });
+            match full.filter(|p| p.is_file()) {
+                Some(p) => {
+                    if let Err(e) = eng.session.split_doc(&cfg, None, Dir::Right, &p) {
+                        problems.push((NoticeLevel::Warn, e.to_string()));
+                    }
+                }
+                None => problems.push((NoticeLevel::Warn, format!("no file at {path}"))),
+            }
+        }
         Cmd::OpenProject { cwd } => {
             let path = PathBuf::from(&cwd);
             // A remembered directory can be gone by the time you pick it. Say so instead of
