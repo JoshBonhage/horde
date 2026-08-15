@@ -354,7 +354,9 @@ impl Engine {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         let text = match (append, existing.is_empty()) {
             (true, false) => {
-                let joined = format!("{}\n{}", existing.trim_end(), body);
+                // A blank line between, so appended sections read as separate entries rather
+                // than as one that ran on.
+                let joined = format!("{}\n\n{}", existing.trim_end(), body.trim_start());
                 if joined.len() > vault::MAX_NOTE {
                     return Err(anyhow!("appending would take the note past {} bytes", vault::MAX_NOTE));
                 }
@@ -1718,6 +1720,14 @@ fn succeed_exhausted(eng: &mut Engine) {
         p.succeeded = true;
     }
 
+    // Filed before the successor is told anything, so the note it is pointed at exists by
+    // the time it goes looking.
+    let filed = file_handoff(eng, dead, &name, &successor);
+    let brief = match &filed {
+        Some(path) => format!("{brief}\n\nThis handover is written up at {}.", path.display()),
+        None => brief,
+    };
+
     let by = format!("horde (for {name})");
     eng.bus.hold_for(&successor, &brief, &by);
     log_line(&format!("{name} ran out; started {successor} on {profile_name} to take over"));
@@ -1778,6 +1788,39 @@ fn compose_brief(eng: &mut Engine, pane: PaneId, name: &str) -> String {
          than finishing it.",
     );
     out
+}
+
+/// Put a handover in the vault, where it outlives the pane it came from.
+///
+/// The agent writes its own notes into `.horde/`, which is derived state horde is free to
+/// delete — fine for a brief read minutes later, wrong for the record of how a piece of work
+/// changed hands. So the note is copied into the vault, attributed to the agent that wrote it
+/// and linked to both ends of the succession, which is what makes it findable later by the
+/// only route anyone will actually use: the graph, or a search for the agent's name.
+///
+/// Nothing here is load-bearing for succession itself. A vault that cannot be written to is a
+/// reason to log and carry on, not a reason to leave an exhausted agent unsucceeded.
+fn file_handoff(eng: &mut Engine, pane: PaneId, name: &str, successor: &str) -> Option<PathBuf> {
+    let cwd = eng.session.panes.get(&pane)?.cwd.clone();
+    let space = eng.session.focused_space?;
+    let left = cwd.join(format!(".horde/handoff-{name}.md"));
+    let body = std::fs::read_to_string(&left).ok()?;
+    if body.trim().is_empty() {
+        return None;
+    }
+    let project = eng.session.space(space).map(|s| s.name.clone()).unwrap_or_default();
+    let note = format!(
+        "# Handoff — {name}\n\nProject: [[{project}]]\nTaken over by: [[{successor}]]\n\n{}",
+        body.trim()
+    );
+    let day = triggers::local_date(now_millis());
+    match eng.vault_put(space, &format!("Handoff — {name} {day}.md"), &note, Some(name), false) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            log_line(&format!("could not file {name}'s handover in the vault: {e}"));
+            None
+        }
+    }
 }
 
 /// Tell an agent that is nearly out of budget to hand over, while it still can.
@@ -2676,6 +2719,50 @@ mod tests {
             seen.contains("sk-or-test"),
             "the pane never saw the configured value; screen was {seen:?}"
         );
+    }
+
+
+    /// A handover written into `.horde/` is derived state horde may delete. The record of how
+    /// a piece of work changed hands should outlive the pane, which means the vault — and it
+    /// has to link both ends, because the only route anyone will actually use to find it later
+    /// is the graph or a search for the agent's name.
+    ///
+    /// Tests the filing rather than the succession around it: succession is covered above, and
+    /// driving it twice in one suite means two engines writing the same shared bus log.
+    #[test]
+    fn a_handover_is_filed_in_the_vault_and_links_both_ends() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-handoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        let pane = *eng.session.panes.keys().next().unwrap();
+        give_agent_named(&mut eng.session, pane, "scribe");
+
+        // Named after an agent no other test uses: `.horde/handoff-{name}.md` lives in a cwd
+        // every test pane shares, so a common name is a failure two tests away from its cause.
+        let cwd = eng.session.panes[&pane].cwd.clone();
+        let left = cwd.join(".horde/handoff-scribe.md");
+        std::fs::create_dir_all(cwd.join(".horde")).unwrap();
+        std::fs::write(&left, "Half-done: the parser. Do not touch the lexer.").unwrap();
+
+        let filed = file_handoff(&mut eng, pane, "scribe", "scribe-next").expect("filed");
+        let text = std::fs::read_to_string(&filed).unwrap();
+
+        assert!(
+            filed.parent().is_some_and(|d| d.ends_with(vault::AGENT_DIR)),
+            "with the rest of what horde wrote: {}",
+            filed.display()
+        );
+        assert!(text.contains("by: scribe"), "credited to whoever wrote it: {text}");
+        assert!(text.contains("Do not touch the lexer"), "its own words survive: {text}");
+        assert!(text.contains("[[scribe-next]]"), "linked to who took over: {text}");
+        assert!(text.contains("Project: [["), "and to the project: {text}");
+
+        // An agent that left nothing has nothing to file, and that is not a failure.
+        std::fs::remove_file(&left).unwrap();
+        assert!(file_handoff(&mut eng, pane, "scribe", "scribe-next").is_none());
+        kill_all(&mut eng);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The silent-death path: no warning, no note, and a successor still appears — briefed with

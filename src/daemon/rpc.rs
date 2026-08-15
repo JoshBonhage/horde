@@ -1094,7 +1094,19 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 eng.last_seen = super::now_millis();
                 eng.touch();
             }
-            serde_json::to_value(d).map_err(|e| failed(e.to_string()))
+            // Filed as well as answered. A digest read and closed is a thing that happened to
+            // you; a digest in the vault is a thing you can go back to, search, and link from
+            // — which is the whole point of horde having a vault at all.
+            let mut value = serde_json::to_value(&d).map_err(|e| failed(e.to_string()))?;
+            if bool_arg(req, "note") {
+                let space = eng.session.focused_space.ok_or_else(|| bad("no focused space"))?;
+                let day = super::triggers::local_date(super::now_millis());
+                let written = eng
+                    .vault_put(space, &format!("{day}.md"), &super::digest::markdown(&d), Some("horde"), true)
+                    .map_err(|e| failed(e.to_string()))?;
+                value["note"] = json!(written.to_string_lossy());
+            }
+            Ok(value)
         }
 
         // -- commands ----------------------------------------------------

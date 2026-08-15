@@ -161,6 +161,9 @@ pub enum Command {
         /// Do not advance the window.
         #[arg(long)]
         keep: bool,
+        /// File it in the vault too, on today's dated note.
+        #[arg(long)]
+        note: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1001,8 +1004,8 @@ pub fn run(cmd: Command) -> Result<()> {
             }
         },
 
-        Command::Digest { since, keep, json: as_json } => {
-            let mut params = json!({ "keep": keep });
+        Command::Digest { since, keep, note, json: as_json } => {
+            let mut params = json!({ "keep": keep, "note": note });
             if let Some(spec) = &since {
                 params["since"] = json!(parse_duration(spec)?);
             }
@@ -1011,7 +1014,11 @@ pub fn run(cmd: Command) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&v)?);
                 return Ok(());
             }
+            let filed = v.get("note").and_then(|p| p.as_str()).map(String::from);
             print_digest(&serde_json::from_value(v)?);
+            if let Some(path) = filed {
+                println!("\nfiled in {path}");
+            }
         }
 
         Command::Note { title, body, append, path, by, space } => {
