@@ -933,6 +933,7 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         // detection already takes, and a model that has just refused will still be refusing a
         // second later. Checking it every tick would buy nothing and cost a scan per pane.
         advance_spent_models(eng);
+        nudge_handover(eng);
     }
 
     // A freshly spawned pane gets looked at on the very next tick rather than waiting out
@@ -1059,6 +1060,77 @@ fn eligible_state(a: &state::AgentRuntime, board_workers: &[String]) -> bool {
 /// report the profile spent when only one model ever refused.
 const SWITCH_QUIET: Duration = Duration::from_secs(30);
 
+/// Match a phrase against a terminal screen, ignoring where the terminal broke the lines.
+///
+/// A pane in a multiplexer is narrow, and every agent TUI wraps to fit. `"Approaching usage
+/// limit"` arrives as `Approaching` on one line and `usage limit` on the next; at the widths a
+/// sidebar leaves, opencode splits *inside* words, so `esc to interrupt` becomes
+/// `in`/`te`/`rr`/`up`/`t` down five lines. A plain `contains` finds neither, which is exactly
+/// how the previous opencode manifest came to match nothing at all.
+///
+/// So both sides have their whitespace removed before comparing. That reads as a blunt
+/// instrument and is the right one here: the alternative is every pattern silently depending on
+/// the reader's pane width.
+fn screen_says(screen: &str, phrase: &str) -> bool {
+    fn squash(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+    !phrase.trim().is_empty() && squash(screen).contains(&squash(phrase))
+}
+
+/// Tell an agent that is nearly out of budget to hand over, while it still can.
+///
+/// This is the half of succession the agent must do itself, because it is the only participant
+/// that knows what it was doing — and the only moment it can is *before* it runs out. Afterwards
+/// it cannot spawn, cannot write a note, cannot answer. So horde watches for the warning and
+/// spends the agent's last usable turn on the handover rather than on work it will not finish.
+///
+/// horde does not spawn the successor here. The agent does, because the brief it writes about
+/// its own half-finished work beats anything reconstructed from a screen.
+fn nudge_handover(eng: &mut Engine) {
+    let cfg = eng.cfg.clone();
+    if cfg.handover.warning.is_empty() {
+        return;
+    }
+    let Some(profile) = cfg.handover.profile.clone() else { return };
+
+    let mut tell: Vec<(PaneId, String)> = Vec::new();
+    for (id, pane) in eng.session.panes.iter_mut() {
+        // Only something there is a conversation with. A dev server has no turn to spend.
+        let Some(agent) = pane.agent.as_ref() else { continue };
+        if pane.handover_told || agent.class != crate::proto::AgentClass::Agent {
+            continue;
+        }
+        let name = agent.name.clone();
+        let screen = pane.detection_snapshot(cfg.detection_lines).join("\n");
+        if !cfg.handover.warning.iter().any(|w| screen_says(&screen, w)) {
+            continue;
+        }
+        pane.handover_told = true;
+        let body = cfg
+            .handover
+            .instruct
+            .clone()
+            .unwrap_or_else(|| crate::config::DEFAULT_INSTRUCT.to_string())
+            .replace("{name}", &name)
+            .replace("{profile}", &profile);
+        tell.push((*id, body));
+    }
+
+    for (pane, body) in tell {
+        let name = super::daemon::bus::Bus::sender_name(&eng.session, Some(pane));
+        log_line(&format!("{name}: nearly out of budget — told to hand over"));
+        eng.journal
+            .note(journal::Kind::Notified, &format!("{name} told to hand over before running out"));
+        let Engine { bus, session, .. } = eng;
+        // Through the bus so it lands at the agent's prompt rather than mid-stream, and is
+        // queued if it is busy — the same gating every other message gets.
+        if let Err(e) = bus.send(session, &cfg, None, &name, &body, false, false, None) {
+            log_line(&format!("{name}: could not send the handover instruction: {e}"));
+        }
+    }
+}
+
 /// Move any agent whose model has stopped serving it onto the next one in its profile.
 ///
 /// horde cannot see an HTTP 429 — it has no HTTP client and that is deliberate. What it can see
@@ -1091,7 +1163,7 @@ fn advance_spent_models(eng: &mut Engine) {
         let Some(switch) = profile.switch.as_ref() else { continue };
 
         let screen = pane.detection_snapshot(cfg.detection_lines).join("\n");
-        if !profile.exhausted.iter().any(|pat| screen.contains(pat.as_str())) {
+        if !profile.exhausted.iter().any(|pat| screen_says(&screen, pat)) {
             continue;
         }
         let Some(run) = pane.model.as_mut() else { continue };
@@ -1571,6 +1643,80 @@ mod tests {
             seen.contains("sk-or-test"),
             "the pane never saw the configured value; screen was {seen:?}"
         );
+    }
+
+    /// Wrapping must not hide a phrase. This is why the previous opencode manifest, which
+    /// looked for "esc to interrupt" as one string, never matched anything.
+    #[test]
+    fn a_phrase_is_found_however_the_terminal_broke_it() {
+        assert!(screen_says("Rate limit exceeded", "Rate limit exceeded"));
+        // Wrapped between words, which is what a narrow pane does to a sentence.
+        assert!(screen_says("... Approaching\nusage limit ...", "Approaching usage limit"));
+        // Wrapped inside words, which is what a very narrow pane does.
+        assert!(screen_says("  esc to\n  in\n  te\n  rr\n  up\n  t", "esc to interrupt"));
+        // And it still says no to text that is genuinely absent.
+        assert!(!screen_says("all is well", "Rate limit exceeded"));
+        assert!(!screen_says("anything at all", "   "));
+    }
+
+    /// An agent that is nearly out gets told to hand over — once, and with something usable.
+    ///
+    /// The turn it spends on this is its last usable one, so the instruction has to be concrete:
+    /// what to write, where, and the exact command to start its successor.
+    #[test]
+    fn an_agent_running_out_is_told_to_hand_over_while_it_still_can() {
+        let mut eng = engine_with_shell(Some("echo Approaching usage limit"));
+        let pane = *eng.session.panes.keys().next().unwrap();
+        eng.cfg.handover = crate::config::Handover {
+            warning: vec!["Approaching usage limit".into()],
+            profile: Some("free".into()),
+            instruct: None,
+        };
+        give_agent_named(&mut eng.session, pane, "builder");
+
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
+            if eng.session.panes[&pane].visible_text().join("").contains("Approaching") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        nudge_handover(&mut eng);
+        assert!(eng.session.panes[&pane].handover_told, "it should have been told");
+
+        let sent = eng.bus.recent(5);
+        let msg = sent.last().expect("an instruction went out");
+        assert!(msg.body.contains("handoff-builder.md"), "names its own note: {}", msg.body);
+        assert!(msg.body.contains("--profile free"), "names the successor profile: {}", msg.body);
+        assert!(msg.body.contains("horde spawn"), "gives the actual command: {}", msg.body);
+
+        // The warning stays on screen. Repeating the instruction would interrupt the handover
+        // it is asking for.
+        let before = eng.bus.recent(50).len();
+        nudge_handover(&mut eng);
+        assert_eq!(eng.bus.recent(50).len(), before, "told exactly once");
+
+        kill_all(&mut eng);
+    }
+
+    /// A warning with nothing to hand over to is a half-configured feature, and firing it would
+    /// spend an agent's last turn telling it to run a command that cannot work.
+    #[test]
+    fn a_handover_warning_without_a_profile_does_nothing() {
+        let mut eng = engine_with_shell(Some("echo Approaching usage limit"));
+        let pane = *eng.session.panes.keys().next().unwrap();
+        eng.cfg.handover = crate::config::Handover {
+            warning: vec!["Approaching usage limit".into()],
+            profile: None,
+            instruct: None,
+        };
+        give_agent_named(&mut eng.session, pane, "builder");
+        nudge_handover(&mut eng);
+        assert!(!eng.session.panes[&pane].handover_told);
+        kill_all(&mut eng);
     }
 
     /// The whole feature, end to end: a model refuses, the agent is moved to the next one.

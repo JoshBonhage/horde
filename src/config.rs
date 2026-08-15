@@ -89,9 +89,21 @@ struct RawConfig {
     #[serde(default)]
     roles: Vec<RawRole>,
     #[serde(default)]
+    handover: RawHandover,
+    #[serde(default)]
     env: HashMap<String, String>,
     #[serde(default)]
     models: HashMap<String, RawModelProfile>,
+}
+
+/// The `[handover]` block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHandover {
+    #[serde(default)]
+    warning: Vec<String>,
+    profile: Option<String>,
+    instruct: Option<String>,
 }
 
 /// One `[models.<name>]` block.
@@ -210,6 +222,32 @@ pub struct ModelProfile {
     pub switch: Option<String>,
 }
 
+/// Telling an agent to hand over while it still can.
+///
+/// The case this exists for: an agent on a metered plan is about to run out. Once it does it can
+/// do nothing at all — not spawn a successor, not write a note, not answer a question. So the
+/// only moment a handover can be arranged by the agent itself is *before*, and the only thing
+/// that reliably notices is whatever is reading the screen. That is horde.
+#[derive(Debug, Clone, Default)]
+pub struct Handover {
+    /// Screen text meaning "nearly out".
+    pub warning: Vec<String>,
+    /// Model profile the successor should start on.
+    pub profile: Option<String>,
+    /// What the agent is told. `{name}` is its own name, `{profile}` the successor's profile.
+    pub instruct: Option<String>,
+}
+
+/// What an agent is told when it is nearly out, if the config does not say otherwise.
+///
+/// Deliberately concrete. A vague nudge produces a vague handover, and the successor inherits
+/// whatever ambiguity was left behind.
+pub const DEFAULT_INSTRUCT: &str = "You are close to your usage limit and will stop being able to \
+act shortly. Hand over now, while you still can: write what you are doing, what is done, what is \
+half-done and what to be careful of to .horde/handoff-{name}.md, commit or stash your work so the \
+tree is not left mid-edit, then run: horde spawn --profile {profile} --name {name}-next --worktree \
+--brief \"You are taking over from {name}. Read .horde/handoff-{name}.md before changing anything.\"";
+
 /// What horde assumes an exhausted model says, when a profile does not say otherwise.
 pub const DEFAULT_EXHAUSTED: &[&str] =
     &["Rate limit exceeded", "rate_limit_exceeded", "429 Too Many Requests"];
@@ -299,6 +337,8 @@ pub struct Config {
     pub env: HashMap<String, String>,
     /// Named model rotations, keyed by profile name. See `ModelProfile`.
     pub models: HashMap<String, ModelProfile>,
+    /// Telling an agent to hand over before it runs out. See `Handover`.
+    pub handover: Handover,
     pub notify: Notify,
     /// Program run when the daemon has something to tell you and nothing is attached. The
     /// summary arrives as `$1` and the full digest as JSON on stdin, which is what keeps
@@ -395,6 +435,7 @@ impl Default for Config {
             max_spawned: 2,
             env: HashMap::new(),
             models: HashMap::new(),
+            handover: Handover::default(),
             notify: Notify::Horde,
             notify_command: None,
             roles: Vec::new(),
@@ -519,6 +560,22 @@ impl Config {
                     switch: m.switch.clone(),
                 },
             );
+        }
+
+        // Handover. A warning list with nothing to hand over *to* would fire and then have no
+        // advice to give, so the profile is what makes the feature live.
+        cfg.handover = Handover {
+            warning: raw.handover.warning.clone(),
+            profile: raw.handover.profile.clone(),
+            instruct: raw.handover.instruct.clone(),
+        };
+        if !cfg.handover.warning.is_empty() && cfg.handover.profile.is_none() {
+            warnings.push(
+                "handover.warning is set but handover.profile is not, so there is nothing to \
+                 hand over to"
+                    .to_string(),
+            );
+            cfg.handover.warning.clear();
         }
 
         // Roles resolve after the theme, because an undeclared one derives its colour from

@@ -177,6 +177,11 @@ pub struct Pane {
     mirror: Vec<Row>,
     /// Rows changed since the last `take_dirty`.
     dirty: HashSet<u16>,
+    /// Set once this agent has been told to hand over, so it is told exactly once.
+    ///
+    /// The warning stays on screen after it appears, and repeating the instruction every few
+    /// seconds would interrupt the very handover it is asking for.
+    pub handover_told: bool,
     /// Which model profile this pane was started on, and how far through it it has got.
     ///
     /// Held on the pane rather than in the profile because the profile is shared config and this
@@ -316,6 +321,7 @@ impl Pane {
             signal_rx,
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
+            handover_told: false,
             model: None,
             last_sent_cursor: None,
             full_repaint: true,
@@ -744,6 +750,7 @@ impl Pane {
             signal_rx,
             mirror: vec![Row::default(); saved.rows as usize],
             dirty: HashSet::new(),
+            handover_told: false,
             model: None,
             last_sent_cursor: None,
             full_repaint: true,

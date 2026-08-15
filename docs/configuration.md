@@ -189,6 +189,41 @@ restart is how a quiet morning turns into archaeology. It stays on the board, st
 and still claimable by id — stale is not deleted. `horde task clear` wipes a project's open
 work outright.
 
+## `[handover]` — hand over before you run out
+
+```toml
+[handover]
+warning = ["Approaching usage limit"]
+profile = "free"
+```
+
+When an agent's pane shows `warning`, horde tells that agent to hand over — **while it still
+can**. This is the case a metered plan creates: once an agent is out of budget it can do nothing
+at all. It cannot spawn a successor, cannot write a note, cannot answer a question. So the only
+moment a handover can be arranged by the agent itself is *before*, and the only thing reliably
+watching is whatever reads the screen.
+
+horde does not spawn the successor. **The agent does**, because a brief it writes about its own
+half-finished work beats anything reconstructed from a screen. What horde contributes is
+noticing, and spending the agent's last usable turn on the handover rather than on work it will
+not finish.
+
+The default instruction tells it to write `.horde/handoff-<name>.md`, commit or stash so the tree
+is not left mid-edit, then run `horde spawn --profile <profile> --brief "read that file first"`.
+Override it with `instruct`, where `{name}` and `{profile}` are substituted.
+
+Told exactly once per agent: the warning stays on screen, and repeating the instruction would
+interrupt the handover it is asking for.
+
+**The warning text is yours to confirm.** horde ships no default for it, because the wording
+belongs to whichever agent you run and inventing one would produce a feature that either never
+fires or fires on the wrong thing. Set it the first time you see a real warning, and check
+`horde.log` for `told to hand over`.
+
+Matching ignores whitespace, so a phrase still matches when the terminal wrapped it — in a narrow
+pane an agent will split `esc to interrupt` into `in`/`te`/`rr`/`up`/`t` down five lines, and a
+literal match would find none of it.
+
 ## `agents.board`
 
 ```toml
