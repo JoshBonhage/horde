@@ -44,6 +44,18 @@ pub struct SavedState {
     /// still in the middle of telling you about.
     #[serde(default)]
     pub last_alert: u64,
+    /// Projects opened before, most recent first. Defaulted rather than versioned: a state
+    /// file written before the dashboard existed loses its history, which is a far better
+    /// trade than discarding every space to avoid an empty list.
+    #[serde(default)]
+    pub recents: Vec<SavedRecent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedRecent {
+    pub name: String,
+    pub cwd: String,
+    pub last_used: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -134,6 +146,7 @@ pub fn save(eng: &Engine, path: &Path) -> Result<()> {
         spaces,
         last_seen: eng.last_seen,
         last_alert: eng.last_alert,
+        recents: eng.recents.clone(),
     };
 
     if let Some(p) = path.parent() {
@@ -196,6 +209,7 @@ pub fn restore(eng: &mut Engine, saved: SavedState) -> Result<()> {
     let cfg = eng.cfg.clone();
     eng.last_seen = saved.last_seen;
     eng.last_alert = saved.last_alert;
+    eng.recents = saved.recents.clone();
     for (si, space) in saved.spaces.iter().enumerate() {
         let cwd = PathBuf::from(&space.cwd);
         // A saved directory can be gone by the next start; fall back rather than fail.
@@ -369,6 +383,45 @@ mod tests {
         assert!(load(Path::new("/nonexistent/horde/state.json")).unwrap().is_none());
     }
 
+    /// A state file written before the dashboard existed has no `recents` key. It must still
+    /// load: discarding every space and pane to avoid an empty list is a strictly worse trade,
+    /// which is exactly why the field is defaulted rather than versioned.
+    #[test]
+    fn a_state_file_from_before_recents_existed_still_loads() {
+        let p = std::env::temp_dir().join(format!("horde-state-old-{}.json", std::process::id()));
+        std::fs::write(
+            &p,
+            r#"{"version":1,"spaces":[],"focused_space":null,"last_seen":7,"last_alert":9}"#,
+        )
+        .unwrap();
+        let loaded = load(&p).unwrap().expect("an older file still loads");
+        assert_eq!(loaded.last_seen, 7, "and keeps what it did carry");
+        assert!(loaded.recents.is_empty(), "the missing list defaults to empty");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// The dashboard's memory is the daemon's, so it has to survive the daemon.
+    #[test]
+    fn remembered_projects_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("horde-recents-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("state.json");
+
+        let mut eng = crate::daemon::tests::engine();
+        eng.remember_project("blog", std::path::Path::new("/tmp/blog"));
+        eng.remember_project("horde", std::path::Path::new("/tmp/horde"));
+        save(&eng, &path).unwrap();
+
+        let loaded = load(&path).unwrap().expect("written state loads");
+        let names: Vec<&str> = loaded.recents.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["horde", "blog"], "newest first, across a restart");
+
+        let mut fresh = crate::daemon::tests::engine();
+        restore(&mut fresh, loaded).unwrap();
+        assert_eq!(fresh.recents.len(), 2, "and the history comes back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_future_version_is_ignored_rather_than_guessed_at() {
         let p = std::env::temp_dir().join("horde-state-version.json");
@@ -380,6 +433,7 @@ mod tests {
                 focused_space: None,
                 last_seen: 0,
                 last_alert: 0,
+                recents: Vec::new(),
             })
             .unwrap(),
         )
@@ -544,6 +598,7 @@ mod tests {
             focused_space: None,
             last_seen: 0,
             last_alert: 0,
+            recents: Vec::new(),
         };
         let json = serde_json::to_string_pretty(&state).unwrap();
         let tmp = path.with_extension("json.tmp");
