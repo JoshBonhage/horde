@@ -4044,6 +4044,7 @@ mod tests {
             body: None,
             backlinks: Vec::new(),
             graph: None,
+            tasks: Vec::new(),
         };
         apply_frame(&mut app, ServerFrame::Vault(Box::new(reply)), &sink());
         assert!(app.completions.is_some(), "the note list opened");
@@ -4080,6 +4081,7 @@ mod tests {
             body: None,
             backlinks: Vec::new(),
             graph: None,
+            tasks: Vec::new(),
         };
         apply_frame(&mut app, ServerFrame::Vault(Box::new(reply)), &sink());
 

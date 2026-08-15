@@ -512,12 +512,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let x = area.x + (area.width.saturating_sub(col)) / 2;
         fill(f.buffer_mut(), area, theme2.ui.bg);
 
-        let head = if backlinks == 0 {
-            title.clone()
-        } else if backlinks == 1 {
-            format!("{title}   ← 1 note links here")
-        } else {
-            format!("{title}   ← {backlinks} notes link here")
+        // Both counts in the header, because both answer "is there more to this note than
+        // the note" — and the tasks are below the fold until you scroll to them.
+        let open = app
+            .vault
+            .as_ref()
+            .map(|v| v.tasks.iter().filter(|t| !t.done && !t.dropped).count())
+            .unwrap_or(0);
+        let head = match (backlinks, open) {
+            (0, 0) => title.clone(),
+            (0, n) => format!("{title}   ◇ {n} open"),
+            (1, 0) => format!("{title}   ← 1 note links here"),
+            (b, 0) => format!("{title}   ← {b} notes link here"),
+            (1, n) => format!("{title}   ← 1 note links here   ◇ {n} open"),
+            (b, n) => format!("{title}   ← {b} notes link here   ◇ {n} open"),
         };
         put_line(
             f.buffer_mut(),
@@ -532,7 +540,42 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             )),
         );
 
-        let rendered = markdown::render(&body, col, &theme2);
+        let mut rendered = markdown::render(&body, col, &theme2);
+
+        // The work outstanding on this note, appended to it. Here rather than in a panel
+        // because it belongs to the note the way its backlinks do — and because scrolling
+        // then carries it, which a panel would not.
+        let tasks = app.vault.as_ref().map(|v| v.tasks.clone()).unwrap_or_default();
+        if !tasks.is_empty() {
+            let faint = Style::default().fg(color(theme2.ui.text_faint)).bg(color(theme2.ui.bg));
+            rendered.lines.push(Line::from(""));
+            rendered.lines.push(Line::from(ratatui::text::Span::styled(
+                "─".repeat(col as usize),
+                faint,
+            )));
+            rendered.lines.push(Line::from(ratatui::text::Span::styled("TASKS".to_string(), faint)));
+            rendered.lines.push(Line::from(""));
+            for t in &tasks {
+                let (glyph, colour) = match (t.dropped, t.done, t.owner.is_some()) {
+                    (true, _, _) => ("✕", theme2.ui.text_faint),
+                    (_, true, _) => ("✓", theme2.ui.done),
+                    (_, _, true) => ("◆", theme2.ui.working),
+                    _ => ("◇", theme2.ui.text_dim),
+                };
+                let who = t.owner.as_deref().map(|o| format!("   {o}")).unwrap_or_default();
+                rendered.lines.push(Line::from(vec![
+                    ratatui::text::Span::styled(
+                        format!("{glyph} "),
+                        Style::default().fg(color(colour)).bg(color(theme2.ui.bg)),
+                    ),
+                    ratatui::text::Span::styled(
+                        truncate(&t.text, col as usize - 4 - width(&who)),
+                        Style::default().fg(color(theme2.ui.text_dim)).bg(color(theme2.ui.bg)),
+                    ),
+                    ratatui::text::Span::styled(who, faint),
+                ]));
+            }
+        }
         let selected_line = rendered.links.get(link).map(|(l, _)| *l);
         let body_top = area.y + 2;
         let rows = area.height.saturating_sub(4);
@@ -564,7 +607,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         put_line(
             f.buffer_mut(),
             x,
-            area.y + area.height.saturating_sub(1),
+            // Above the status bar, which is drawn after this and would otherwise cover it —
+            // the same mistake the editor's hint row was making.
+            area.y + area.height.saturating_sub(2),
             col,
             Line::from(ratatui::text::Span::styled(
                 hint,

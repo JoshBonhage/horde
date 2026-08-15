@@ -73,6 +73,7 @@ pub fn build(eng: &Engine, since: u64) -> Digest {
                 owner: t.owner.clone(),
                 result: t.result.clone(),
                 dropped: t.state == TaskState::Dropped,
+                done: true,
             });
         }
     }

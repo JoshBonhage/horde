@@ -403,6 +403,7 @@ impl Engine {
             body: None,
             backlinks: Vec::new(),
             graph: None,
+            tasks: Vec::new(),
         };
         match kind {
             VaultQuery::List => reply.notes = idx.search("").into_iter().filter_map(line).collect(),
@@ -416,6 +417,24 @@ impl Engine {
                 // the vault, not a copy of it.
                 reply.body = std::fs::read_to_string(idx.root.join(path)).ok();
                 reply.backlinks = idx.backlinks(id).iter().filter_map(|b| line(*b)).collect();
+                // A task may name this note by its filename or by any title it answers to,
+                // because that is how a link written by hand names it.
+                let n = &idx.notes[id];
+                let mut names = vec![n.stem(), n.title.clone()];
+                names.extend(n.aliases.iter().cloned());
+                reply.tasks = self
+                    .board
+                    .about(&names)
+                    .into_iter()
+                    .map(|t| crate::proto::TaskLine {
+                        id: t.id,
+                        text: t.text.clone(),
+                        owner: t.owner.clone(),
+                        result: t.result.clone(),
+                        dropped: matches!(t.state, tasks::TaskState::Dropped),
+                        done: !t.is_open() && !t.is_claimed(),
+                    })
+                    .collect();
             }
             VaultQuery::Graph => reply.graph = Some(idx.graph()),
         }

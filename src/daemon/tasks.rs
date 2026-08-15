@@ -100,6 +100,26 @@ pub struct Task {
 }
 
 impl Task {
+    /// The notes this task names, as `[[wikilinks]]` in its text.
+    ///
+    /// No new syntax and no new field: a task about a note is written the way a link to that
+    /// note is written everywhere else in horde. Which also means an agent that was told to
+    /// "read [[Auth findings]] and fix it" has already made the link without being asked to.
+    pub fn linked_notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = self.text.as_str();
+        while let Some(open) = rest.find("[[") {
+            let after = &rest[open + 2..];
+            let Some(close) = after.find("]]") else { break };
+            let (target, _, _) = crate::daemon::vault::split_target(&after[..close]);
+            if !target.is_empty() {
+                out.push(target);
+            }
+            rest = &after[close + 2..];
+        }
+        out
+    }
+
     pub fn is_open(&self) -> bool {
         self.state == TaskState::Open
     }
@@ -325,6 +345,21 @@ impl Board {
             .filter(|t| t.is_open() && !t.is_stale(now))
             .filter(|t| t.space.as_deref() == Some(space))
             .count()
+    }
+
+    /// Tasks that name this note, whether by its filename or by a title it answers to.
+    ///
+    /// The other half of a link. A note showing the work outstanding on it is the whole point
+    /// of a board and a vault being in the same program — otherwise "what is left to do about
+    /// this" is a question you have to remember to ask somewhere else.
+    ///
+    /// Done tasks are kept: what was decided about a note is as worth seeing as what is still
+    /// open, and a note whose tasks vanish on completion loses its own history.
+    pub fn about(&self, names: &[String]) -> Vec<&Task> {
+        let matches = |n: &str| {
+            names.iter().any(|name| name.eq_ignore_ascii_case(n))
+        };
+        self.tasks.iter().filter(|t| t.linked_notes().iter().any(|n| matches(n))).collect()
     }
 
     /// Hand back any task whose owner is no longer among the live claimants.
@@ -604,7 +639,8 @@ mod tests {
     #[test]
     fn a_malformed_log_line_is_skipped_rather_than_fatal() {
         let p = std::env::temp_dir().join("horde-tasks-broken.jsonl");
-        std::fs::write(&p, "not json\n{\"partial\":true}\n").unwrap();
+        std::fs::write(&p, "not json\n{\"partial\":true}
+").unwrap();
         assert!(Board::new(p.clone()).all().is_empty());
         let _ = std::fs::remove_file(&p);
     }
@@ -649,5 +685,57 @@ mod tests {
 
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&archive);
+    }
+
+    /// A task about a note is written the way a link to that note is written everywhere else.
+    /// No new syntax, and an agent told to "read [[Auth findings]] and fix it" has already
+    /// made the link without being asked to.
+    #[test]
+    fn a_task_names_notes_the_way_everything_else_does() {
+        let t = |text: &str| Task {
+            id: 1,
+            text: text.into(),
+            state: TaskState::Open,
+            created: 0,
+            by: "user".into(),
+            space: None,
+            owner: None,
+            claimed_at: None,
+            done_at: None,
+            result: None,
+        };
+        assert_eq!(t("plain text").linked_notes(), Vec::<String>::new());
+        assert_eq!(t("read [[Auth findings]] first").linked_notes(), ["Auth findings"]);
+        assert_eq!(
+            t("[[One]] then [[Two|the other]]").linked_notes(),
+            ["One", "Two"],
+            "an alias names the same note"
+        );
+        assert_eq!(
+            t("[[Note#Section]]").linked_notes(),
+            ["Note"],
+            "a heading link is still a link to the note"
+        );
+        assert_eq!(t("unclosed [[oops").linked_notes(), Vec::<String>::new(), "and no panic");
+    }
+
+    /// The other half of the link. A note showing the work outstanding on it is the whole
+    /// point of a board and a vault living in the same program.
+    #[test]
+    fn a_note_can_be_asked_which_tasks_are_about_it() {
+        let p = std::env::temp_dir().join(format!("horde-about-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut b = Board::new(p.clone());
+        b.add("fix [[Auth findings]]", "user", None).unwrap();
+        b.add("unrelated work", "user", None).unwrap();
+        b.add("also see [[auth findings]]", "user", None).unwrap();
+
+        let names = vec!["Auth findings".to_string()];
+        let hits = b.about(&names);
+        assert_eq!(hits.len(), 2, "case does not decide whether a link resolves");
+        assert!(hits.iter().all(|t| t.text.to_lowercase().contains("auth findings")));
+
+        assert!(b.about(&["Nothing".to_string()]).is_empty());
+        let _ = std::fs::remove_file(&p);
     }
 }

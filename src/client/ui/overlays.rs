@@ -1130,6 +1130,7 @@ mod tests {
             warnings: vec![],
             fired: vec![],
             tasks_done: vec![TaskLine {
+                done: true,
                 id: 4,
                 text: "write the bus tests".into(),
                 owner: Some("builder".into()),

@@ -514,6 +514,7 @@ mod tests {
             body: None,
             backlinks: Vec::new(),
             graph: None,
+            tasks: Vec::new(),
         }
     }
 
