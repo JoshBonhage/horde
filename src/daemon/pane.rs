@@ -124,7 +124,10 @@ impl EventListener for EventProxy {
 /// change at all. A pane showing a file is then a pane in every way that matters -- it
 /// splits, zooms, swaps and resizes, because the layout never knew what was inside one.
 enum Content {
-    Pty(PtyContent),
+    /// Boxed because a terminal emulator is large and a file's lines are not: without it
+    /// every `Content` — and so every `Pane` — would be sized by the emulator whether or
+    /// not there is one inside.
+    Pty(Box<PtyContent>),
     Doc(DocContent),
 }
 
@@ -383,7 +386,7 @@ impl Pane {
             pinned: false,
             board: false,
             spawned_by_pane: None,
-            content: Content::Pty(PtyContent {
+            content: Content::Pty(Box::new(PtyContent {
                 term,
                 parser: Processor::new(),
                 master,
@@ -393,7 +396,7 @@ impl Pane {
                 signal_rx,
                 deferred: Vec::new(),
                 outbound: Vec::new(),
-            }),
+            })),
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
             handover_told: false,
@@ -919,7 +922,7 @@ impl Pane {
                 nudged_since: None,
                 alerted_since: None,
             }),
-            content: Content::Pty(PtyContent {
+            content: Content::Pty(Box::new(PtyContent {
                 term,
                 parser: Processor::new(),
                 master,
@@ -929,7 +932,7 @@ impl Pane {
                 signal_rx,
                 deferred: Vec::new(),
                 outbound: Vec::new(),
-            }),
+            })),
             mirror: vec![Row::default(); saved.rows as usize],
             dirty: HashSet::new(),
             handover_told: false,
@@ -1077,9 +1080,7 @@ impl Pane {
 
     pub fn kill(&mut self) {
         match &mut self.content {
-            Content::Pty(p) => {
-                let _ = p.child.kill();
-            }
+            Content::Pty(p) => p.child.kill(),
             // Closing a doc is closing a window onto a file. Marked exited so the session's
             // reaper takes it away on the next tick, the same as any pane whose program
             // ended -- one path for "this pane is finished" rather than two.

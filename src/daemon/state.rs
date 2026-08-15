@@ -1299,8 +1299,6 @@ mod tests {
     }
 
 
-    use super::*;
-
     fn session() -> (Config, Session) {
         let mut cfg = Config::default();
         // `cat` starts instantly and produces nothing, keeping these tests quick.
