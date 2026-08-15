@@ -229,6 +229,9 @@ pub fn describe_trigger(t: &Trigger, prefix: &Chord) -> String {
             crossterm::event::KeyCode::Null => "—".into(),
             _ => c.describe(),
         },
+        // Spelled "leader" rather than resolved to `ctrl+space`, because that is how it is
+        // written in config and how the which-key popup announces it.
+        Trigger::Leader(s) => format!("leader {}", s.describe()),
     }
 }
 

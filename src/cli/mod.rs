@@ -1193,11 +1193,13 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::Keys => {
             let (cfg, _) = crate::config::Config::load();
             let prefix = cfg.prefix.describe();
-            println!("prefix: {prefix}\n");
+            let leader = cfg.leader.describe();
+            println!("prefix: {prefix}\nleader: {leader}\n");
             for (name, trigger, _) in cfg.keys.described() {
                 let key = match trigger {
                     crate::config::Trigger::Prefix(c) => format!("{prefix} {}", c.describe()),
                     crate::config::Trigger::Direct(c) => c.describe(),
+                    crate::config::Trigger::Leader(s) => format!("{leader} {}", s.describe()),
                 };
                 println!("  {key:<18} {name}");
             }
