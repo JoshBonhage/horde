@@ -1210,6 +1210,18 @@ fn handle_key(
                     app.buffer = None;
                     read_note(app, &path, out);
                 }
+                // Available because the client runs in raw mode, so ctrl+z is a keystroke
+                // here rather than a suspend signal.
+                (KeyCode::Char('z'), true) => {
+                    if !buf.undo() {
+                        app.toast(NoticeLevel::Info, "nothing to undo");
+                    }
+                }
+                (KeyCode::Char('y'), true) => {
+                    if !buf.redo() {
+                        app.toast(NoticeLevel::Info, "nothing to redo");
+                    }
+                }
                 (KeyCode::Enter, _) => buf.newline(),
                 (KeyCode::Backspace, _) => buf.backspace(),
                 (KeyCode::Delete, _) => buf.delete(),

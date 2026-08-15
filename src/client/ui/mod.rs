@@ -330,8 +330,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             area.y + area.height.saturating_sub(1),
             col,
             Line::from(ratatui::text::Span::styled(
-                "live preview · the line you are on shows its source   ctrl+s save   esc back"
-                    .to_string(),
+                "ctrl+z undo   ctrl+y redo   ctrl+s save   esc back".to_string(),
                 Style::default().fg(color(theme2.ui.text_faint)).bg(color(theme2.ui.bg)),
             )),
         );

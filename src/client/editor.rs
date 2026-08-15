@@ -8,6 +8,28 @@
 //! Pure: no drawing, no daemon. It holds lines and a cursor and answers questions about
 //! them, which is what makes it testable as text.
 
+/// A point the buffer can be put back to.
+#[derive(Debug, Clone, PartialEq)]
+struct Snap {
+    lines: Vec<String>,
+    line: usize,
+    col: usize,
+}
+
+/// What kind of change an edit was, for grouping consecutive ones together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Insert,
+    Delete,
+}
+
+/// Characters in one undo step before it is closed and a new one started.
+///
+/// Without a cap, a paragraph typed without pausing is a single undo — press it once and
+/// the paragraph is gone. Without grouping at all, undo removes one letter at a time, which
+/// is worse. Forty is about a line of prose.
+const MAX_GROUP: usize = 40;
+
 /// A text buffer and a cursor into it.
 #[derive(Debug, Clone)]
 pub struct Buffer {
@@ -24,6 +46,15 @@ pub struct Buffer {
     /// Bumped by every edit. Highlighting a file costs milliseconds and a frame costs
     /// microseconds, so the drawing side keeps its answer until this changes.
     pub rev: usize,
+    /// States to go back to, most recent last.
+    undo: Vec<Snap>,
+    /// States undone, to go forward to again. Cleared by any new edit, because a redo past
+    /// a change that never happened is a buffer nobody can reason about.
+    redo: Vec<Snap>,
+    /// The last edit's kind and where it left the cursor, so consecutive typing groups into
+    /// one undo step rather than one per keystroke.
+    last: Option<(Edit, usize, usize)>,
+    group: usize,
 }
 
 impl Buffer {
@@ -32,7 +63,18 @@ impl Buffer {
         if lines.is_empty() {
             lines.push(String::new());
         }
-        Buffer { lines, line: 0, col: 0, dirty: false, goal: 0, rev: 0 }
+        Buffer {
+            lines,
+            line: 0,
+            col: 0,
+            dirty: false,
+            goal: 0,
+            rev: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last: None,
+            group: 0,
+        }
     }
 
     pub fn text(&self) -> String {
@@ -51,28 +93,92 @@ impl Buffer {
             .unwrap_or(0)
     }
 
+    /// Mark an edit finished: dirty, a new revision, and where it left the cursor so the
+    /// next one can tell whether it continues this one.
+    fn touched(&mut self, kind: Edit) {
+        self.dirty = true;
+        self.rev += 1;
+        self.last = Some((kind, self.line, self.col));
+    }
+
+    fn snap(&self) -> Snap {
+        Snap { lines: self.lines.clone(), line: self.line, col: self.col }
+    }
+
+    fn restore(&mut self, s: Snap) {
+        self.lines = s.lines;
+        self.line = s.line;
+        self.col = s.col;
+        self.goal = s.col;
+        self.dirty = true;
+        self.rev += 1;
+        self.last = None;
+    }
+
+    /// Record a point to come back to, unless this edit continues the last one.
+    ///
+    /// Snapshots the whole buffer rather than the change. A note is kilobytes and an undo
+    /// stack of them is nothing; inverting operations would be less memory and considerably
+    /// more ways to be subtly wrong about what the buffer used to be.
+    fn checkpoint(&mut self, kind: Edit) {
+        let continues = self.last == Some((kind, self.line, self.col)) && self.group < MAX_GROUP;
+        if !continues {
+            self.undo.push(self.snap());
+            self.group = 0;
+            // A hundred steps back is more than anyone reaches for, and bounds the memory a
+            // long session can hold.
+            if self.undo.len() > 100 {
+                self.undo.remove(0);
+            }
+        }
+        self.group += 1;
+        self.redo.clear();
+    }
+
+    /// Go back one step. Returns false when there is nothing to go back to.
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo.pop() else { return false };
+        self.redo.push(self.snap());
+        self.restore(prev);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop() else { return false };
+        self.undo.push(self.snap());
+        self.restore(next);
+        true
+    }
+
     pub fn insert(&mut self, c: char) {
+        self.checkpoint(Edit::Insert);
         let b = self.byte_at(self.line, self.col);
         self.lines[self.line].insert(b, c);
         self.col += 1;
         self.goal = self.col;
-        self.dirty = true;
-        self.rev += 1;
+        self.touched(Edit::Insert);
     }
 
     pub fn newline(&mut self) {
+        // Always its own step: a line break is where a thought ended, and undoing back
+        // through several of them at once loses the shape of what was written.
+        self.last = None;
+        self.checkpoint(Edit::Insert);
         let b = self.byte_at(self.line, self.col);
         let rest = self.lines[self.line].split_off(b);
         self.lines.insert(self.line + 1, rest);
         self.line += 1;
         self.col = 0;
         self.goal = 0;
-        self.dirty = true;
-        self.rev += 1;
+        self.touched(Edit::Insert);
+        // Closed at both ends: what follows a line break starts its own step, so undo takes
+        // back the line you just wrote and then, separately, the break that made room for it.
+        self.last = None;
     }
 
     /// Delete backwards, joining lines when the cursor is at the start of one.
     pub fn backspace(&mut self) {
+        self.checkpoint(Edit::Delete);
         if self.col > 0 {
             let start = self.byte_at(self.line, self.col - 1);
             let end = self.byte_at(self.line, self.col);
@@ -87,11 +193,11 @@ impl Buffer {
             return; // start of the buffer: nothing to delete
         }
         self.goal = self.col;
-        self.dirty = true;
-        self.rev += 1;
+        self.touched(Edit::Delete);
     }
 
     pub fn delete(&mut self) {
+        self.checkpoint(Edit::Delete);
         if self.col < self.line_len(self.line) {
             let start = self.byte_at(self.line, self.col);
             let end = self.byte_at(self.line, self.col + 1);
@@ -232,6 +338,94 @@ mod tests {
         b.end();
         b.delete();
         assert_eq!(b.text(), "bcd", "at the end of a line it pulls the next one up");
+    }
+
+    /// Undo removes a word, not a letter. One keystroke per undo is technically correct and
+    /// useless — nobody wants to press it eleven times to take back "hello world".
+    #[test]
+    fn typing_a_run_of_characters_undoes_as_one_step() {
+        let mut b = Buffer::new("");
+        for c in "hello world".chars() {
+            b.insert(c);
+        }
+        assert_eq!(b.text(), "hello world");
+        assert!(b.undo());
+        assert_eq!(b.text(), "", "the whole run went back at once");
+        assert!(!b.undo(), "and there is nothing before it");
+    }
+
+    /// Grouping stops where the shape of the writing does: a line break, a change of
+    /// direction, or a cursor that moved somewhere else first.
+    #[test]
+    fn a_new_step_starts_where_the_writing_changed_direction() {
+        let mut b = Buffer::new("");
+        for c in "one".chars() {
+            b.insert(c);
+        }
+        b.newline();
+        for c in "two".chars() {
+            b.insert(c);
+        }
+        assert_eq!(b.text(), "one\ntwo");
+        b.undo();
+        assert_eq!(b.text(), "one\n", "the second line, on its own");
+        b.undo();
+        assert_eq!(b.text(), "one", "then the break");
+        b.undo();
+        assert_eq!(b.text(), "", "then the first word");
+
+        // Deleting after typing is its own step, not a continuation of it.
+        let mut b = Buffer::new("");
+        b.insert('a');
+        b.backspace();
+        assert_eq!(b.text(), "");
+        b.undo();
+        assert_eq!(b.text(), "a", "the delete came back before the type did");
+    }
+
+    /// Where the cursor was is part of what you are going back to. Undo that leaves the
+    /// cursor elsewhere makes you find your place again, which is half of why undo exists.
+    #[test]
+    fn undo_puts_the_cursor_back_where_the_edit_happened() {
+        let mut b = Buffer::new("first
+second
+third");
+        b.goto(1, 6);
+        b.insert('!');
+        b.goto(0, 0);
+        b.undo();
+        assert_eq!((b.line, b.col), (1, 6), "back to the edit, not left at the top");
+    }
+
+    #[test]
+    fn redo_goes_forward_again_and_a_new_edit_forgets_it() {
+        let mut b = Buffer::new("");
+        for c in "abc".chars() {
+            b.insert(c);
+        }
+        b.undo();
+        assert_eq!(b.text(), "");
+        assert!(b.redo());
+        assert_eq!(b.text(), "abc", "forward again");
+
+        b.undo();
+        b.insert('z');
+        assert!(!b.redo(), "a new edit is a new history; there is no forward from here");
+        assert_eq!(b.text(), "z");
+    }
+
+    /// A very long run still breaks into steps, or undo becomes all-or-nothing on a
+    /// paragraph typed without pausing.
+    #[test]
+    fn a_long_run_of_typing_is_more_than_one_step() {
+        let mut b = Buffer::new("");
+        for _ in 0..(MAX_GROUP * 2 + 5) {
+            b.insert('x');
+        }
+        let full = b.text().len();
+        b.undo();
+        assert!(b.text().len() < full, "something came back");
+        assert!(!b.text().is_empty(), "but not the whole lot");
     }
 
     #[test]

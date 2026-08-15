@@ -186,12 +186,14 @@ a cursor would make the arrow keys lie about where they are going.
 |---|---|
 | anything | types |
 | arrows, `home` `end`, `page` | move |
+| `ctrl+z` / `ctrl+y` | undo / redo |
 | `ctrl+s` | save |
 | `ctrl+r` | save and read it rendered |
 | `esc` | save and go back |
 
 Leaving saves. An editor that can lose a note because you pressed the wrong key to get out
-of it is not one to trust a thought to. The status bar shows `WRITING` in its own colour,
+of it is not one to trust a thought to — which is also why there is undo, grouped by run
+rather than by keystroke, so taking back a word costs one press instead of eleven. The status bar shows `WRITING` in its own colour,
 and a `•` next to the filename while there is anything unsaved.
 
 ### Reading a note
