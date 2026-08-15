@@ -117,6 +117,35 @@ impl EventListener for EventProxy {
     }
 }
 
+/// The parts of a pane that are a running program: its tty, its child, and the buffers
+/// between them.
+///
+/// Split out from [`Pane`] so that identity, geometry and the row mirror -- everything the
+/// rest of the daemon actually touches -- stop being tangled with the one thing not every
+/// pane will have. Nothing else changes: a pane is still exactly one of these.
+struct PtyContent {
+    term: Term<EventProxy>,
+    parser: Processor,
+    master: Master,
+    writer: std::fs::File,
+    child: ChildHandle,
+    reader: Reader,
+    signal_rx: UnboundedReceiver<PaneSignal>,
+    /// Bytes to write once their deadline passes.
+    ///
+    /// This exists for one reason: Enter has to arrive as its own read. Agents treat a chunk
+    /// of text and a carriage return arriving together as a *paste*, and a trailing CR in a
+    /// paste inserts a literal newline instead of submitting. Writing the text, then the CR
+    /// a beat later, makes the CR read as a keypress.
+    deferred: Vec<(Instant, Vec<u8>)>,
+    /// Bytes accepted for this pane but not yet taken by the tty.
+    ///
+    /// The master is non-blocking, so a write takes what fits and reports the rest. Holding the
+    /// remainder here and pushing it on later ticks is what keeps a slow or wedged agent from
+    /// stalling the engine mid-message.
+    outbound: Vec<u8>,
+}
+
 pub struct Pane {
     pub id: PaneId,
     pub tab: TabId,
@@ -165,13 +194,8 @@ pub struct Pane {
     /// project reached an agent you had left thinking in another.
     pub board: bool,
 
-    term: Term<EventProxy>,
-    parser: Processor,
-    master: Master,
-    writer: std::fs::File,
-    child: ChildHandle,
-    reader: Reader,
-    signal_rx: UnboundedReceiver<PaneSignal>,
+    /// Everything that makes this pane a running program.
+    content: PtyContent,
 
     /// Visible grid as of the last `pump`. Authoritative for both rendering and detection.
     mirror: Vec<Row>,
@@ -204,19 +228,6 @@ pub struct Pane {
     pub last_sent_cursor: Option<crate::proto::CursorPos>,
     /// Set when a client attaches or the pane resizes, forcing a full repaint.
     full_repaint: bool,
-    /// Bytes to write once their deadline passes.
-    ///
-    /// This exists for one reason: Enter has to arrive as its own read. Agents treat a chunk
-    /// of text and a carriage return arriving together as a *paste*, and a trailing CR in a
-    /// paste inserts a literal newline instead of submitting. Writing the text, then the CR
-    /// a beat later, makes the CR read as a keypress.
-    deferred: Vec<(Instant, Vec<u8>)>,
-    /// Bytes accepted for this pane but not yet taken by the tty.
-    ///
-    /// The master is non-blocking, so a write takes what fits and reports the rest. Holding the
-    /// remainder here and pushing it on later ticks is what keeps a slow or wedged agent from
-    /// stalling the engine mid-message.
-    outbound: Vec<u8>,
 }
 
 /// A pane's position in a model profile.
@@ -319,13 +330,17 @@ impl Pane {
             pinned: false,
             board: false,
             spawned_by_pane: None,
-            term,
-            parser: Processor::new(),
-            master,
-            writer,
-            child,
-            reader,
-            signal_rx,
+            content: PtyContent {
+                term,
+                parser: Processor::new(),
+                master,
+                writer,
+                child,
+                reader,
+                signal_rx,
+                deferred: Vec::new(),
+                outbound: Vec::new(),
+            },
             mirror: vec![Row::default(); rows as usize],
             dirty: HashSet::new(),
             handover_told: false,
@@ -334,8 +349,6 @@ impl Pane {
             model: None,
             last_sent_cursor: None,
             full_repaint: true,
-            deferred: Vec::new(),
-            outbound: Vec::new(),
         })
     }
 
@@ -345,9 +358,9 @@ impl Pane {
         let mut got_bytes = false;
         // Bounded per tick so one firehosing pane cannot starve the others.
         for _ in 0..256 {
-            match self.reader.rx.try_recv() {
+            match self.content.reader.rx.try_recv() {
                 Ok(chunk) => {
-                    self.parser.advance(&mut self.term, &chunk);
+                    self.content.parser.advance(&mut self.content.term, &chunk);
                     got_bytes = true;
                 }
                 Err(_) => break,
@@ -355,7 +368,7 @@ impl Pane {
         }
 
         let mut signals = Vec::new();
-        while let Ok(sig) = self.signal_rx.try_recv() {
+        while let Ok(sig) = self.content.signal_rx.try_recv() {
             signals.push(sig);
         }
         for sig in signals {
@@ -372,20 +385,20 @@ impl Pane {
         let now = Instant::now();
         let due: Vec<Vec<u8>> = {
             let (due, pending): (Vec<_>, Vec<_>) =
-                std::mem::take(&mut self.deferred).into_iter().partition(|(at, _)| *at <= now);
-            self.deferred = pending;
+                std::mem::take(&mut self.content.deferred).into_iter().partition(|(at, _)| *at <= now);
+            self.content.deferred = pending;
             due.into_iter().map(|(_, b)| b).collect()
         };
         for bytes in due {
             let _ = self.write(&bytes);
         }
         // Whatever the tty could not take last tick goes out now.
-        if !self.outbound.is_empty() {
+        if !self.content.outbound.is_empty() {
             self.push_outbound();
         }
 
         if self.exited.is_none() {
-            if let Some(code) = self.child.try_wait() {
+            if let Some(code) = self.content.child.try_wait() {
                 self.exited = Some(code);
             }
         }
@@ -404,8 +417,8 @@ impl Pane {
 
         // Which viewport rows to rebuild. Damage is reported relative to the live view, so
         // while scrolled back it does not describe what is on screen — rebuild everything.
-        let scrolled = self.term.grid().display_offset() != 0;
-        let targets: Vec<usize> = match self.term.damage() {
+        let scrolled = self.content.term.grid().display_offset() != 0;
+        let targets: Vec<usize> = match self.content.term.damage() {
             TermDamage::Full => (0..rows).collect(),
             TermDamage::Partial(iter) => {
                 let lines: Vec<usize> = iter.map(|d| d.line).collect();
@@ -416,7 +429,7 @@ impl Pane {
                 }
             }
         };
-        self.term.reset_damage();
+        self.content.term.reset_damage();
 
         let targets = if self.full_repaint { (0..rows).collect() } else { targets };
         self.full_repaint = false;
@@ -435,7 +448,7 @@ impl Pane {
 
     /// Read one viewport row out of the grid and run-length encode it by style.
     fn build_row(&self, y: usize, theme: &Theme) -> Row {
-        let grid = self.term.grid();
+        let grid = self.content.term.grid();
         let offset = grid.display_offset() as i32;
         // Viewport row 0 is `Line(-offset)`; scrolling back shows history above it.
         let line = Line(y as i32 - offset);
@@ -539,7 +552,7 @@ impl Pane {
     }
 
     pub fn cursor(&self) -> CursorPos {
-        let grid = self.term.grid();
+        let grid = self.content.term.grid();
         let Point { line, column } = grid.cursor.point;
         let offset = grid.display_offset() as i32;
         let y = line.0 + offset;
@@ -547,37 +560,37 @@ impl Pane {
             x: column.0 as u16,
             y: y.max(0) as u16,
             // Hidden by the program, or scrolled out of view.
-            visible: self.term.mode().contains(TermMode::SHOW_CURSOR)
+            visible: self.content.term.mode().contains(TermMode::SHOW_CURSOR)
                 && y >= 0
                 && y < self.rows as i32,
         }
     }
 
     pub fn scroll_offset(&self) -> usize {
-        self.term.grid().display_offset()
+        self.content.term.grid().display_offset()
     }
 
     pub fn bracketed_paste(&self) -> bool {
-        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+        self.content.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
     /// True when the program asked to receive mouse events, in which case the client should
     /// forward them instead of using the mouse for horde's own UI.
     pub fn wants_mouse(&self) -> bool {
-        self.term.mode().intersects(TermMode::MOUSE_MODE)
+        self.content.term.mode().intersects(TermMode::MOUSE_MODE)
     }
 
     pub fn scroll(&mut self, lines: i32) {
         use alacritty_terminal::grid::Scroll;
         // Scrolling changes which grid lines are visible without generating damage, so
         // force a repaint explicitly.
-        self.term.scroll_display(Scroll::Delta(lines));
+        self.content.term.scroll_display(Scroll::Delta(lines));
         self.full_repaint = true;
     }
 
     pub fn scroll_bottom(&mut self) {
         use alacritty_terminal::grid::Scroll;
-        self.term.scroll_display(Scroll::Bottom);
+        self.content.term.scroll_display(Scroll::Bottom);
         self.full_repaint = true;
     }
 
@@ -591,33 +604,33 @@ impl Pane {
         }
         // A pane that has stopped reading entirely must not grow this without limit. The bus
         // gate normally prevents it from getting close; this is the backstop.
-        if self.outbound.len() + bytes.len() > MAX_OUTBOUND {
+        if self.content.outbound.len() + bytes.len() > MAX_OUTBOUND {
             return Err(anyhow!("pane {} is not reading its input", self.id));
         }
-        self.outbound.extend_from_slice(bytes);
+        self.content.outbound.extend_from_slice(bytes);
         self.push_outbound();
         Ok(())
     }
 
     /// Hand the buffer to the tty until it stops accepting.
     fn push_outbound(&mut self) {
-        while !self.outbound.is_empty() {
-            match self.writer.write(&self.outbound) {
+        while !self.content.outbound.is_empty() {
+            match self.content.writer.write(&self.content.outbound) {
                 Ok(0) => break,
                 Ok(n) => {
-                    self.outbound.drain(..n);
+                    self.content.outbound.drain(..n);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 // The tty is full. The rest waits for a later tick.
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 // The pane is gone; holding its bytes forever would leak.
                 Err(_) => {
-                    self.outbound.clear();
+                    self.content.outbound.clear();
                     break;
                 }
             }
         }
-        let _ = self.writer.flush();
+        let _ = self.content.writer.flush();
     }
 
     /// Typing into a pane implies you want to see the live view again.
@@ -635,11 +648,11 @@ impl Pane {
     /// Returns false on timeout. A caller that cannot get confirmation must abandon the
     /// handoff: two processes reading one master would tear the output stream apart.
     pub fn pause_reader(&self, timeout: std::time::Duration) -> bool {
-        self.reader.pause(timeout)
+        self.content.reader.pause(timeout)
     }
 
     pub fn resume_reader(&self) {
-        self.reader.resume();
+        self.content.reader.resume();
     }
 
     /// Everything a successor daemon needs to take this pane over, plus a duplicate of the
@@ -650,14 +663,14 @@ impl Pane {
         // Anything already read but not yet fed to the emulator travels with the manifest;
         // dropping it would lose whatever the pane printed in the last instant.
         let mut pending = Vec::new();
-        while let Ok(chunk) = self.reader.rx.try_recv() {
+        while let Ok(chunk) = self.content.reader.rx.try_recv() {
             pending.extend(chunk);
         }
         let cursor = self.cursor();
-        let fd = self.master.dup_for_handoff()?;
+        let fd = self.content.master.dup_for_handoff()?;
         Ok((
             super::handoff::HPane {
-                pid: self.child.pid().unwrap_or(0),
+                pid: self.content.child.pid().unwrap_or(0),
                 cmd: self.cmd.clone(),
                 cwd: self.cwd.to_string_lossy().to_string(),
                 name: self.name.clone(),
@@ -750,13 +763,17 @@ impl Pane {
                 nudged_since: None,
                 alerted_since: None,
             }),
-            term,
-            parser: Processor::new(),
-            master,
-            writer,
-            child: ChildHandle::Adopted(saved.pid),
-            reader,
-            signal_rx,
+            content: PtyContent {
+                term,
+                parser: Processor::new(),
+                master,
+                writer,
+                child: ChildHandle::Adopted(saved.pid),
+                reader,
+                signal_rx,
+                deferred: Vec::new(),
+                outbound: Vec::new(),
+            },
             mirror: vec![Row::default(); saved.rows as usize],
             dirty: HashSet::new(),
             handover_told: false,
@@ -765,8 +782,6 @@ impl Pane {
             model: None,
             last_sent_cursor: None,
             full_repaint: true,
-            deferred: Vec::new(),
-            outbound: Vec::new(),
         };
 
         // Repaint the emulator to what was on screen, then apply anything the predecessor
@@ -774,9 +789,9 @@ impl Pane {
         // whatever is running happened to redraw.
         let replay =
             super::handoff::screen_to_ansi(&saved.screen, saved.cursor_x, saved.cursor_y);
-        pane.parser.advance(&mut pane.term, &replay);
+        pane.content.parser.advance(&mut pane.content.term, &replay);
         if !saved.pending.is_empty() {
-            pane.parser.advance(&mut pane.term, &saved.pending);
+            pane.content.parser.advance(&mut pane.content.term, &saved.pending);
         }
         pane.refresh_mirror(theme);
         pane.request_full_repaint();
@@ -785,7 +800,7 @@ impl Pane {
 
     /// Queue bytes to be written after `delay`.
     pub fn write_later(&mut self, bytes: Vec<u8>, delay: std::time::Duration) {
-        self.deferred.push((Instant::now() + delay, bytes));
+        self.content.deferred.push((Instant::now() + delay, bytes));
     }
 
     /// Whether the pty will take a write now. See [`Master::writable`].
@@ -794,7 +809,7 @@ impl Pane {
     /// a target that cannot take input within a few milliseconds is better queued than waited
     /// on. It flushes on a later pass at no cost.
     pub fn accepts_input(&self) -> bool {
-        self.master.writable(5)
+        self.content.master.writable(5)
     }
 
     /// Longest text this pane can accept in one line without the tty discarding the tail.
@@ -804,7 +819,7 @@ impl Pane {
     /// `MAX_CANON` and drops the rest silently, so a long message has to be refused rather
     /// than half-delivered.
     pub fn max_input_line(&self) -> Option<usize> {
-        match self.master.input_is_canonical() {
+        match self.content.master.input_is_canonical() {
             // A little headroom under MAX_CANON (1024): the limit counts the whole line, and
             // anything already typed at that prompt counts against it too.
             Some(true) => Some(900),
@@ -818,7 +833,7 @@ impl Pane {
     /// Anything about to type into this pane must wait for both, or its text would land inside
     /// the previous message or in front of a submit that has not fired.
     pub fn has_deferred(&self) -> bool {
-        !self.deferred.is_empty() || !self.outbound.is_empty()
+        !self.content.deferred.is_empty() || !self.content.outbound.is_empty()
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
@@ -829,8 +844,8 @@ impl Pane {
         }
         self.cols = cols;
         self.rows = rows;
-        self.master.resize(cols, rows)?;
-        self.term.resize(TermSize { cols: cols as usize, rows: rows as usize });
+        self.content.master.resize(cols, rows)?;
+        self.content.term.resize(TermSize { cols: cols as usize, rows: rows as usize });
         self.mirror.clear();
         self.mirror.resize(rows as usize, Row::default());
         self.full_repaint = true;
@@ -886,11 +901,11 @@ impl Pane {
     /// Foreground process group of the PTY. Detection uses this to work out which program
     /// is actually in charge, which is not necessarily what we spawned.
     pub fn foreground_pgid(&self) -> Option<i32> {
-        self.master.foreground_pgid()
+        self.content.master.foreground_pgid()
     }
 
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        let _ = self.content.child.kill();
     }
 }
 
