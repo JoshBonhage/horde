@@ -33,6 +33,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::config::{Action, Chord, Config, LeaderMatch, Notify, Trigger};
+use crate::client::editor::Vim;
 use crate::client::menu::{Act, Level, Prompt, Target};
 use crate::framing;
 use crate::proto::{
@@ -65,7 +66,8 @@ pub enum Mode {
     /// `project` says which half of horde the file belongs to — a note in a vault, or a file
     /// in the project — because that decides where saving sends it and nothing else about
     /// the editor changes.
-    Editor { path: String, scroll: usize, project: bool },
+    /// `vim` is which half of the keyboard you are in: insert types, normal commands.
+    Editor { path: String, scroll: usize, project: bool, vim: editor::Vim },
     /// A note, rendered. `link` indexes the wikilinks in it, so `tab` walks them and
     /// `enter` follows one — which is the whole difference between a file and a vault.
     Reader { scroll: usize, link: usize },
@@ -178,9 +180,18 @@ pub struct App {
     ///
     /// Cached because highlighting a file is milliseconds and a frame is microseconds: a
     /// highlighter run on every keystroke would make a fast editor feel like a slow one.
-    pub highlight: Option<(usize, Vec<ratatui::text::Line<'static>>)>,
+    ///
+    /// Keyed by path as well as revision. Every buffer opens at revision zero, so a cache
+    /// that only knew the number would hand the next file the last one's coloured text —
+    /// which is not a wrong colour, it is the wrong file's contents on the screen.
+    pub highlight: Option<(String, usize, Vec<ratatui::text::Line<'static>>)>,
     /// The note being written, alive only while the editor is open.
     pub buffer: Option<editor::Buffer>,
+    /// The line held by `dd`, `yy` or `cc`, for `p` to put down. One unnamed register: named
+    /// ones are a filing system, and this is an editor you keep a note open in.
+    pub yank: Option<String>,
+    /// What `/` last looked for, so `n` has something to repeat.
+    pub search: String,
     /// The graph layout, alive only while the graph is open.
     pub sim: Option<graph::Sim>,
     /// How far in, and where the view is centred. Panning moves the centre; the layout
@@ -239,6 +250,8 @@ impl App {
             setup: ui::setup::Answers::default(),
             highlight: None,
             buffer: None,
+            yank: None,
+            search: String::new(),
             sim: None,
             graph_zoom: 1.0,
             graph_centre: graph::Point { x: 0.0, y: 0.0 },
@@ -690,7 +703,7 @@ fn apply_frame(
                 // A body means this was asked for in order to edit it.
                 (Some(body), Some(path)) => {
                     app.buffer = Some(editor::Buffer::new(&body));
-                    app.mode = Mode::Editor { path, scroll: 0, project: true };
+                    app.mode = Mode::Editor { path, scroll: 0, project: true, vim: Vim::Insert };
                 }
                 _ => app.files = Some(*f),
             }
@@ -720,7 +733,8 @@ fn apply_frame(
                 app.opening_editor = false;
                 if let (Some(body), Some(note)) = (v.body.clone(), v.notes.first()) {
                     app.buffer = Some(editor::Buffer::new(&body));
-                    app.mode = Mode::Editor { path: note.path.clone(), scroll: 0, project: false };
+                    app.mode =
+                        Mode::Editor { path: note.path.clone(), scroll: 0, project: false, vim: Vim::Insert };
                 }
             }
             if let Some(g) = v.graph.as_ref() {
@@ -1170,87 +1184,24 @@ fn handle_key(
             }
             return Ok(());
         }
-        Mode::Editor { path, scroll, project } => {
+        Mode::Editor { path, scroll, project, vim } => {
             let rows = app.snapshot.as_ref().map(|s| s.status.h).unwrap_or(1) as usize;
             let page = rows.max(10);
-            let Some(buf) = app.buffer.as_mut() else {
+            if app.buffer.is_none() {
                 app.mode = Mode::Terminal;
                 return Ok(());
-            };
-            let save = |app: &mut App, out: &mpsc::UnboundedSender<ClientFrame>, path: &str| {
-                let Some(b) = app.buffer.as_mut() else { return };
-                let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) else {
-                    return;
-                };
-                let body = b.text();
-                let cmd = if project {
-                    Cmd::FileSave { space, path: path.to_string(), body }
-                } else {
-                    Cmd::VaultSave { space, path: path.to_string(), body }
-                };
-                let _ = out.send(ClientFrame::Command(cmd));
-                b.saved();
-            };
-
-            match (k.code, k.modifiers.contains(KeyModifiers::CONTROL)) {
-                (KeyCode::Char('s'), true) => save(app, out, &path),
-                // Leaving saves. An editor that can lose a note because you pressed the
-                // wrong key to get out of it is not one anybody should trust a thought to.
-                (KeyCode::Esc, _) => {
-                    save(app, out, &path);
-                    app.buffer = None;
-                    app.mode = if project {
-                        Mode::Files { query: String::new(), sel: 0 }
-                    } else {
-                        Mode::Notes { query: String::new(), sel: 0 }
-                    };
-                }
-                (KeyCode::Char('r'), true) => {
-                    save(app, out, &path);
-                    app.buffer = None;
-                    read_note(app, &path, out);
-                }
-                // Available because the client runs in raw mode, so ctrl+z is a keystroke
-                // here rather than a suspend signal.
-                (KeyCode::Char('z'), true) => {
-                    if !buf.undo() {
-                        app.toast(NoticeLevel::Info, "nothing to undo");
-                    }
-                }
-                (KeyCode::Char('y'), true) => {
-                    if !buf.redo() {
-                        app.toast(NoticeLevel::Info, "nothing to redo");
-                    }
-                }
-                (KeyCode::Enter, _) => buf.newline(),
-                (KeyCode::Backspace, _) => buf.backspace(),
-                (KeyCode::Delete, _) => buf.delete(),
-                (KeyCode::Left, _) => buf.left(),
-                (KeyCode::Right, _) => buf.right(),
-                (KeyCode::Up, _) => buf.up(),
-                (KeyCode::Down, _) => buf.down(),
-                (KeyCode::Home, _) => buf.home(),
-                (KeyCode::End, _) => buf.end(),
-                (KeyCode::Tab, _) => {
-                    for _ in 0..2 {
-                        buf.insert(' ');
-                    }
-                }
-                (KeyCode::PageDown, _) => {
-                    for _ in 0..page {
-                        buf.down();
-                    }
-                }
-                (KeyCode::PageUp, _) => {
-                    for _ in 0..page {
-                        buf.up();
-                    }
-                }
-                // Everything else types. No mode to be in, and no key that silently means
-                // something else — this is a notes app.
-                (KeyCode::Char(c), false) => buf.insert(c),
-                _ => {}
             }
+
+            // `None` means the editor is gone — closed, or handed over to the reader — and
+            // has already put the mode wherever it went.
+            let next = match vim {
+                Vim::Insert => editor_insert(app, k, out, &path, project, page),
+                Vim::Command(line) => editor_line(app, k, out, &path, project, false, line),
+                Vim::Search(line) => editor_line(app, k, out, &path, project, true, line),
+                Vim::Normal => editor_normal(app, k, out, &path, project, page, None),
+                Vim::Pending(c) => editor_normal(app, k, out, &path, project, page, Some(c)),
+            };
+            let Some(vim) = next else { return Ok(()) };
 
             // Keep the cursor on screen by following it, never by moving it.
             if let Some(b) = app.buffer.as_ref() {
@@ -1262,9 +1213,7 @@ fn handle_key(
                 } else {
                     scroll
                 };
-                if matches!(app.mode, Mode::Editor { .. }) {
-                    app.mode = Mode::Editor { path, scroll, project };
-                }
+                app.mode = Mode::Editor { path, scroll, project, vim };
             }
             return Ok(());
         }
@@ -2150,7 +2099,424 @@ fn create_note(app: &mut App, title: &str, out: &mpsc::UnboundedSender<ClientFra
     if let Some(b) = app.buffer.as_mut() {
         b.goto(2, 0); // past the heading, where you were going to type anyway
     }
-    app.mode = Mode::Editor { path, scroll: 0, project: false };
+    app.mode = Mode::Editor { path, scroll: 0, project: false, vim: Vim::Insert };
+}
+
+// -- the editor's keyboard ---------------------------------------------------
+//
+// Split by mode rather than nested in one match, because insert and normal share almost no
+// keys and reading either one should not mean stepping over the other. They all answer the
+// same question: where does the keyboard go next, and `None` means the editor is gone.
+
+/// Write the buffer back to wherever it came from. Says whether it went.
+fn editor_save(
+    app: &mut App,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    path: &str,
+    project: bool,
+) -> bool {
+    let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) else {
+        // Silence here would be the worst kind: you press `:w`, nothing happens, and you find
+        // out at the end of the evening.
+        app.toast(NoticeLevel::Warn, "no project is focused, so there is nowhere to save this");
+        return false;
+    };
+    let Some(b) = app.buffer.as_mut() else { return false };
+    let body = b.text();
+    b.saved();
+    let cmd = if project {
+        Cmd::FileSave { space, path: path.to_string(), body }
+    } else {
+        Cmd::VaultSave { space, path: path.to_string(), body }
+    };
+    let _ = out.send(ClientFrame::Command(cmd));
+    true
+}
+
+/// Put the editor away, back to whichever browser opened it.
+fn editor_close(app: &mut App, project: bool) {
+    app.buffer = None;
+    app.highlight = None;
+    app.mode = if project {
+        Mode::Files { query: String::new(), sel: 0 }
+    } else {
+        Mode::Notes { query: String::new(), sel: 0 }
+    };
+}
+
+/// Insert: typing types, and the only key that means something else is the one that leaves.
+fn editor_insert(
+    app: &mut App,
+    k: KeyEvent,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    path: &str,
+    project: bool,
+    page: usize,
+) -> Option<Vim> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match (k.code, ctrl) {
+        (KeyCode::Char('s'), true) => {
+            editor_save(app, out, path, project);
+            return Some(Vim::Insert);
+        }
+        // esc leaves *insert*, not the note. That is the whole reason for having modes: the
+        // way out of the editor is `:q`, or one more esc.
+        (KeyCode::Esc, _) => {
+            if let Some(b) = app.buffer.as_mut() {
+                b.clamp();
+            }
+            return Some(Vim::Normal);
+        }
+        (KeyCode::Char('r'), true) => {
+            editor_save(app, out, path, project);
+            app.buffer = None;
+            app.highlight = None;
+            read_note(app, path, out);
+            return None;
+        }
+        // Available because the client runs in raw mode, so ctrl+z is a keystroke here
+        // rather than a suspend signal.
+        (KeyCode::Char('z'), true) => {
+            if !app.buffer.as_mut().is_some_and(|b| b.undo()) {
+                app.toast(NoticeLevel::Info, "nothing to undo");
+            }
+            return Some(Vim::Insert);
+        }
+        (KeyCode::Char('y'), true) => {
+            if !app.buffer.as_mut().is_some_and(|b| b.redo()) {
+                app.toast(NoticeLevel::Info, "nothing to redo");
+            }
+            return Some(Vim::Insert);
+        }
+        _ => {}
+    }
+
+    let Some(buf) = app.buffer.as_mut() else { return Some(Vim::Insert) };
+    match (k.code, ctrl) {
+        (KeyCode::Enter, _) => buf.newline(),
+        (KeyCode::Backspace, _) => buf.backspace(),
+        (KeyCode::Delete, _) => buf.delete(),
+        (KeyCode::Left, _) => buf.left(),
+        (KeyCode::Right, _) => buf.right(),
+        (KeyCode::Up, _) => buf.up(),
+        (KeyCode::Down, _) => buf.down(),
+        (KeyCode::Home, _) => buf.home(),
+        (KeyCode::End, _) => buf.end(),
+        (KeyCode::Tab, _) => {
+            for _ in 0..2 {
+                buf.insert(' ');
+            }
+        }
+        (KeyCode::PageDown, _) => {
+            for _ in 0..page {
+                buf.down();
+            }
+        }
+        (KeyCode::PageUp, _) => {
+            for _ in 0..page {
+                buf.up();
+            }
+        }
+        // Everything else types — including `:` and `/`, which are punctuation in here and
+        // commands one mode over.
+        (KeyCode::Char(c), false) => buf.insert(c),
+        _ => {}
+    }
+    Some(Vim::Insert)
+}
+
+/// Normal: keys are verbs. `pending` is the first half of a pair, if one was typed.
+fn editor_normal(
+    app: &mut App,
+    k: KeyEvent,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    path: &str,
+    project: bool,
+    page: usize,
+    pending: Option<char>,
+) -> Option<Vim> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+
+    // A half-typed pair is resolved or dropped, and never falls through to the single-key
+    // meaning of its second half. The `d` of an abandoned `dd` must not delete anything.
+    if let Some(first) = pending {
+        match (first, k.code) {
+            ('g', KeyCode::Char('g')) => {
+                if let Some(b) = app.buffer.as_mut() {
+                    b.top();
+                }
+            }
+            ('d', KeyCode::Char('d')) => {
+                if let Some(gone) = app.buffer.as_mut().map(|b| b.delete_line()) {
+                    app.yank = Some(gone);
+                }
+            }
+            ('y', KeyCode::Char('y')) => {
+                if let Some(line) = app.buffer.as_ref().map(|b| b.line_text()) {
+                    app.yank = Some(line);
+                    app.toast(NoticeLevel::Info, "line yanked");
+                }
+            }
+            ('c', KeyCode::Char('c')) => {
+                if let Some(b) = app.buffer.as_mut() {
+                    app.yank = Some(b.line_text());
+                    b.clear_line();
+                    return Some(Vim::Insert);
+                }
+            }
+            _ => {}
+        }
+        return Some(Vim::Normal);
+    }
+
+    // The keys that are about the editor rather than about the text, taken first so the rest
+    // can hold the buffer without also needing the app.
+    match (k.code, ctrl) {
+        // Up one layer, saving on the way. esc is the key people press when they are not
+        // sure what else to press, so it must never be the one that loses a note — leaving
+        // without writing is spelled `:q!`, deliberately and on purpose.
+        (KeyCode::Esc, _) => {
+            editor_save(app, out, path, project);
+            editor_close(app, project);
+            return None;
+        }
+        (KeyCode::Char('s'), true) => {
+            editor_save(app, out, path, project);
+            return Some(Vim::Normal);
+        }
+        (KeyCode::Char(':'), false) => return Some(Vim::Command(String::new())),
+        (KeyCode::Char('/'), false) => return Some(Vim::Search(String::new())),
+        (KeyCode::Char('r'), true) => {
+            if !app.buffer.as_mut().is_some_and(|b| b.redo()) {
+                app.toast(NoticeLevel::Info, "nothing to redo");
+            }
+            return Some(Vim::Normal);
+        }
+        _ => {}
+    }
+
+    let held = app.yank.clone();
+    let last = app.search.clone();
+    let Some(b) = app.buffer.as_mut() else { return Some(Vim::Normal) };
+    let mut next = Vim::Normal;
+    let mut miss: Option<String> = None;
+
+    match (k.code, ctrl) {
+        // moving
+        (KeyCode::Char('h'), false) | (KeyCode::Left, _) => b.step(false),
+        (KeyCode::Char('l'), false) | (KeyCode::Right, _) => b.step(true),
+        (KeyCode::Char('j'), false) | (KeyCode::Down, _) => {
+            b.down();
+            b.clamp();
+        }
+        (KeyCode::Char('k'), false) | (KeyCode::Up, _) => {
+            b.up();
+            b.clamp();
+        }
+        (KeyCode::Char('w'), false) => b.word_forward(),
+        (KeyCode::Char('b'), false) => b.word_back(),
+        (KeyCode::Char('e'), false) => b.word_end(),
+        (KeyCode::Char('0'), false) | (KeyCode::Home, _) => b.home(),
+        (KeyCode::Char('^'), false) => b.first_nonblank(),
+        (KeyCode::Char('$'), false) | (KeyCode::End, _) => {
+            b.end();
+            b.clamp();
+        }
+        (KeyCode::Char('G'), false) => b.bottom(),
+        (KeyCode::Char('{'), false) => b.paragraph(false),
+        (KeyCode::Char('}'), false) => b.paragraph(true),
+        (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
+            for _ in 0..page / 2 {
+                b.down();
+            }
+            b.clamp();
+        }
+        (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
+            for _ in 0..page / 2 {
+                b.up();
+            }
+            b.clamp();
+        }
+
+        // into insert, at the six places people expect to land
+        (KeyCode::Char('i'), false) => next = Vim::Insert,
+        (KeyCode::Char('a'), false) => {
+            b.goto(b.line, b.col + 1);
+            next = Vim::Insert;
+        }
+        (KeyCode::Char('I'), false) => {
+            b.first_nonblank();
+            next = Vim::Insert;
+        }
+        (KeyCode::Char('A'), false) => {
+            b.end();
+            next = Vim::Insert;
+        }
+        (KeyCode::Char('o'), false) => {
+            b.put_line("", true);
+            next = Vim::Insert;
+        }
+        (KeyCode::Char('O'), false) => {
+            b.put_line("", false);
+            next = Vim::Insert;
+        }
+
+        // changing
+        (KeyCode::Char('x'), false) => {
+            b.delete_char();
+        }
+        (KeyCode::Char('D'), false) => {
+            b.delete_to_end();
+            b.clamp();
+        }
+        (KeyCode::Char('C'), false) => {
+            b.delete_to_end();
+            next = Vim::Insert;
+        }
+        (KeyCode::Char('J'), false) => b.join(),
+        (KeyCode::Char('p'), false) | (KeyCode::Char('P'), false) => match held {
+            Some(y) => b.put_line(&y, k.code == KeyCode::Char('p')),
+            None => miss = Some("nothing to put down yet".into()),
+        },
+        (KeyCode::Char('u'), false) | (KeyCode::Char('z'), true) => {
+            if !b.undo() {
+                miss = Some("nothing to undo".into());
+            }
+        }
+        (KeyCode::Char('y'), true) => {
+            if !b.redo() {
+                miss = Some("nothing to redo".into());
+            }
+        }
+
+        // the first half of a pair
+        (KeyCode::Char(c @ ('g' | 'd' | 'y' | 'c')), false) => next = Vim::Pending(c),
+
+        // the search again, in both directions
+        (KeyCode::Char(c @ ('n' | 'N')), false) => {
+            if last.is_empty() {
+                miss = Some("nothing searched for yet".into());
+            } else if !b.search(&last, c == 'n') {
+                miss = Some(format!("no more {last:?}"));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(m) = miss {
+        app.toast(NoticeLevel::Info, m);
+    }
+    Some(next)
+}
+
+/// The `:` and `/` lines. One reader, because they are the same act with different verbs.
+fn editor_line(
+    app: &mut App,
+    k: KeyEvent,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    path: &str,
+    project: bool,
+    searching: bool,
+    mut line: String,
+) -> Option<Vim> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Esc => return Some(Vim::Normal),
+        KeyCode::Backspace => {
+            // Backspacing off the front of the prompt is how you take back having opened it,
+            // which is what it does everywhere else in horde.
+            if line.pop().is_none() {
+                return Some(Vim::Normal);
+            }
+        }
+        KeyCode::Enter => {
+            return if searching {
+                editor_find(app, &line)
+            } else {
+                editor_run(app, out, path, project, &line)
+            };
+        }
+        KeyCode::Char(c) if !ctrl => line.push(c),
+        _ => {}
+    }
+    Some(if searching { Vim::Search(line) } else { Vim::Command(line) })
+}
+
+/// Run what was typed after `/`. An empty line repeats the last search, as it does elsewhere.
+fn editor_find(app: &mut App, needle: &str) -> Option<Vim> {
+    let needle = if needle.is_empty() { app.search.clone() } else { needle.to_string() };
+    if needle.is_empty() {
+        app.toast(NoticeLevel::Info, "nothing to search for");
+        return Some(Vim::Normal);
+    }
+    if !app.buffer.as_mut().is_some_and(|b| b.search(&needle, true)) {
+        app.toast(NoticeLevel::Info, format!("not found: {needle}"));
+    }
+    // Remembered either way, so `n` after a miss searches for what you meant rather than for
+    // whatever was in there before it.
+    app.search = needle;
+    Some(Vim::Normal)
+}
+
+/// Run what was typed after `:`.
+///
+/// Only the commands that mean something here. An unknown one says so rather than being
+/// swallowed, because a `:` line that silently ignores things is one you cannot trust to have
+/// written the file.
+fn editor_run(
+    app: &mut App,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    path: &str,
+    project: bool,
+    line: &str,
+) -> Option<Vim> {
+    let cmd = line.trim();
+    let dirty = app.buffer.as_ref().is_some_and(|b| b.dirty);
+    match cmd {
+        "" => Some(Vim::Normal),
+        "w" | "w!" => {
+            if editor_save(app, out, path, project) {
+                app.toast(NoticeLevel::Info, format!("wrote {path}"));
+            }
+            Some(Vim::Normal)
+        }
+        "wq" | "wq!" | "x" | "xa" | "wqa" => {
+            // A failed write must not close the note: that is the one path where quitting
+            // would throw away work while looking like it saved it.
+            if editor_save(app, out, path, project) {
+                editor_close(app, project);
+                return None;
+            }
+            Some(Vim::Normal)
+        }
+        "q" | "qa" => {
+            if dirty {
+                app.toast(
+                    NoticeLevel::Warn,
+                    "unsaved changes — :wq to write and go, :q! to throw them away",
+                );
+                return Some(Vim::Normal);
+            }
+            editor_close(app, project);
+            None
+        }
+        "q!" | "qa!" => {
+            editor_close(app, project);
+            None
+        }
+        other => {
+            // `:42` is a line number, which is the one bit of `:` syntax that is not a word.
+            if let Ok(n) = other.parse::<usize>() {
+                if let Some(b) = app.buffer.as_mut() {
+                    b.goto(n.saturating_sub(1), 0);
+                    b.clamp();
+                }
+                return Some(Vim::Normal);
+            }
+            app.toast(NoticeLevel::Warn, format!("not a command: :{other}"));
+            Some(Vim::Normal)
+        }
+    }
 }
 
 fn read_note(app: &mut App, path: &str, out: &mpsc::UnboundedSender<ClientFrame>) {
@@ -2856,6 +3222,206 @@ mod tests {
             out.push(f);
         }
         out
+    }
+
+    // -- the editor's two keyboards ----------------------------------------
+
+    fn editing() -> App {
+        let mut app = app_with_snapshot();
+        app.buffer = Some(editor::Buffer::new("one\ntwo\nthree"));
+        app.mode =
+            Mode::Editor { path: "note.md".into(), scroll: 0, project: false, vim: Vim::Insert };
+        app
+    }
+
+    fn vim_of(app: &App) -> Vim {
+        match &app.mode {
+            Mode::Editor { vim, .. } => vim.clone(),
+            other => panic!("the editor closed: {other:?}"),
+        }
+    }
+
+    /// Type a run of characters, one key at a time, and hand back everything they sent.
+    fn typed(app: &mut App, text: &str) -> Vec<Cmd> {
+        let mut out = Vec::new();
+        for c in text.chars() {
+            out.extend(cmds(press(app, KeyCode::Char(c))));
+        }
+        out
+    }
+
+    /// The whole point of having modes: `esc` reaches the commands, and the note stays open.
+    /// Before this it left the editor, which meant there was nowhere for `:` to be typed.
+    #[test]
+    fn esc_while_writing_reaches_the_commands_rather_than_leaving() {
+        let mut app = editing();
+        let sent = cmds(press(&mut app, KeyCode::Esc));
+        assert_eq!(vim_of(&app), Vim::Normal);
+        assert!(sent.is_empty(), "and nothing was written on the way: {sent:?}");
+        assert!(app.buffer.is_some(), "the note is still open");
+    }
+
+    /// `:` only means `:` where it is not a character you are typing.
+    #[test]
+    fn a_colon_typed_into_a_note_is_a_colon() {
+        let mut app = editing();
+        typed(&mut app, ":q");
+        assert_eq!(vim_of(&app), Vim::Insert, "still writing");
+        assert_eq!(app.buffer.as_ref().unwrap().lines[0], ":qone");
+    }
+
+    #[test]
+    fn colon_wq_writes_the_note_and_closes_it() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, ":wq");
+        let sent = cmds(press(&mut app, KeyCode::Enter));
+        assert!(
+            matches!(sent.first(), Some(Cmd::VaultSave { path, .. }) if path == "note.md"),
+            "it wrote: {sent:?}"
+        );
+        assert!(matches!(app.mode, Mode::Notes { .. }), "and went back where it came from");
+        assert!(app.buffer.is_none());
+    }
+
+    #[test]
+    fn colon_w_writes_and_stays_in_the_note() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Char('!'));
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, ":w");
+        let sent = cmds(press(&mut app, KeyCode::Enter));
+        assert!(matches!(sent.first(), Some(Cmd::VaultSave { .. })), "{sent:?}");
+        assert_eq!(vim_of(&app), Vim::Normal, "and the note is still open");
+        assert!(!app.buffer.as_ref().unwrap().dirty, "with nothing left unwritten");
+    }
+
+    /// `:q` on unsaved work is a question, not an action — and the answer has to name the two
+    /// keys that resolve it, or refusing is just a wall.
+    #[test]
+    fn colon_q_refuses_to_throw_away_unsaved_work_and_says_how_to_mean_it() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, ":q");
+        let sent = cmds(press(&mut app, KeyCode::Enter));
+
+        assert!(sent.is_empty(), "nothing written: {sent:?}");
+        assert_eq!(vim_of(&app), Vim::Normal, "and nothing closed");
+        let said = app.toasts.back().map(|t| t.text.clone()).unwrap_or_default();
+        assert!(said.contains(":wq") && said.contains(":q!"), "it offers both ways out: {said}");
+    }
+
+    /// The deliberate discard. It is the one path out of the editor that does not write, and
+    /// it is spelled with the character people already use to mean "yes, really".
+    #[test]
+    fn colon_q_bang_leaves_without_writing() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, ":q!");
+        let sent = cmds(press(&mut app, KeyCode::Enter));
+        assert!(sent.is_empty(), "the file on disk is untouched: {sent:?}");
+        assert!(matches!(app.mode, Mode::Notes { .. }));
+    }
+
+    /// A clean note has nothing to lose, so `:q` is just leaving.
+    #[test]
+    fn colon_q_on_an_unchanged_note_simply_goes() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, ":q");
+        let sent = cmds(press(&mut app, KeyCode::Enter));
+        assert!(sent.is_empty());
+        assert!(matches!(app.mode, Mode::Notes { .. }));
+    }
+
+    /// horde's own rule, kept: `esc` goes up one layer and never destroys. It is the key
+    /// people press when they are lost, so it is the one that has to write first.
+    #[test]
+    fn esc_from_the_commands_saves_on_the_way_out() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Char('!'));
+        press(&mut app, KeyCode::Esc);
+        let sent = cmds(press(&mut app, KeyCode::Esc));
+        assert!(matches!(sent.first(), Some(Cmd::VaultSave { .. })), "{sent:?}");
+        assert!(matches!(app.mode, Mode::Notes { .. }));
+    }
+
+    /// Half of `dd` must never delete a line on its own — which is what would happen if the
+    /// pending key were a flag the second keystroke could fall through.
+    #[test]
+    fn half_of_a_pair_does_nothing_when_it_is_abandoned() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(vim_of(&app), Vim::Pending('d'), "waiting for the other half");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(vim_of(&app), Vim::Normal);
+        assert_eq!(app.buffer.as_ref().unwrap().text(), "one\ntwo\nthree", "nothing went");
+        assert!(app.buffer.as_ref().is_some_and(|b| !b.dirty));
+
+        // And the completed pair does, with the line kept for `p`.
+        typed(&mut app, "dd");
+        assert_eq!(app.buffer.as_ref().unwrap().text(), "two\nthree");
+        assert_eq!(app.yank.as_deref(), Some("one"));
+        typed(&mut app, "p");
+        assert_eq!(app.buffer.as_ref().unwrap().text(), "two\none\nthree");
+    }
+
+    #[test]
+    fn an_unknown_command_says_so_rather_than_being_swallowed() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, ":wat");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(vim_of(&app), Vim::Normal);
+        let said = app.toasts.back().map(|t| t.text.clone()).unwrap_or_default();
+        assert!(said.contains(":wat"), "and names what it did not understand: {said}");
+    }
+
+    /// The `:` line is a place you can change your mind about being in.
+    #[test]
+    fn backing_off_the_front_of_the_prompt_closes_it() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, ":w");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(vim_of(&app), Vim::Command(String::new()));
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(vim_of(&app), Vim::Normal, "and the prompt is gone");
+    }
+
+    #[test]
+    fn search_moves_the_cursor_and_n_repeats_it() {
+        let mut app = editing();
+        press(&mut app, KeyCode::Esc);
+        typed(&mut app, "/t");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(vim_of(&app), Vim::Normal);
+        let b = app.buffer.as_ref().unwrap();
+        assert_eq!((b.line, b.col), (1, 0), "the `t` of `two`");
+
+        press(&mut app, KeyCode::Char('n'));
+        let b = app.buffer.as_ref().unwrap();
+        assert_eq!((b.line, b.col), (2, 0), "then the `t` of `three`");
+    }
+
+    /// `i` and its neighbours are the way back to typing, and each lands somewhere specific.
+    #[test]
+    fn the_keys_into_insert_land_where_they_say_they_do() {
+        for (key, line, col) in
+            [('i', 1, 1), ('a', 1, 2), ('I', 1, 0), ('A', 1, 3), ('o', 2, 0), ('O', 1, 0)]
+        {
+            let mut app = editing();
+            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::Char('j'));
+            press(&mut app, KeyCode::Char('l'));
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(vim_of(&app), Vim::Insert, "`{key}` types");
+            let b = app.buffer.as_ref().unwrap();
+            assert_eq!((b.line, b.col), (line, col), "`{key}` landed wrong");
+        }
     }
 
     /// Opening horde is arriving, and arriving shows you the state of things. Every attach

@@ -176,9 +176,19 @@ impl Widget for StatusBar<'_> {
             Mode::Notes { .. } => left.push(chip(" NOTES ", t.ui.accent_alt, t)),
             Mode::Graph { .. } => left.push(chip(" GRAPH ", t.ui.accent_alt, t)),
             Mode::Reader { .. } => left.push(chip(" READING ", t.ui.accent_alt, t)),
-            // Its own colour, like the approval queue: this is the mode where a keystroke
-            // changes a file, and it should not look like the ones where it does not.
-            Mode::Editor { .. } => left.push(chip(" WRITING ", t.ui.working, t)),
+            // Insert gets its own colour, like the approval queue: this is the one mode where
+            // a printable key changes a file, and it must not look like the ones where the
+            // same key is a command. The `:` and `/` chips are the glyph you typed, because
+            // that is exactly what the keyboard is doing.
+            Mode::Editor { vim, .. } => left.push(match vim {
+                crate::client::editor::Vim::Insert => chip(" INSERT ", t.ui.working, t),
+                crate::client::editor::Vim::Normal => chip(" NORMAL ", t.ui.accent_alt, t),
+                crate::client::editor::Vim::Pending(c) => {
+                    chip(&format!(" NORMAL {c} "), t.ui.accent_alt, t)
+                }
+                crate::client::editor::Vim::Command(_) => chip(" : ", t.ui.accent_alt, t),
+                crate::client::editor::Vim::Search(_) => chip(" / ", t.ui.accent_alt, t),
+            }),
             Mode::Setup { .. } => left.push(chip(" SETUP ", t.ui.accent_alt, t)),
             Mode::Files { .. } => left.push(chip(" FILES ", t.ui.accent_alt, t)),
             Mode::Help => left.push(chip(" HELP ", t.ui.accent_alt, t)),
@@ -484,6 +494,41 @@ mod tests {
             assert_eq!(out.chars().count(), w as usize, "tab bar at {w}");
             let out = text(&render_status(&s, Mode::Prefix, w), w);
             assert_eq!(out.chars().count(), w as usize, "status bar at {w}");
+        }
+    }
+
+    /// The chip is the contract: it says what the next keystroke will do. In the editor that
+    /// is the difference between typing a `d` and deleting a line, so every state the
+    /// keyboard can be in has to name itself, and none of them may look alike.
+    #[test]
+    fn the_editor_names_which_keyboard_you_have() {
+        use crate::client::editor::Vim;
+        let s = snap(&[Some(AgentState::Working)], 1);
+        let seen: Vec<String> = [
+            Vim::Insert,
+            Vim::Normal,
+            Vim::Pending('d'),
+            Vim::Command("wq".into()),
+            Vim::Search("thing".into()),
+        ]
+        .into_iter()
+        .map(|vim| {
+            let mode =
+                Mode::Editor { path: "n.md".into(), scroll: 0, project: false, vim };
+            text(&render_status(&s, mode, 80), 80)
+        })
+        .collect();
+
+        assert!(seen[0].contains("INSERT"), "{}", seen[0]);
+        assert!(seen[1].contains("NORMAL"), "{}", seen[1]);
+        assert!(seen[2].contains("NORMAL d"), "the half-typed pair is visible: {}", seen[2]);
+        assert!(seen[3].contains(':'), "{}", seen[3]);
+        assert!(seen[4].contains('/'), "{}", seen[4]);
+
+        for (i, a) in seen.iter().enumerate() {
+            for b in seen.iter().skip(i + 1) {
+                assert_ne!(a, b, "two states of the keyboard look the same");
+            }
         }
     }
 

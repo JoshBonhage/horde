@@ -258,7 +258,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    if let Mode::Editor { ref path, scroll, .. } = app.mode {
+    if let Mode::Editor { ref path, scroll, vim: ref vim_mode, .. } = app.mode {
+        let vim_mode = vim_mode.clone();
         let theme2 = theme.clone();
         fill(f.buffer_mut(), area, theme2.ui.bg);
         let col = area.width.saturating_sub(6).min(96);
@@ -295,11 +296,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             // keeps typing feeling like typing.
             if !markdownish {
                 let rev = app.buffer.as_ref().map(|b| b.rev).unwrap_or(0);
-                let stale = app.highlight.as_ref().is_none_or(|(r, _)| *r != rev);
+                let stale =
+                    app.highlight.as_ref().is_none_or(|(p, r, _)| *r != rev || p != path);
                 if stale {
                     let text = app.buffer.as_ref().map(|b| b.text()).unwrap_or_default();
                     app.highlight = crate::client::syntax::highlight(path, &text, &theme2)
-                        .map(|lines| (rev, lines));
+                        .map(|lines| (path.clone(), rev, lines));
                 }
             }
             for (i, line) in buf.lines.iter().skip(scroll).take(rows as usize).enumerate() {
@@ -307,7 +309,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 let rendered = if markdownish && n != buf.line {
                     markdown::live_line(line, &theme2)
                 } else if let Some(hl) =
-                    app.highlight.as_ref().and_then(|(_, ls)| ls.get(n)).filter(|_| !markdownish)
+                    app.highlight.as_ref().and_then(|(_, _, ls)| ls.get(n)).filter(|_| !markdownish)
                 {
                     hl.clone()
                 } else {
@@ -318,22 +320,56 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 };
                 put_line(f.buffer_mut(), x, top + i as u16, col, rendered);
             }
-            if buf.line >= scroll && buf.line < scroll + rows as usize {
+            // The cursor belongs to whichever line is being typed into. While the `:` line is
+            // open that is the prompt, not the text — put it in both places and the one you
+            // are actually editing is anybody's guess.
+            if vim_mode.prompt().is_none()
+                && buf.line >= scroll
+                && buf.line < scroll + rows as usize
+            {
                 let cx = x + (buf.col as u16).min(col.saturating_sub(1));
                 f.set_cursor_position((cx, top + (buf.line - scroll) as u16));
             }
         }
 
-        put_line(
-            f.buffer_mut(),
-            x,
-            area.y + area.height.saturating_sub(1),
-            col,
-            Line::from(ratatui::text::Span::styled(
-                "ctrl+z undo   ctrl+y redo   ctrl+s save   esc back".to_string(),
-                Style::default().fg(color(theme2.ui.text_faint)).bg(color(theme2.ui.bg)),
-            )),
-        );
+        let foot = area.y + area.height.saturating_sub(1);
+        match vim_mode.prompt() {
+            // The line being typed *is* the hint: it shows the command as it is written, the
+            // way it does in the editor everyone learned this from.
+            Some((glyph, typed)) => {
+                put_line(
+                    f.buffer_mut(),
+                    x,
+                    foot,
+                    col,
+                    Line::from(ratatui::text::Span::styled(
+                        format!("{glyph}{typed}"),
+                        Style::default().fg(color(theme2.ui.text)).bg(color(theme2.ui.bg)),
+                    )),
+                );
+                let cx = x + 1 + typed.chars().count() as u16;
+                f.set_cursor_position((cx.min(x + col.saturating_sub(1)), foot));
+            }
+            // Different modes, different keys, so different hints. The row always describes
+            // the keyboard you have, not the one you had a moment ago.
+            None => {
+                let hint = if vim_mode.typing() {
+                    "esc normal   ctrl+s save   ctrl+z undo   ctrl+r read"
+                } else {
+                    "i insert   : command   / search   dd yy p   u undo   :wq write and go"
+                };
+                put_line(
+                    f.buffer_mut(),
+                    x,
+                    foot,
+                    col,
+                    Line::from(ratatui::text::Span::styled(
+                        hint.to_string(),
+                        Style::default().fg(color(theme2.ui.text_faint)).bg(color(theme2.ui.bg)),
+                    )),
+                );
+            }
+        }
         statusbar::StatusBar {
             snap: &snap,
             theme: &theme,
