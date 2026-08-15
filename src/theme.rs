@@ -66,6 +66,63 @@ pub const SPACE_ACCENTS: usize = 6;
 /// found that, and is what keeps a future palette from reintroducing it.
 const ACCENT_SLOTS: [usize; SPACE_ACCENTS] = [4, 5, 6, 2, 3, 1];
 
+/// Colours for the things a language has in it.
+///
+/// Derived from the theme's own palette rather than declared per theme: a scheme that looks
+/// like horde in its chrome and like somebody else's editor in its code is two designs in
+/// one window. Every theme gets syntax colouring for free, and a theme that wants to differ
+/// can still override the fields it cares about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Syntax {
+    pub keyword: Rgb,
+    pub function: Rgb,
+    pub type_name: Rgb,
+    pub string: Rgb,
+    pub number: Rgb,
+    pub comment: Rgb,
+    pub constant: Rgb,
+    pub punctuation: Rgb,
+    pub variable: Rgb,
+}
+
+impl Syntax {
+    /// The palette a theme implies. Keywords take the accent, because they are the words
+    /// that give a line its shape; comments take the faintest text colour, because they are
+    /// the part you skip when you are looking for something.
+    fn from(ui: &Ui, ansi: &[Rgb; 16]) -> Syntax {
+        Syntax {
+            keyword: ui.accent,
+            function: ui.accent_alt,
+            type_name: ansi[6],
+            string: ui.ok,
+            number: ansi[5],
+            comment: ui.text_faint,
+            constant: ui.warn,
+            punctuation: ui.text_dim,
+            variable: ui.text,
+        }
+    }
+
+    /// The colour for a tree-sitter highlight name, longest match first.
+    ///
+    /// Names are dotted (`keyword.control`, `string.special`), so a scope nobody has an
+    /// opinion about falls back to its family rather than to nothing.
+    pub fn for_scope(&self, scope: &str) -> Rgb {
+        let head = scope.split('.').next().unwrap_or(scope);
+        match head {
+            "keyword" | "operator" | "keyword.control" => self.keyword,
+            "function" | "method" => self.function,
+            "type" | "constructor" | "namespace" | "module" => self.type_name,
+            "string" | "character" => self.string,
+            "number" | "float" | "boolean" => self.number,
+            "comment" => self.comment,
+            "constant" | "attribute" | "label" => self.constant,
+            "punctuation" | "tag" => self.punctuation,
+            _ => self.variable,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub name: String,
@@ -75,6 +132,8 @@ pub struct Theme {
     pub bg: Rgb,
     pub cursor: Rgb,
     pub ui: Ui,
+    /// Colours for code, derived from `ui` unless a theme says otherwise.
+    pub syntax: Syntax,
     /// When true, cell colors that are still "default" pass through to the host terminal's
     /// own palette instead of being pinned to `fg`/`bg`.
     pub inherit_terminal: bool,
@@ -90,6 +149,32 @@ impl Default for Theme {
         Theme::horde()
     }
 }
+
+/// Stand-ins used only while the first `Theme` literal is being built; every theme's real
+/// syntax palette is computed by `derive_syntax` once its colours are final.
+const ANSI_PLACEHOLDER: [Rgb; 16] = [Rgb::new(0, 0, 0); 16];
+const UI_PLACEHOLDER: Ui = Ui {
+    accent: Rgb::new(0, 0, 0),
+    accent_alt: Rgb::new(0, 0, 0),
+    bg: Rgb::new(0, 0, 0),
+    panel_bg: Rgb::new(0, 0, 0),
+    title_bg: Rgb::new(0, 0, 0),
+    text: Rgb::new(0, 0, 0),
+    text_dim: Rgb::new(0, 0, 0),
+    text_faint: Rgb::new(0, 0, 0),
+    border: Rgb::new(0, 0, 0),
+    border_focus: Rgb::new(0, 0, 0),
+    working: Rgb::new(0, 0, 0),
+    blocked: Rgb::new(0, 0, 0),
+    done: Rgb::new(0, 0, 0),
+    idle: Rgb::new(0, 0, 0),
+    unknown: Rgb::new(0, 0, 0),
+    serving: Rgb::new(0, 0, 0),
+    ok: Rgb::new(0, 0, 0),
+    warn: Rgb::new(0, 0, 0),
+    error: Rgb::new(0, 0, 0),
+    selection: Rgb::new(0, 0, 0),
+};
 
 impl Theme {
     /// horde's own palette: cool slate ground, mint accent, amber/coral for agent states.
@@ -143,7 +228,22 @@ impl Theme {
             },
             inherit_terminal: false,
             space_accent_overrides: [None; SPACE_ACCENTS],
+            // Stand-in only: `derive_syntax` below replaces it before this returns. Every
+            // other constructor copies this theme and *then* changes `ansi` and `ui`, so a
+            // palette computed at the literal would describe horde's colours in gruvbox.
+            syntax: Syntax::from(&UI_PLACEHOLDER, &ANSI_PLACEHOLDER),
         }
+        .derive_syntax()
+    }
+
+    /// Recompute the syntax palette from the theme's own colours.
+    ///
+    /// Called after a theme is built rather than inside each constructor, because the
+    /// derived themes change their palette after copying horde's and would otherwise carry
+    /// horde's syntax colours into a window painted in gruvbox.
+    fn derive_syntax(mut self) -> Theme {
+        self.syntax = Syntax::from(&self.ui, &self.ansi);
+        self
     }
 
     pub fn tokyo_night() -> Theme {
@@ -186,7 +286,7 @@ impl Theme {
         t.ui.idle = rgb(0x56, 0x5f, 0x89);
         t.ui.serving = rgb(0x7d, 0xcf, 0xff);
         t.ui.selection = rgb(0x28, 0x34, 0x57);
-        t
+        t.derive_syntax()
     }
 
     pub fn catppuccin() -> Theme {
@@ -229,7 +329,7 @@ impl Theme {
         t.ui.idle = rgb(0x6c, 0x70, 0x86);
         t.ui.serving = rgb(0x89, 0xb4, 0xfa);
         t.ui.selection = rgb(0x41, 0x42, 0x59);
-        t
+        t.derive_syntax()
     }
 
     pub fn gruvbox() -> Theme {
@@ -272,7 +372,7 @@ impl Theme {
         t.ui.idle = rgb(0x92, 0x83, 0x74);
         t.ui.serving = rgb(0x83, 0xa5, 0x98);
         t.ui.selection = rgb(0x50, 0x49, 0x45);
-        t
+        t.derive_syntax()
     }
 
     /// Follow the host terminal's own ANSI palette. Cell colors that are still "default"
@@ -281,7 +381,7 @@ impl Theme {
         let mut t = Theme::horde();
         t.name = "terminal".into();
         t.inherit_terminal = true;
-        t
+        t.derive_syntax()
     }
 
     /// The colours projects are tinted with, in assignment order.
@@ -301,14 +401,16 @@ impl Theme {
     }
 
     pub fn by_name(name: &str) -> Option<Theme> {
-        Some(match name {
-            "horde" => Theme::horde(),
-            "tokyo-night" => Theme::tokyo_night(),
-            "catppuccin" => Theme::catppuccin(),
-            "gruvbox" => Theme::gruvbox(),
-            "terminal" => Theme::terminal(),
-            _ => return None,
-        })
+        Some(
+            match name {
+                "horde" => Theme::horde(),
+                "tokyo-night" => Theme::tokyo_night(),
+                "catppuccin" => Theme::catppuccin(),
+                "gruvbox" => Theme::gruvbox(),
+                "terminal" => Theme::terminal(),
+                _ => return None,
+            }
+        )
     }
 
     pub fn names() -> &'static [&'static str] {

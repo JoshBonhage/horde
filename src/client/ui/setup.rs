@@ -57,12 +57,11 @@ impl Step {
             ],
             Step::Languages => &[
                 "The editor recognises a file by its extension and colours it",
-                "accordingly.",
+                "accordingly. These are the languages this build understands:",
                 "",
-                "Markdown is always on, since that is what notes are. The rest",
-                "are the languages horde highlights when you open code — each",
-                "costs a little of the binary, so the list is yours to keep",
-                "short.",
+                // Filled in from the build itself below — asking you to choose
+                // would be a question nothing could act on, since grammars are
+                // compiled in rather than loaded.
             ],
             Step::Unattended => &[
                 "horde can start and nudge agents while nobody is attached: on",
@@ -87,8 +86,6 @@ impl Step {
 #[derive(Debug, Clone)]
 pub struct Answers {
     pub vault: String,
-    /// Languages beyond markdown, which is never optional.
-    pub languages: Vec<(&'static str, bool)>,
     pub unattended: bool,
     /// Which choice on the current step is highlighted.
     pub cursor: usize,
@@ -102,17 +99,6 @@ impl Default for Answers {
                 .join("notes")
                 .to_string_lossy()
                 .to_string(),
-            // The common ones on, the long tail off. Each is a real cost in binary size, so
-            // the default is "what most people open", not "everything".
-            languages: vec![
-                ("rust", true),
-                ("typescript / javascript", true),
-                ("python", true),
-                ("toml / json / yaml", true),
-                ("bash", false),
-                ("go", false),
-                ("c / c++", false),
-            ],
             unattended: false,
             cursor: 0,
         }
@@ -122,12 +108,11 @@ impl Default for Answers {
 impl Answers {
     /// The config the walkthrough would write.
     pub fn to_config(&self) -> String {
-        let langs: Vec<&str> =
-            self.languages.iter().filter(|(_, on)| *on).map(|(n, _)| *n).collect();
+        let langs = crate::client::syntax::available();
         format!(
             "# Written by horde's setup walkthrough. Yours to edit.\n\n\
              [vault]\nhome = \"{}\"\n\n\
-             # Languages the editor highlights: {}\n\
+             # Languages this build highlights: {}\n\
              [triggers]\nunattended = {}\n",
             self.vault,
             if langs.is_empty() { "markdown only".to_string() } else { langs.join(", ") },
@@ -137,27 +122,35 @@ impl Answers {
 }
 
 /// How many choices the step offers, for cursor bounds.
-pub fn choices(step: Step, a: &Answers) -> usize {
+pub fn choices(step: Step, _a: &Answers) -> usize {
     match step {
         Step::Vault => 1,
-        Step::Languages => a.languages.len(),
+        Step::Languages => 0,
         Step::Unattended => 2,
         Step::Done => 0,
     }
 }
 
 /// The lines of the choice area, and which are selectable.
-pub fn choice_lines(step: Step, a: &Answers) -> Vec<String> {
+pub fn choice_lines(step: Step, _a: &Answers) -> Vec<String> {
     match step {
-        Step::Vault => vec![format!("  {}", a.vault)],
-        Step::Languages => a
-            .languages
-            .iter()
-            .map(|(name, on)| format!("  [{}] {name}", if *on { "x" } else { " " }))
-            .collect(),
+        Step::Vault => vec![format!("  {}", _a.vault)],
+        Step::Languages => {
+            let langs = crate::client::syntax::available();
+            let mut out: Vec<String> = if langs.is_empty() {
+                vec!["  none — this build was made without language features".into()]
+            } else {
+                langs.chunks(3).map(|row| format!("  {}", row.join("   "))).collect()
+            };
+            out.push(String::new());
+            out.push("  Grammars are compiled in, so this is a property of the".into());
+            out.push("  binary rather than a setting. A smaller build is".into());
+            out.push("  `--no-default-features`, plus the ones you want.".into());
+            out
+        }
         Step::Unattended => vec![
-            format!("  ({}) leave it off", if a.unattended { " " } else { "•" }),
-            format!("  ({}) let horde act on its own", if a.unattended { "•" } else { " " }),
+            format!("  ({}) leave it off", if _a.unattended { " " } else { "•" }),
+            format!("  ({}) let horde act on its own", if _a.unattended { "•" } else { " " }),
         ],
         Step::Done => Vec::new(),
     }
@@ -263,7 +256,6 @@ mod tests {
     fn every_step_has_a_default_already_chosen() {
         let a = Answers::default();
         assert!(a.vault.ends_with("notes"), "somewhere obvious: {}", a.vault);
-        assert!(a.languages.iter().any(|(_, on)| *on), "some languages start on");
         assert!(!a.unattended, "and acting alone starts off, because that is the safe side");
 
         for step in Step::all() {
@@ -291,11 +283,17 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The step reports rather than asks. Grammars are compiled in, so a question about
+    /// which to enable would be one the answer could not act on — and a walkthrough that
+    /// collects a preference nothing reads is a walkthrough that lies politely.
     #[test]
-    fn the_languages_step_shows_what_is_on() {
-        let a = Answers::default();
-        let lines = choice_lines(Step::Languages, &a);
-        assert!(lines.iter().any(|l| l.contains("[x] rust")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("[ ] go")), "{lines:?}");
+    fn the_languages_step_reports_what_the_build_actually_has() {
+        let lines = choice_lines(Step::Languages, &Answers::default());
+        let text = lines.join(" ");
+        for lang in crate::client::syntax::available() {
+            assert!(text.contains(lang), "{lang} is missing from {text:?}");
+        }
+        assert!(text.contains("compiled in"), "and it says why it is not a setting");
+        assert_eq!(choices(Step::Languages, &Answers::default()), 0, "nothing to choose");
     }
 }

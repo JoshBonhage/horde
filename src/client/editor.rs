@@ -21,6 +21,9 @@ pub struct Buffer {
     /// The column to return to when moving up or down through short lines, so a cursor
     /// walking down a ragged paragraph keeps the column you actually asked for.
     goal: usize,
+    /// Bumped by every edit. Highlighting a file costs milliseconds and a frame costs
+    /// microseconds, so the drawing side keeps its answer until this changes.
+    pub rev: usize,
 }
 
 impl Buffer {
@@ -29,7 +32,7 @@ impl Buffer {
         if lines.is_empty() {
             lines.push(String::new());
         }
-        Buffer { lines, line: 0, col: 0, dirty: false, goal: 0 }
+        Buffer { lines, line: 0, col: 0, dirty: false, goal: 0, rev: 0 }
     }
 
     pub fn text(&self) -> String {
@@ -54,6 +57,7 @@ impl Buffer {
         self.col += 1;
         self.goal = self.col;
         self.dirty = true;
+        self.rev += 1;
     }
 
     pub fn newline(&mut self) {
@@ -64,6 +68,7 @@ impl Buffer {
         self.col = 0;
         self.goal = 0;
         self.dirty = true;
+        self.rev += 1;
     }
 
     /// Delete backwards, joining lines when the cursor is at the start of one.
@@ -83,6 +88,7 @@ impl Buffer {
         }
         self.goal = self.col;
         self.dirty = true;
+        self.rev += 1;
     }
 
     pub fn delete(&mut self) {
@@ -91,10 +97,12 @@ impl Buffer {
             let end = self.byte_at(self.line, self.col + 1);
             self.lines[self.line].replace_range(start..end, "");
             self.dirty = true;
+        self.rev += 1;
         } else if self.line + 1 < self.lines.len() {
             let next = self.lines.remove(self.line + 1);
             self.lines[self.line].push_str(&next);
             self.dirty = true;
+        self.rev += 1;
         }
     }
 

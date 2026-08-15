@@ -5,6 +5,7 @@
 
 pub mod editor;
 pub mod graph;
+pub mod syntax;
 mod input;
 pub mod menu;
 pub mod roster;
@@ -173,6 +174,11 @@ pub struct App {
     pub files: Option<crate::proto::FileList>,
     /// What the setup walkthrough has been told.
     pub setup: ui::setup::Answers,
+    /// Syntax highlighting for the open buffer, and the revision it was computed at.
+    ///
+    /// Cached because highlighting a file is milliseconds and a frame is microseconds: a
+    /// highlighter run on every keystroke would make a fast editor feel like a slow one.
+    pub highlight: Option<(usize, Vec<ratatui::text::Line<'static>>)>,
     /// The note being written, alive only while the editor is open.
     pub buffer: Option<editor::Buffer>,
     /// The graph layout, alive only while the graph is open.
@@ -231,6 +237,7 @@ impl App {
             want_files: false,
             files: None,
             setup: ui::setup::Answers::default(),
+            highlight: None,
             buffer: None,
             sim: None,
             graph_zoom: 1.0,
@@ -1147,11 +1154,6 @@ fn handle_key(
                 }
                 KeyCode::Up | KeyCode::BackTab => {
                     app.setup.cursor = app.setup.cursor.saturating_sub(1)
-                }
-                KeyCode::Char(' ') if step == Step::Languages => {
-                    if let Some(l) = app.setup.languages.get_mut(app.setup.cursor) {
-                        l.1 = !l.1;
-                    }
                 }
                 KeyCode::Char(' ') if step == Step::Unattended => {
                     app.setup.unattended = app.setup.cursor == 1

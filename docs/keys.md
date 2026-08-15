@@ -107,8 +107,22 @@ version history, and binaries are skipped. It is not a full `.gitignore` impleme
 just the directories that are output in every language — and it stops at a few thousand
 files rather than pretending to offer a list nobody could pick from.
 
-Editing a project file is the same editor notes use, minus the live preview, which is a
-markdown idea and would happily read `**p` in C as bold text.
+Editing a project file is the same editor notes use, minus the live preview — that is a
+markdown idea and would happily read `**p` in C as bold text. Code gets **syntax colouring**
+instead: comments, keywords, types, strings and numbers, in the colours of whichever theme
+you are running, so a window painted in gruvbox does not have somebody else's editor inside
+it.
+
+Which languages a build understands is a property of the binary, not a setting: grammars are
+compiled in. `horde status` lists them. The default build knows markdown, rust, typescript,
+tsx, javascript, python, json, toml and bash, and costs about 6.6 MB for the privilege — a
+build that only wants notes is
+
+```sh
+cargo build --release --no-default-features --features lang-markdown
+```
+
+which comes out around half the size.
 
 ## Notes
 

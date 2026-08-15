@@ -291,15 +291,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             let markdownish = path.rsplit('.').next().is_some_and(|e| {
                 matches!(e.to_ascii_lowercase().as_str(), "md" | "markdown" | "mdx")
             });
+            // Code gets colour instead. Recomputed only when the text changes, which is what
+            // keeps typing feeling like typing.
+            if !markdownish {
+                let rev = app.buffer.as_ref().map(|b| b.rev).unwrap_or(0);
+                let stale = app.highlight.as_ref().is_none_or(|(r, _)| *r != rev);
+                if stale {
+                    let text = app.buffer.as_ref().map(|b| b.text()).unwrap_or_default();
+                    app.highlight = crate::client::syntax::highlight(path, &text, &theme2)
+                        .map(|lines| (rev, lines));
+                }
+            }
             for (i, line) in buf.lines.iter().skip(scroll).take(rows as usize).enumerate() {
                 let n = scroll + i;
-                let rendered = if n == buf.line || !markdownish {
+                let rendered = if markdownish && n != buf.line {
+                    markdown::live_line(line, &theme2)
+                } else if let Some(hl) =
+                    app.highlight.as_ref().and_then(|(_, ls)| ls.get(n)).filter(|_| !markdownish)
+                {
+                    hl.clone()
+                } else {
                     Line::from(ratatui::text::Span::styled(
                         line.clone(),
                         Style::default().fg(color(theme2.ui.text)).bg(color(theme2.ui.bg)),
                     ))
-                } else {
-                    markdown::live_line(line, &theme2)
                 };
                 put_line(f.buffer_mut(), x, top + i as u16, col, rendered);
             }

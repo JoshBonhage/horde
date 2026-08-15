@@ -156,6 +156,10 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             "socket": crate::config::socket_path().to_string_lossy(),
             "theme": eng.cfg.theme.name,
             "agent_manifests": eng.agents.manifest_names(),
+            // Which languages this binary can colour. Grammars are compile-time features,
+            // so "why is my Rust not highlighted" is answerable without guessing at how it
+            // was built.
+            "languages": crate::client::syntax::available(),
             // The clock triggers actually fire on. `--at 09:00` means nine *here*, and a distro
             // whose timezone was never set sits on UTC while the person setting the trigger does
             // not — which looks like triggers firing at random rather than like a wrong clock.

@@ -102,6 +102,20 @@ close_pane = "none"         # unbind
 
 Run `horde keys` for every rebindable action name.
 
+## Languages
+
+Syntax colouring is compiled in rather than configured, because a tree-sitter grammar is C
+that has to be built with the binary. `horde status` reports which languages a build has.
+
+| Build | Knows |
+|---|---|
+| default | markdown, rust, typescript, tsx, javascript, python, json, toml, bash |
+| `--no-default-features` | nothing — every file is plain text |
+| `--no-default-features --features lang-rust,lang-markdown` | just those two |
+
+The full set costs roughly 6.6 MB of binary, unevenly: typescript and tsx are 2.8 MiB of it
+and json is 8 KiB. Colours come from the theme, so nothing needs setting per language.
+
 Three binding forms, and which one you get depends on the spec:
 
 | Spec | Reached by |
