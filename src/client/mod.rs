@@ -3,7 +3,9 @@
 //! All geometry and session state comes from the daemon, so the client is free to die and
 //! come back without disturbing a single running process.
 
+pub mod clipboard;
 pub mod editor;
+pub mod image;
 pub mod graph;
 pub mod syntax;
 mod input;
@@ -362,7 +364,7 @@ pub struct App {
     /// Row hits for the note browser.
     pub notes_hits: Vec<(u16, usize)>,
     /// Row hits for the dashboard: `(y, index into its row list)`.
-    pub dashboard_hits: Vec<(u16, usize)>,
+    pub dashboard_hits: Vec<ui::dashboard::Hit>,
     /// Whether the start-screen decision has been made for this attach. Made once, on the
     /// first snapshot, so a later shape change cannot yank you back to a greeter.
     greeted: bool,
@@ -1746,59 +1748,42 @@ fn handle_key(
             let picks = ui::dashboard::selectable(&rows);
             let last = picks.len().saturating_sub(1);
             match k.code {
+                // The menu at the foot is a grid, so down is a line of it rather than one
+                // entry, and left/right mean something there. `move_sel` owns that maths —
+                // it is the only thing that knows the shape the rows are drawn in.
                 KeyCode::Char('j') | KeyCode::Down => {
-                    app.mode = Mode::Dashboard { sel: (sel + 1).min(last) }
+                    app.mode = Mode::Dashboard { sel: ui::dashboard::move_sel(&rows, sel, 1, 0) }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    app.mode = Mode::Dashboard { sel: sel.saturating_sub(1) }
+                    app.mode = Mode::Dashboard { sel: ui::dashboard::move_sel(&rows, sel, -1, 0) }
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    app.mode = Mode::Dashboard { sel: ui::dashboard::move_sel(&rows, sel, 0, -1) }
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    app.mode = Mode::Dashboard { sel: ui::dashboard::move_sel(&rows, sel, 0, 1) }
                 }
                 KeyCode::Char('g') | KeyCode::Home => app.mode = Mode::Dashboard { sel: 0 },
                 KeyCode::Char('G') | KeyCode::End => app.mode = Mode::Dashboard { sel: last },
                 // Acts *and* leaves, like every other list in horde.
                 KeyCode::Enter => {
-                    let row = picks.get(sel).map(|i| rows[*i].clone());
-                    if let Some(cmd) = row.as_ref().and_then(dashboard_activate) {
-                        let _ = out.send(ClientFrame::Command(cmd));
+                    if let Some(row) = picks.get(sel).map(|i| rows[*i].clone()) {
+                        return dashboard_open(app, row, out);
                     }
-                    // Opening a project shows you the project: its files, to pick one and
-                    // edit it. The multiplexer is a keystroke from there rather than the
-                    // thing you have to go through to reach anything.
-                    //
-                    // An agent that needs you is the exception — that row is a pane, and
-                    // the whole point of choosing it is to go and look at it.
-                    app.mode = match row {
-                        Some(ui::dashboard::Row::Attention { .. }) | None => Mode::Terminal,
-                        Some(_) => {
-                            // Asked for on the next snapshot rather than now: focusing a
-                            // space is a round trip, and a listing requested before it lands
-                            // is a listing of the project you just left.
-                            app.files = None;
-                            app.want_files = true;
-                            Mode::Files { query: String::new(), sel: 0 }
-                        }
-                    };
-                }
-                // The quote is "push P for project", and the habit is lower case, so both.
-                KeyCode::Char('p') | KeyCode::Char('P') => {
-                    app.mode = Mode::SpaceSwitcher { query: String::new(), sel: 0 }
-                }
-                KeyCode::Char('n') => {
-                    let _ = out.send(ClientFrame::Command(Cmd::NewSpace { name: None }));
                     app.mode = Mode::Terminal;
                 }
-                // The note side, straight from the menu. It never touches the multiplexer:
-                // writing a note is not a thing you should have to open a terminal to do.
-                KeyCode::Char('w') => return run_action(app, Action::NoteNew, out),
-                KeyCode::Char('N') => return run_action(app, Action::Notes, out),
-                KeyCode::Char('o') => return run_action(app, Action::Roster, out),
-                KeyCode::Char('D') => return run_action(app, Action::Cmd(Cmd::RequestDigest), out),
-                KeyCode::Char('.') => return run_action(app, Action::Settings, out),
-                KeyCode::Char('?') => return run_action(app, Action::Help, out),
-                // A greeter's `q` leaves the program, which is what every editor start screen
-                // has taught. Elsewhere in horde `q` backs out of a view; here there is no
-                // deeper place to back out to.
-                KeyCode::Char('q') => return run_action(app, Action::Detach, out),
-                KeyCode::Esc => app.mode = Mode::Terminal,
+                // The quote is "push P for project", and the habit is lower case, so both.
+                KeyCode::Char('P') => {
+                    return dashboard_act(app, ui::dashboard::Act::Projects, out)
+                }
+                KeyCode::Esc => return dashboard_act(app, ui::dashboard::Act::Terminal, out),
+                // Everything else the greeter answers to is a line on its menu, so the menu
+                // is what decides which key does what.
+                KeyCode::Char(c) => {
+                    if let Some(a) = ui::dashboard::Act::from_key(c) {
+                        return dashboard_act(app, a, out);
+                    }
+                }
                 _ => {}
             }
             return Ok(());
@@ -2606,6 +2591,13 @@ fn editor_insert(
             completion_ask(app, out, path, project);
             return Some(Vim::Insert);
         }
+        // Paste a picture. A terminal never delivers image bytes through paste itself — the
+        // clipboard has to be asked for directly — so this is a key rather than something
+        // that happens when you press the paste you already know.
+        (KeyCode::Char('v'), true) => {
+            paste_image(app, out, path, project);
+            return Some(Vim::Insert);
+        }
         // esc leaves *insert*, not the note. That is the whole reason for having modes: the
         // way out of the editor is `:q`, or one more esc.
         (KeyCode::Esc, _) => {
@@ -2693,6 +2685,50 @@ fn editor_insert(
         }
     }
     Some(Vim::Insert)
+}
+
+/// Put the clipboard's picture in the vault and link it from here.
+///
+/// The link goes in whether or not the write lands, and deliberately: a missing attachment
+/// renders as a named placeholder, which is a thing you can see and fix. Text that silently
+/// did not appear is not.
+fn paste_image(
+    app: &mut App,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+    path: &str,
+    project: bool,
+) {
+    // A note's attachment goes in the vault. A code file has no vault to put one in, and
+    // scattering PNGs through a source tree is not a thing to do on a keystroke.
+    if project {
+        app.toast(NoticeLevel::Info, "pictures go in notes, not in project files");
+        return;
+    }
+    let Some(bytes) = clipboard::image() else {
+        app.toast(NoticeLevel::Info, "no picture on the clipboard");
+        return;
+    };
+    let Some(space) = app.snapshot.as_ref().and_then(|s| s.focused_space) else { return };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = clipboard::attachment_name(path, stamp);
+
+    let _ = out.send(ClientFrame::Command(Cmd::Attach {
+        space,
+        name: name.clone(),
+        bytes,
+    }));
+    // An embed, in the vault's own vocabulary — the same `![[...]]` Obsidian writes, so a
+    // note pasted into here opens correctly over there.
+    if let Some(b) = app.buffer.as_mut() {
+        for c in format!("![[{name}]]").chars() {
+            b.insert(c);
+        }
+        b.newline();
+    }
+    app.toast(NoticeLevel::Info, format!("attached {name}"));
 }
 
 /// Ask what could go here.
@@ -3103,7 +3139,80 @@ fn dashboard_activate(row: &ui::dashboard::Row) -> Option<Cmd> {
         ui::dashboard::Row::Attention { pane, .. } => Some(Cmd::FocusPane(*pane)),
         ui::dashboard::Row::Live { space, .. } => Some(Cmd::FocusSpace(*space)),
         ui::dashboard::Row::Recent { cwd, .. } => Some(Cmd::OpenProject { cwd: cwd.clone() }),
-        ui::dashboard::Row::Header(_) | ui::dashboard::Row::Hint(_) => None,
+        // The menu's entries are not a round trip to the daemon, so they go the other way —
+        // see [`dashboard_act`].
+        ui::dashboard::Row::Header(_) | ui::dashboard::Row::Action(_) => None,
+    }
+}
+
+/// Choose a dashboard row, however it was chosen: enter, or a click on the same line.
+fn dashboard_open(
+    app: &mut App,
+    row: ui::dashboard::Row,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+) -> Result<()> {
+    if let ui::dashboard::Row::Action(a) = row {
+        return dashboard_act(app, a, out);
+    }
+    if let Some(cmd) = dashboard_activate(&row) {
+        let _ = out.send(ClientFrame::Command(cmd));
+    }
+    // Opening a project shows you the project: its files, to pick one and edit it. The
+    // multiplexer is a keystroke from there rather than the thing you have to go through to
+    // reach anything.
+    //
+    // An agent that needs you is the exception — that row is a pane, and the whole point of
+    // choosing it is to go and look at it.
+    app.mode = match row {
+        ui::dashboard::Row::Live { .. } | ui::dashboard::Row::Recent { .. } => {
+            // Asked for on the next snapshot rather than now: focusing a space is a round
+            // trip, and a listing requested before it lands is a listing of the project you
+            // just left.
+            app.files = None;
+            app.want_files = true;
+            Mode::Files { query: String::new(), sel: 0 }
+        }
+        _ => Mode::Terminal,
+    };
+    Ok(())
+}
+
+/// Run one entry from the start screen's menu.
+///
+/// Every entry is here rather than in the key handler, so a menu line and the key printed
+/// beside it cannot come to mean different things.
+fn dashboard_act(
+    app: &mut App,
+    act: ui::dashboard::Act,
+    out: &mpsc::UnboundedSender<ClientFrame>,
+) -> Result<()> {
+    use ui::dashboard::Act;
+    match act {
+        Act::Projects => {
+            app.mode = Mode::SpaceSwitcher { query: String::new(), sel: 0 };
+            Ok(())
+        }
+        Act::NewProject => {
+            let _ = out.send(ClientFrame::Command(Cmd::NewSpace { name: None }));
+            app.mode = Mode::Terminal;
+            Ok(())
+        }
+        // The note side never touches the multiplexer: writing a note is not a thing you
+        // should have to open a terminal to do.
+        Act::WriteNote => run_action(app, Action::NoteNew, out),
+        Act::Notes => run_action(app, Action::Notes, out),
+        Act::Roster => run_action(app, Action::Roster, out),
+        Act::Digest => run_action(app, Action::Cmd(Cmd::RequestDigest), out),
+        Act::Settings => run_action(app, Action::Settings, out),
+        Act::Keys => run_action(app, Action::Help, out),
+        Act::Terminal => {
+            app.mode = Mode::Terminal;
+            Ok(())
+        }
+        // A greeter's `q` leaves the program, which is what every editor start screen has
+        // taught. Elsewhere in horde `q` backs out of a view; here there is no deeper place
+        // to back out to.
+        Act::Detach => run_action(app, Action::Detach, out),
     }
 }
 
@@ -3382,17 +3491,18 @@ fn handle_mouse(
     }
 
     // Clicks on the start screen open the row under the pointer, the same rows `j` walks.
+    // The menu's line holds several of them side by side, so the column matters too.
     if let Mode::Dashboard { .. } = app.mode {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if let Some((_, row)) = app.dashboard_hits.iter().find(|(hy, _)| *hy == y).copied() {
+            let hit = app.dashboard_hits.iter().find(|h| h.y == y && h.x.contains(&m.column));
+            if let Some(row) = hit.map(|h| h.row) {
                 let rows = app
                     .snapshot
                     .as_ref()
                     .map(|s| ui::dashboard::rows(s, ui::now_millis()))
                     .unwrap_or_default();
-                if let Some(cmd) = rows.get(row).and_then(dashboard_activate) {
-                    let _ = out.send(ClientFrame::Command(cmd));
-                    app.mode = Mode::Terminal;
+                if let Some(row) = rows.get(row).cloned() {
+                    return dashboard_open(app, row, out);
                 }
             }
         }

@@ -18,7 +18,7 @@ use super::{color, fill, logo, put_line, truncate};
 use crate::proto::{AgentState, PaneId, RecentProject, Snapshot, SpaceId};
 use crate::theme::Theme;
 
-/// One line of the dashboard. Headers and hints are scenery; the rest can be selected.
+/// One line of the dashboard. Headers are scenery; the rest can be selected.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     Header(String),
@@ -28,15 +28,104 @@ pub enum Row {
     Live { space: SpaceId, name: String, accent: u8, facts: String, cwd: String },
     /// A project this session has opened before, not open now.
     Recent { cwd: String, name: String, when: String },
-    Hint(String),
+    /// Something the start screen can do, rather than somewhere it can take you.
+    Action(Act),
 }
 
 impl Row {
-    /// Whether the cursor can land here. Headers and hints cannot be chosen.
+    /// Whether the cursor can land here. Headers cannot be chosen.
     pub fn selectable(&self) -> bool {
-        matches!(self, Row::Attention { .. } | Row::Live { .. } | Row::Recent { .. })
+        matches!(
+            self,
+            Row::Attention { .. } | Row::Live { .. } | Row::Recent { .. } | Row::Action(_)
+        )
     }
 }
+
+/// The menu at the foot of the start screen.
+///
+/// Three to a line with the key beside each, wrapping onto as many lines as it takes — a
+/// block you can take in at a glance, rather than the run of keys set as prose that this
+/// replaced. Each entry is walkable with the cursor as well as typeable, so the menu teaches
+/// the key while staying usable before you have learnt it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    Projects,
+    NewProject,
+    WriteNote,
+    Notes,
+    Roster,
+    Digest,
+    Settings,
+    Keys,
+    Terminal,
+    Detach,
+}
+
+impl Act {
+    /// In menu order: the note side and the multiplexer first, then the ways out.
+    pub fn all() -> [Act; 10] {
+        [
+            Act::Projects,
+            Act::NewProject,
+            Act::WriteNote,
+            Act::Notes,
+            Act::Roster,
+            Act::Digest,
+            Act::Settings,
+            Act::Keys,
+            Act::Terminal,
+            Act::Detach,
+        ]
+    }
+
+    /// The key that runs it without walking the list.
+    pub fn key(&self) -> &'static str {
+        match self {
+            Act::Projects => "p",
+            Act::NewProject => "n",
+            Act::WriteNote => "w",
+            Act::Notes => "N",
+            Act::Roster => "o",
+            Act::Digest => "D",
+            Act::Settings => ".",
+            Act::Keys => "?",
+            Act::Terminal => "esc",
+            Act::Detach => "q",
+        }
+    }
+
+    /// The typed key that reaches this entry, if there is one. Keeps the list and the key
+    /// handler from drifting apart: the menu is the source of both.
+    pub fn from_key(c: char) -> Option<Act> {
+        Act::all().into_iter().find(|a| a.key().chars().eq(std::iter::once(c)))
+    }
+
+    /// Short by necessity: three of these share a line, so a label that needs a sentence
+    /// would either truncate or push the columns apart.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Act::Projects => "Switch project",
+            Act::NewProject => "New project",
+            Act::WriteNote => "Write a note",
+            Act::Notes => "Browse notes",
+            Act::Roster => "Agent roster",
+            Act::Digest => "Catch-up digest",
+            Act::Settings => "Settings",
+            Act::Keys => "Keys",
+            Act::Terminal => "Terminal",
+            Act::Detach => "Detach",
+        }
+    }
+}
+
+/// How many entries share a line.
+///
+/// Three, because the menu is a block you take in at a glance rather than a list you read:
+/// ten single-file lines under the session made the screen mostly menu. Whatever does not
+/// fit on the first line wraps to the next, so the shape holds however many entries there
+/// come to be.
+pub const MENU_COLS: usize = 3;
 
 /// How long ago, in the roughest useful units. "3d" beats a timestamp on a screen you are
 /// scanning rather than reading.
@@ -123,12 +212,45 @@ pub fn rows(snap: &Snapshot, now: u64) -> Vec<Row> {
         }
     }
 
-    // Two halves of the system, named as such. The multiplexer is one of them, not the
-    // thing the other lives inside.
-    out.push(Row::Hint("enter opens a project's files   w write a note   N notes".into()));
-    out.push(Row::Hint("p projects   n new project   o roster   D digest   . settings".into()));
-    out.push(Row::Hint("esc to the terminal   q detach".into()));
+    // Everything above this is somewhere to go; everything below is something to do.
+    out.push(Row::Header("actions".into()));
+    out.extend(Act::all().into_iter().map(Row::Action));
     out
+}
+
+/// Where the menu starts: the header above the first action, or the end of the list.
+pub fn menu_start(rows: &[Row]) -> usize {
+    rows.iter()
+        .position(|r| matches!(r, Row::Action(_)))
+        .map(|i| i.saturating_sub(1))
+        .unwrap_or(rows.len())
+}
+
+/// Lines the menu takes on screen: its header, plus one per row of [`MENU_COLS`] entries.
+fn menu_lines(rows: &[Row]) -> usize {
+    let n = rows.iter().filter(|r| matches!(r, Row::Action(_))).count();
+    if n == 0 { 0 } else { 1 + n.div_ceil(MENU_COLS) }
+}
+
+/// Which of the rows above the menu are shown, on a screen too short for all of them.
+///
+/// The menu itself is never dropped — it is the part of this screen you came here to use,
+/// and a menu that falls off the bottom when a session gets busy is a menu you cannot rely
+/// on. The listing above it scrolls instead, keeping the cursor in view.
+pub fn window(rows: &[Row], height: u16, cursor: Option<usize>) -> std::ops::Range<usize> {
+    let start = menu_start(rows);
+    let room = (height as usize).saturating_sub(menu_lines(rows));
+    if start <= room {
+        return 0..start;
+    }
+    // Scroll only as far as the cursor demands, so the top of the listing stays put while
+    // it can.
+    let first = match cursor {
+        // A cursor down in the menu says nothing about where the listing should sit.
+        Some(c) if c >= room && c < start => (c + 1 - room).min(start - room),
+        _ => 0,
+    };
+    first..(first + room).min(start)
 }
 
 /// Indices of the rows a cursor may sit on.
@@ -136,14 +258,60 @@ pub fn selectable(rows: &[Row]) -> Vec<usize> {
     rows.iter().enumerate().filter(|(_, r)| r.selectable()).map(|(i, _)| i).collect()
 }
 
-/// Draw the whole screen. Returns the hit list: `(y, row index)` for mouse resolution.
+/// Move the cursor, in cursor positions rather than rows.
+///
+/// The session above is a column and the menu below is a grid, so the same keypress means
+/// different arithmetic depending on where the cursor is: down the listing is one step, down
+/// the menu is a whole line of it. Getting that wrong is what makes a grid feel like a list
+/// someone rearranged, so it lives here, next to the layout it has to agree with.
+pub fn move_sel(rows: &[Row], sel: usize, dy: i32, dx: i32) -> usize {
+    let picks = selectable(rows).len();
+    if picks == 0 {
+        return 0;
+    }
+    let last = picks - 1;
+    // Where the menu's entries begin among the cursor positions.
+    let menu = rows.iter().take(menu_start(rows)).filter(|r| r.selectable()).count();
+    let sel = sel.min(last);
+
+    if dx != 0 {
+        // Sideways is a menu idea; in the single-column listing there is nowhere to go.
+        if sel < menu {
+            return sel;
+        }
+        return (sel as i32 + dx).clamp(menu as i32, last as i32) as usize;
+    }
+    match dy {
+        d if d > 0 && sel + 1 < menu => sel + 1,
+        // Off the bottom of the listing, into the menu's first entry.
+        d if d > 0 && sel < menu => menu.min(last),
+        d if d > 0 => (sel + MENU_COLS).min(last),
+        d if d < 0 && sel > menu + MENU_COLS - 1 => sel - MENU_COLS,
+        // Off the top of the menu, back onto the last thing in the listing.
+        d if d < 0 && sel >= menu => menu.saturating_sub(1),
+        d if d < 0 => sel.saturating_sub(1),
+        _ => sel,
+    }
+}
+
+/// A drawn row and the cells it occupies, so a click resolves to the row the keyboard
+/// would have reached. The menu puts several rows on one line, which is why an `x` range
+/// is part of this and not just a `y`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub y: u16,
+    pub x: std::ops::Range<u16>,
+    pub row: usize,
+}
+
+/// Draw the whole screen. Returns where each row landed, for mouse resolution.
 pub fn draw(
     buf: &mut Buffer,
     area: TRect,
     theme: &Theme,
     rows_in: &[Row],
     sel: usize,
-) -> Vec<(u16, usize)> {
+) -> Vec<Hit> {
     fill(buf, area, theme.ui.bg);
     let mut hits = Vec::new();
     if area.height < 6 || area.width < 30 {
@@ -155,13 +323,21 @@ pub fn draw(
     let w = area.width.min(72);
     let x = area.x + (area.width - w) / 2;
 
+    let sel_rows = selectable(rows_in);
+    let cursor_row = sel_rows.get(sel).copied();
+    // On a short screen the listing gives way before the menu does.
+    let shown = window(rows_in, area.height.saturating_sub(2), cursor_row);
+    let lines = shown.len() + menu_lines(rows_in);
+
     // Centre the whole block vertically. A greeter pinned to the top of a tall terminal
     // leaves a third of the screen empty below it and reads as a page that failed to load.
-    let body = rows_in.len() as u16 + 2;
+    let body = lines as u16 + 2;
     let banner_room = area.height.saturating_sub(body);
     let banner_h = if banner_room >= 4 { logo::height(w, banner_room) + 2 } else { 0 };
-    let total = body + banner_h;
-    let mut y = area.y + area.height.saturating_sub(total) / 2;
+    // Centred on what is actually painted, which is the banner block less its trailing
+    // blank line — a menu long enough to matter makes an approximation here visible.
+    let painted = lines as u16 + banner_h.saturating_sub(1);
+    let mut y = area.y + area.height.saturating_sub(painted) / 2;
     if banner_h > 0 {
         y += logo::draw(buf, x, y, w, banner_room, theme);
         put_line(
@@ -177,10 +353,12 @@ pub fn draw(
         y += 2;
     }
 
-    let sel_rows = selectable(rows_in);
-    let cursor_row = sel_rows.get(sel).copied();
-
-    for (i, row) in rows_in.iter().enumerate() {
+    // The session listing, a row to a line, and the menu's heading. The menu itself is a
+    // grid rather than a column, so it is drawn after this rather than in it.
+    let start = menu_start(rows_in);
+    let heading = start..start + usize::from(menu_lines(rows_in) > 0);
+    for i in shown.chain(heading) {
+        let row = &rows_in[i];
         if y >= area.y + area.height {
             break;
         }
@@ -222,10 +400,8 @@ pub fn draw(
                     base.fg(color(theme.ui.text_faint)),
                 ),
             ],
-            Row::Hint(t) => vec![Span::styled(
-                format!("  {t}"),
-                Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.bg)),
-            )],
+            // Drawn as a grid below, not as a line here.
+            Row::Action(_) => continue,
         };
 
         if selected {
@@ -233,9 +409,42 @@ pub fn draw(
         }
         put_line(buf, x, y, w, Line::from(spans));
         if row.selectable() {
-            hits.push((y, i));
+            hits.push(Hit { y, x: x..x + w, row: i });
         }
         y += 1;
+    }
+
+    // The menu: [`MENU_COLS`] entries to a line, each one a key in its own right-aligned
+    // column so the keys line up down the block rather than hiding inside the labels.
+    let cell = w / MENU_COLS as u16;
+    for (n, i) in (start..rows_in.len()).filter(|i| matches!(rows_in[*i], Row::Action(_))).enumerate()
+    {
+        let Row::Action(a) = &rows_in[i] else { continue };
+        let (col, row_n) = (n % MENU_COLS, n / MENU_COLS);
+        let cy = y + row_n as u16;
+        if cy >= area.y + area.height {
+            break;
+        }
+        let cx = x + col as u16 * cell;
+        let selected = cursor_row == Some(i);
+        if selected {
+            fill(buf, TRect { x: cx, y: cy, width: cell, height: 1 }, theme.ui.selection);
+        }
+        let base = Style::default().bg(color(if selected { theme.ui.selection } else { theme.ui.bg }));
+        put_line(
+            buf,
+            cx,
+            cy,
+            cell,
+            Line::from(vec![
+                Span::styled(format!("  {:>3}  ", a.key()), base.fg(color(theme.ui.accent))),
+                Span::styled(
+                    truncate(a.label(), cell.saturating_sub(7) as usize),
+                    base.fg(color(theme.ui.text)),
+                ),
+            ]),
+        );
+        hits.push(Hit { y: cy, x: cx..cx + cell, row: i });
     }
     hits
 }
@@ -290,9 +499,114 @@ mod tests {
         }
         assert!(rows.iter().any(|r| r.selectable()), "there is something to select");
         assert!(
-            !rows.iter().filter(|r| r.selectable()).any(|r| matches!(r, Row::Header(_) | Row::Hint(_))),
-            "no heading or hint is ever selectable"
+            !rows.iter().filter(|r| r.selectable()).any(|r| matches!(r, Row::Header(_))),
+            "no heading is ever selectable"
         );
+    }
+
+    /// The keys are a block, not a sentence: every one of them reachable with the cursor as
+    /// well as by its key.
+    #[test]
+    fn the_menu_lists_every_action_once_and_all_of_it_walkable() {
+        let rows = rows(&snap(), 0);
+        let listed: Vec<Act> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Action(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listed, Act::all().to_vec(), "every entry, once, in order: {rows:?}");
+        assert!(
+            rows.iter().filter(|r| matches!(r, Row::Action(_))).all(|r| r.selectable()),
+            "an action you can see but not select is a key you had to already know"
+        );
+    }
+
+    /// Down the listing is one row; down the menu is a whole line of it, and sideways is
+    /// only a thing the menu has. Every entry has to stay reachable either way.
+    #[test]
+    fn the_cursor_walks_a_column_above_and_a_grid_below() {
+        let rows = rows(&snap(), 0);
+        let picks = selectable(&rows).len();
+        let menu = rows.iter().take(menu_start(&rows)).filter(|r| r.selectable()).count();
+        assert!(menu > 0 && picks > menu, "the fixture has both halves");
+
+        // The listing is a column: down is one row, and sideways is nothing.
+        assert_eq!(move_sel(&rows, 0, 1, 0), 1);
+        assert_eq!(move_sel(&rows, 0, 0, 1), 0, "there is no second column up there");
+        // Off the bottom of it lands on the menu's first entry, and back up returns.
+        assert_eq!(move_sel(&rows, menu - 1, 1, 0), menu);
+        assert_eq!(move_sel(&rows, menu, -1, 0), menu - 1);
+        // Inside the menu, down is a line of three and sideways is one entry.
+        assert_eq!(move_sel(&rows, menu, 1, 0), menu + MENU_COLS);
+        assert_eq!(move_sel(&rows, menu + MENU_COLS, -1, 0), menu);
+        assert_eq!(move_sel(&rows, menu, 0, 1), menu + 1);
+        assert_eq!(move_sel(&rows, menu, 0, -1), menu, "and stops at the left edge");
+        // Nothing walks off either end.
+        assert_eq!(move_sel(&rows, 0, -1, 0), 0);
+        assert_eq!(move_sel(&rows, picks - 1, 1, 0), picks - 1);
+        assert_eq!(move_sel(&rows, picks - 1, 0, 1), picks - 1);
+
+        // And every entry is reachable from the top by pressing down and right.
+        let mut seen = std::collections::HashSet::from([0usize]);
+        for start in 0..picks {
+            for (dy, dx) in [(1, 0), (0, 1)] {
+                seen.insert(move_sel(&rows, start, dy, dx));
+            }
+        }
+        assert_eq!(seen.len(), picks, "unreachable cursor positions: {seen:?}");
+    }
+
+    /// Two entries sharing a key would make one of them unreachable by typing.
+    #[test]
+    fn every_menu_key_is_distinct_and_resolves_back_to_its_entry() {
+        let mut seen = std::collections::HashSet::new();
+        for a in Act::all() {
+            assert!(seen.insert(a.key()), "{:?} reuses {}", a, a.key());
+            assert!(!a.label().is_empty(), "{a:?} has no label");
+            let mut chars = a.key().chars();
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                assert_eq!(Act::from_key(c), Some(a), "typing {c} must reach {a:?}");
+            }
+        }
+        assert_eq!(Act::from_key('e'), None, "an unbound key reaches nothing");
+        assert_eq!(Act::from_key('s'), None, "and so does a near miss");
+    }
+
+    /// A busy session must not push the menu off the bottom of a short terminal — that is
+    /// the part of the screen you came here to use.
+    #[test]
+    fn a_short_screen_drops_the_listing_before_the_menu() {
+        let mut s = snap();
+        s.recents = (0..12)
+            .map(|i| RecentProject {
+                name: format!("p{i}"),
+                cwd: format!("/home/j/dev/p{i}"),
+                last_used: 0,
+                live: false,
+            })
+            .collect();
+        let rows = rows(&s, 0);
+        let menu = menu_start(&rows);
+        let shown = window(&rows, 14, None);
+        assert!(shown.len() < menu, "the listing had to give way: {shown:?} of {menu}");
+        assert_eq!(shown.len() + menu_lines(&rows), 14, "and the menu keeps its room");
+        assert_eq!(menu_lines(&rows), 1 + Act::all().len().div_ceil(MENU_COLS), "header and grid");
+
+        // And when the cursor is below the fold, the listing scrolls to it.
+        let last = menu - 1;
+        let scrolled = window(&rows, 14, Some(last));
+        assert!(scrolled.contains(&last), "cursor {last} is off screen: {scrolled:?}");
+    }
+
+    /// Nothing scrolls while everything fits.
+    #[test]
+    fn a_tall_screen_shows_the_whole_listing() {
+        let rows = rows(&snap(), 0);
+        let menu = menu_start(&rows);
+        assert_eq!(window(&rows, 40, Some(0)), 0..menu);
+        assert_eq!(window(&rows, 40, Some(menu + 3)), 0..menu, "a cursor in the menu never scrolls it");
     }
 
     /// The greeter is centred and every section is present and in order. Pinned as text
@@ -313,6 +627,13 @@ mod tests {
         assert!(at("PROJECTS") < at("RECENT"), "open projects before closed ones");
         assert!(text.contains("resume"), "a closed project says what enter will do");
         assert!(text.contains("3d ago"), "and when it was last open");
+        assert!(at("RECENT") < at("ACTIONS"), "the menu sits under the session, not in it");
+
+        // Each action on its own line, key in a column of its own.
+        for a in Act::all() {
+            let line = format!("{:>3}  {}", a.key(), a.label());
+            assert!(text.contains(&line), "missing menu line {line:?}:\n{text}");
+        }
 
         let painted: Vec<u16> = (0..area.height)
             .filter(|y| (0..area.width).any(|x| buf[(x, *y)].symbol() != " "))

@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -687,6 +687,12 @@ pub enum Cmd {
     /// What could go here. Carries the buffer with it, because an answer computed against
     /// text a debounce has not sent yet would be an answer about a different file.
     Complete { space: SpaceId, path: String, body: String, line: u32, col: u32, vault: bool },
+    /// A picture pasted into a note, on its way to the vault's attachment folder.
+    ///
+    /// The bytes travel because the clipboard belongs to the machine somebody is sitting at
+    /// and the vault belongs to the daemon. A client attached from another host pastes its
+    /// own clipboard, which is the only answer that is ever right.
+    Attach { space: SpaceId, name: String, bytes: Vec<u8> },
 }
 
 // Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
@@ -1160,7 +1166,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 18, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 19, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the
@@ -1227,7 +1233,8 @@ mod digest_tests {
                 | Cmd::OpenProject { .. }
                 | Cmd::DocChanged { .. }
                 | Cmd::DocClosed { .. }
-                | Cmd::Complete { .. } => {}
+                | Cmd::Complete { .. }
+                | Cmd::Attach { .. } => {}
             }
         }
 

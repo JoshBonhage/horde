@@ -74,13 +74,21 @@ from the terminal. `ctrl+b 0` or `ctrl+space d` brings it back whenever you want
 
 | Key | Action |
 |---|---|
-| `j` `k`, arrows | walk the rows |
-| `enter` | open the row — focus a live project, reopen a remembered one |
+| `j` `k`, arrows | walk the rows — and, in the menu, `h` `l` across it |
+| `enter` | open the row — focus a live project, reopen a remembered one, run a menu entry |
 | `p` or `P` | the project picker |
 | `n` | new project |
-| `o` `D` `.` `?` | roster · digest · settings · keys |
+| `w` `N` | write a note · browse notes |
+| `o` `D` | roster · digest |
+| `.` `?` | settings · keys |
 | `esc` | drop into the terminal |
 | `q` | detach |
+
+Under the session sits **actions**: the same keys as a block, three to a line, wrapping onto
+as many lines as it takes. The cursor walks it like any other row — down moves a whole line,
+left and right move one entry — so nothing on this screen has to be remembered before it can
+be used. On a screen too short for everything the project listing scrolls, rather than the
+menu falling off the bottom.
 
 A live project shows what is running in it (`main*  2 agents  ◍1`); a remembered one says
 `resume` and how long ago. The row tells you which before you press anything, so `enter`

@@ -13,6 +13,12 @@ pub mod journal;
 pub mod layout;
 pub mod logfile;
 pub mod lsp;
+
+/// The most a pasted attachment may be.
+///
+/// Eight megabytes is a very large screenshot and a very small photograph. Anything past it
+/// is a mistake — a video frame, a raw scan — and a vault is a directory on somebody's disk.
+const MAX_ATTACHMENT: usize = 8 * 1024 * 1024;
 pub mod manifest;
 pub mod notify;
 pub mod pane;
@@ -207,6 +213,36 @@ impl Engine {
             space.lsp = self.lsp_info(space.id);
         }
         s
+    }
+
+    /// Put a pasted picture in the vault's attachment folder.
+    ///
+    /// Jailed like everything else that arrives over a socket, and capped: bytes from a
+    /// client are bytes from somewhere, and a vault is a directory on somebody's disk.
+    pub fn vault_attach(&mut self, space: SpaceId, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        if bytes.is_empty() {
+            return Err(anyhow!("nothing to attach"));
+        }
+        if bytes.len() > MAX_ATTACHMENT {
+            return Err(anyhow!(
+                "{} bytes; the limit is {MAX_ATTACHMENT}",
+                bytes.len()
+            ));
+        }
+        // The name is a filename, never a path. `safe_join` would catch a traversal anyway;
+        // this makes one impossible to express rather than merely refused.
+        let file = std::path::Path::new(name)
+            .file_name()
+            .ok_or_else(|| anyhow!("not a filename"))?
+            .to_string_lossy()
+            .to_string();
+        let root = self.vault_root_for_write(space)?;
+        let dir = root.join(crate::client::image::ATTACHMENTS);
+        std::fs::create_dir_all(&dir)?;
+        let path = vault::safe_join(&dir, &file)?;
+        std::fs::write(&path, bytes)?;
+        self.touch();
+        Ok(path)
     }
 
     /// Where a document the editor has open actually is, and what the client calls it.
@@ -1198,6 +1234,12 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
         ClientFrame::Command(Cmd::DocClosed { space, path, vault }) => {
             eng.doc_closed(space, &path, vault);
         }
+        ClientFrame::Command(Cmd::Attach { space, name, bytes }) => {
+            match eng.vault_attach(space, &name, &bytes) {
+                Ok(path) => log_line(&format!("attached {}", path.display())),
+                Err(e) => eng.notice(NoticeLevel::Warn, format!("could not attach {name}: {e}")),
+            }
+        }
         ClientFrame::Command(Cmd::Complete { space, path, body, line, col, vault }) => {
             // The buffer goes with the request rather than waiting for the debounce: an
             // answer about text the server has not been shown yet is an answer about a
@@ -1442,7 +1484,8 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         | Cmd::FileSave { .. }
         | Cmd::DocChanged { .. }
         | Cmd::DocClosed { .. }
-        | Cmd::Complete { .. } => {}
+        | Cmd::Complete { .. }
+        | Cmd::Attach { .. } => {}
         Cmd::ApplyLayout { preset } => {
             if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
                 problems.push((NoticeLevel::Warn, e.to_string()));

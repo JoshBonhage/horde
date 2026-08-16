@@ -121,10 +121,32 @@ fn code_ranges(text: &str, opts: Options) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
+/// Where a note is, so the pictures it embeds can be found.
+///
+/// `None` renders the note without them — which is what the graph's little panel wants, and
+/// what anything that has text but no idea where it came from gets.
+#[derive(Clone, Copy, Default)]
+pub struct Where<'a> {
+    /// The directory the note itself is in.
+    pub dir: Option<&'a std::path::Path>,
+    pub vault: Option<&'a std::path::Path>,
+    /// Rows an image may take. A picture that fills the screen buries the note it is in.
+    pub tall: u16,
+}
+
 /// Render `text` to styled lines wrapped at `width` columns.
 pub fn render(text: &str, width: u16, theme: &Theme) -> Rendered {
+    render_in(text, width, theme, Where::default())
+}
+
+/// The same, knowing where the note lives — so `![[shot.png]]` becomes the picture.
+pub fn render_in(text: &str, width: u16, theme: &Theme, at: Where<'_>) -> Rendered {
     let width = width.max(20) as usize;
     let mut out = Rendered { lines: Vec::new(), links: Vec::new() };
+    // An image's alt text is a description of the picture, so it is not read out beside one
+    // that is actually on screen.
+    let mut skip_alt = false;
+    let mut image_rows = 0usize;
 
     // Frontmatter is metadata, not prose. Shown as a dim key line rather than as a wall of
     // YAML: the browser already lists tags, and a reader wants the note.
@@ -319,6 +341,54 @@ pub fn render(text: &str, width: u16, theme: &Theme) -> Rendered {
             Event::End(TagEnd::Strong) => inline.bold = false,
             Event::Start(Tag::Strikethrough) => inline.strike = true,
             Event::End(TagEnd::Strikethrough) => inline.strike = false,
+            // A picture, where there is somewhere to look for it and a way to draw it.
+            //
+            // Drawn where it sits in the note rather than collected at the end, because an
+            // embed in Obsidian is part of the prose — the sentence before it is usually
+            // "here is what that looks like".
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                let target = dest_url.strip_prefix(WIKI_SCHEME).unwrap_or(&dest_url).to_string();
+                flush(&mut spans, &mut out, &prefix);
+                skip_alt = true;
+                // `![[Some Note]]` is an embed too, and arrives here as an image. horde does
+                // not transclude one note into another yet, so it says what it is and offers
+                // it as a link rather than hunting for a picture that was never there.
+                if !crate::client::image::is_image(&target) {
+                    out.links.push((out.lines.len(), target.clone()));
+                    out.lines.push(Line::from(Span::styled(
+                        format!("▸ {target}"),
+                        Style::default().fg(color(theme.ui.accent)),
+                    )));
+                    continue;
+                }
+                let drawn = crate::client::image::locate(&target, at.dir, at.vault)
+                    .filter(|_| at.tall > 0)
+                    .and_then(|p| {
+                        crate::client::image::cells(&p, width as u16, at.tall, theme)
+                    });
+                match drawn {
+                    Some(rows) => {
+                        image_rows = rows.len();
+                        out.lines.extend(rows);
+                        out.lines.push(Line::from(""));
+                    }
+                    // Named rather than silently dropped. A missing attachment is a thing to
+                    // notice — usually it means the file did not come across with the note.
+                    None => {
+                        let name = target.rsplit('/').next().unwrap_or(&target).to_string();
+                        out.lines.push(Line::from(Span::styled(
+                            format!("🖼 {name}"),
+                            Style::default().fg(color(theme.ui.text_faint)),
+                        )));
+                    }
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                skip_alt = false;
+                spans.clear();
+                let _ = image_rows;
+            }
+
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let dest = dest_url.to_string();
                 if let Some(target) = dest.strip_prefix(WIKI_SCHEME) {
@@ -338,6 +408,9 @@ pub fn render(text: &str, width: u16, theme: &Theme) -> Rendered {
                 )));
                 out.lines.push(Line::from(""));
             }
+
+            // Alt text belongs to the picture, not to the page.
+            Event::Text(_) | Event::Code(_) if skip_alt => {}
 
             Event::Text(ref t) if title_for.is_some() => {
                 let (c, kind, mut title) = title_for.take().expect("checked");
@@ -719,5 +792,46 @@ mod tests {
         assert!(text.contains("tags · status"), "{text}");
         assert!(!text.contains("[a, b]"), "the values are not the point: {text}");
         assert!(text.contains("Real"));
+    }
+
+    /// `![[shot.png]]` is a picture and `![[Some Note]]` is not, and both arrive here as the
+    /// same event. Drawing the second as a broken image is the failure worth pinning.
+    #[test]
+    fn an_embedded_picture_is_drawn_and_an_embedded_note_is_offered() {
+        let dir = std::env::temp_dir().join(format!("horde-md-img-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("attachments")).unwrap();
+        let mut img = image::RgbaImage::new(8, 4);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([200, 30, 40, 255]);
+        }
+        img.save(dir.join("attachments").join("shot.png")).unwrap();
+
+        let t = Theme::horde();
+        let at = Where { dir: Some(&dir), vault: Some(&dir), tall: 8 };
+        let out = render_in("before\n\n![[shot.png]]\n\nafter", 40, &t, at);
+        let text: Vec<String> = out
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+
+        assert!(text.iter().any(|l| l.contains('▀')), "the picture is drawn: {text:?}");
+        assert!(text.iter().any(|l| l.contains("before")) && text.iter().any(|l| l.contains("after")));
+        assert!(!text.iter().any(|l| l.contains("shot.png")), "and not named as well: {text:?}");
+
+        // A note embed is not a picture. It says what it is and can be followed.
+        let out = render_in("![[Some Note]]", 40, &t, at);
+        let text: String = out.lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.to_string()).collect();
+        assert!(text.contains("Some Note"), "{text}");
+        assert!(!text.contains('▀'), "not drawn as a broken picture: {text}");
+        assert_eq!(out.links.first().map(|(_, t)| t.as_str()), Some("Some Note"), "and followable");
+
+        // A picture that is not there is named rather than silently dropped — usually it
+        // means the file did not travel with the note.
+        let out = render_in("![[missing.png]]", 40, &t, at);
+        let text: String = out.lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.to_string()).collect();
+        assert!(text.contains("missing.png"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

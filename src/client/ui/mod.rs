@@ -560,7 +560,26 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             )),
         );
 
-        let mut rendered = markdown::render(&body, col, &theme2);
+        // Where the note is, so the pictures it embeds can be found and drawn.
+        let root = app.vault.as_ref().map(|v| std::path::PathBuf::from(&v.root));
+        let dir = app
+            .vault
+            .as_ref()
+            .and_then(|v| v.notes.first())
+            .and_then(|n| std::path::Path::new(&n.path).parent().map(|p| p.to_path_buf()))
+            .and_then(|rel| root.as_ref().map(|r| r.join(rel)));
+        let mut rendered = markdown::render_in(
+            &body,
+            col,
+            &theme2,
+            markdown::Where {
+                dir: dir.as_deref(),
+                vault: root.as_deref(),
+                // Half the reading area. A picture that fills the screen buries the note it
+                // is in, and the note is the thing you opened.
+                tall: (area.height / 2).clamp(6, 24),
+            },
+        );
 
         // The work outstanding on this note, appended to it. Here rather than in a panel
         // because it belongs to the note the way its backlinks do — and because scrolling
