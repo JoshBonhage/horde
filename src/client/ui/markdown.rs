@@ -134,12 +134,43 @@ pub struct Where<'a> {
     pub tall: u16,
 }
 
-/// Render `text` to styled lines wrapped at `width` columns.
-pub fn render(text: &str, width: u16, theme: &Theme) -> Rendered {
-    render_in(text, width, theme, Where::default())
+/// Where a note lives, owned — because [`Where`] borrows and the paths have to be somewhere.
+///
+/// Built from the reply that carried the note, so every view that renders one resolves its
+/// pictures the same way. Three places needed this and two of them had it wrong: the graph's
+/// panel drew a placeholder because it never said where the note was, and the reader's *key*
+/// handler re-renders to count lines for scrolling — so with images drawn but not counted,
+/// scrolling past one stopped early.
+#[derive(Default)]
+pub struct Home {
+    pub dir: Option<std::path::PathBuf>,
+    pub vault: Option<std::path::PathBuf>,
 }
 
-/// The same, knowing where the note lives — so `![[shot.png]]` becomes the picture.
+impl Home {
+    pub fn of(v: Option<&crate::proto::VaultReply>) -> Home {
+        let Some(v) = v else { return Home::default() };
+        let vault = std::path::PathBuf::from(&v.root);
+        let dir = v
+            .notes
+            .first()
+            .and_then(|n| std::path::Path::new(&n.path).parent())
+            .map(|rel| vault.join(rel));
+        Home { dir, vault: Some(vault) }
+    }
+
+    /// The borrowed form, with a limit on how many rows a picture may take.
+    pub fn at(&self, tall: u16) -> Where<'_> {
+        Where { dir: self.dir.as_deref(), vault: self.vault.as_deref(), tall }
+    }
+}
+
+/// Render `text` to styled lines wrapped at `width` columns, knowing where the note lives —
+/// which is what turns `![[shot.png]]` into the picture rather than into its filename.
+///
+/// There is no location-free version. Every caller that had one was either drawing a
+/// placeholder where a picture belonged, or counting lines a different way from the way they
+/// were drawn, and the second of those is a scroll that stops short of the end of a note.
 pub fn render_in(text: &str, width: u16, theme: &Theme, at: Where<'_>) -> Rendered {
     let width = width.max(20) as usize;
     let mut out = Rendered { lines: Vec::new(), links: Vec::new() };
@@ -633,7 +664,7 @@ mod tests {
     /// weight has to come from colour, boldness and a rule.
     #[test]
     fn a_heading_is_bold_accented_and_underlined_by_a_rule() {
-        let r = render("# Title\n\nbody text\n", 40, &Theme::horde());
+        let r = render_in("# Title\n\nbody text\n", 40, &Theme::horde(), Where::default());
         let s = styled(&r, "Title").expect("the heading is there");
         assert!(s.add_modifier.contains(Modifier::BOLD), "bold");
         assert_eq!(s.fg, Some(color(Theme::horde().ui.accent)), "and accented");
@@ -643,7 +674,7 @@ mod tests {
     /// Emphasis has to actually be emphasised, or the reading view is just reflowed source.
     #[test]
     fn bold_and_italic_become_real_terminal_attributes() {
-        let r = render("**strong** and *soft* and ~~gone~~\n", 60, &Theme::horde());
+        let r = render_in("**strong** and *soft* and ~~gone~~\n", 60, &Theme::horde(), Where::default());
         assert!(styled(&r, "strong").unwrap().add_modifier.contains(Modifier::BOLD));
         assert!(styled(&r, "soft").unwrap().add_modifier.contains(Modifier::ITALIC));
         assert!(styled(&r, "gone").unwrap().add_modifier.contains(Modifier::CROSSED_OUT));
@@ -656,7 +687,7 @@ mod tests {
     /// can follow it.
     #[test]
     fn a_wikilink_shows_its_text_without_the_brackets_and_is_followable() {
-        let r = render("see [[Some Note]] and [[Other|call it this]]\n", 60, &Theme::horde());
+        let r = render_in("see [[Some Note]] and [[Other|call it this]]\n", 60, &Theme::horde(), Where::default());
         let text = plain(&r);
         assert!(text.contains("Some Note"), "{text}");
         assert!(text.contains("call it this"), "the alias is what shows: {text}");
@@ -674,7 +705,7 @@ mod tests {
     /// the literal `[!warning]` a reader would have to decode.
     #[test]
     fn a_callout_becomes_a_coloured_bar_rather_than_its_own_syntax() {
-        let r = render("> [!warning] Watch out\n> the body of it\n", 60, &Theme::horde());
+        let r = render_in("> [!warning] Watch out\n> the body of it\n", 60, &Theme::horde(), Where::default());
         let text = plain(&r);
         assert!(text.contains("Watch out"), "{text}");
         assert!(!text.contains("[!warning]"), "the marker is not shown: {text}");
@@ -684,7 +715,7 @@ mod tests {
 
     #[test]
     fn lists_get_bullets_and_numbers_and_checkboxes() {
-        let r = render("- one\n- two\n\n1. first\n2. second\n\n- [x] done\n- [ ] not\n", 40, &Theme::horde());
+        let r = render_in("- one\n- two\n\n1. first\n2. second\n\n- [x] done\n- [ ] not\n", 40, &Theme::horde(), Where::default());
         let text = plain(&r);
         assert!(text.contains("• one"), "{text}");
         assert!(text.contains("1. first") && text.contains("2. second"), "{text}");
@@ -694,7 +725,7 @@ mod tests {
     /// Code is shown as written — that is the one place reflowing would be wrong.
     #[test]
     fn a_fenced_block_keeps_its_lines_and_gets_its_own_ground() {
-        let r = render("text\n\n```rust\nfn main() {\n    let x = 1;\n}\n```\n", 60, &Theme::horde());
+        let r = render_in("text\n\n```rust\nfn main() {\n    let x = 1;\n}\n```\n", 60, &Theme::horde(), Where::default());
         let text = plain(&r);
         assert!(text.contains("fn main() {"), "{text}");
         assert!(text.contains("    let x = 1;"), "indentation survives: {text}");
@@ -709,7 +740,7 @@ mod tests {
     #[test]
     fn prose_wraps_to_the_width_it_is_given() {
         let long = "word ".repeat(60);
-        let r = render(&format!("- {long}\n"), 30, &Theme::horde());
+        let r = render_in(&format!("- {long}\n"), 30, &Theme::horde(), Where::default());
         assert!(r.lines.len() > 3, "it wrapped into several lines");
         for l in &r.lines {
             assert!(l.width() <= 30, "line of {} columns: {l:?}", l.width());
@@ -721,7 +752,7 @@ mod tests {
     /// Caught by reading a real note, and cheap to catch again.
     #[test]
     fn styling_a_word_does_not_add_a_space_after_it() {
-        let r = render("Being grown into **horde-full**: a thing (~31.7k lines).\n", 100, &Theme::horde());
+        let r = render_in("Being grown into **horde-full**: a thing (~31.7k lines).\n", 100, &Theme::horde(), Where::default());
         let text = plain(&r);
         assert!(text.contains("horde-full: a thing"), "no space before the colon: {text}");
         assert!(text.contains("(~31.7k lines)"), "and none inside the parentheses: {text}");
@@ -787,7 +818,7 @@ mod tests {
     /// Frontmatter is metadata. A reader wants the note, not eight lines of YAML.
     #[test]
     fn frontmatter_collapses_to_a_single_faint_line() {
-        let r = render("---\ntags: [a, b]\nstatus: active\n---\n\n# Real\n", 40, &Theme::horde());
+        let r = render_in("---\ntags: [a, b]\nstatus: active\n---\n\n# Real\n", 40, &Theme::horde(), Where::default());
         let text = plain(&r);
         assert!(text.contains("tags · status"), "{text}");
         assert!(!text.contains("[a, b]"), "the values are not the point: {text}");

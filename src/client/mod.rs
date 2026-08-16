@@ -1533,7 +1533,17 @@ fn handle_key(
                 })
                 .unwrap_or_default();
             let width = app.snapshot.as_ref().map(|s| s.status.w).unwrap_or(80);
-            let rendered = ui::markdown::render(&body, width.saturating_sub(6).min(96), &app.cfg.theme);
+            // Rendered exactly as the drawing side renders it, images and all. Counting
+            // lines a different way from the way they are drawn is how scrolling stops short
+            // of the bottom of a note with a picture in it.
+            let rows = app.snapshot.as_ref().map(|s| s.status.y + 1).unwrap_or(24);
+            let home = ui::markdown::Home::of(app.vault.as_ref());
+            let rendered = ui::markdown::render_in(
+                &body,
+                width.saturating_sub(6).min(96),
+                &app.cfg.theme,
+                home.at((rows / 2).clamp(6, 24)),
+            );
             let page = 10;
             let max = rendered.lines.len().saturating_sub(1);
             match k.code {

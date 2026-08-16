@@ -182,7 +182,11 @@ fn preview(buf: &mut Buffer, area: TRect, theme: &Theme, p: &Preview<'_>) {
     // The note itself, rendered rather than shown as source — the same reader the full view
     // uses, so a heading looks like a heading in both.
     let text = note.body.as_deref().unwrap_or("");
-    let rendered = super::markdown::render(text, w, theme);
+    // Small, but a picture the size of a stamp still says "this note is a screenshot", which
+    // is most of what the panel is for.
+    let home = super::markdown::Home::of(Some(note));
+    let rendered =
+        super::markdown::render_in(text, w, theme, home.at((area.height / 2).clamp(3, 10)));
     let end = area.y + area.height;
     for line in rendered.lines.iter().take(end.saturating_sub(y) as usize) {
         // `markdown::render` paints on the page background; this panel has its own.
