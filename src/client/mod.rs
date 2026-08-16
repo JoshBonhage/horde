@@ -47,24 +47,58 @@ use ui::overlays::Item;
 use crate::client::roster::Focus;
 use ui::sidebar::Hit;
 
-/// Animation cadence for spinners and toast expiry.
+/// Animation cadence for spinners, toast expiry, and whatever is crossing the start screen.
 const ANIM: Duration = Duration::from_millis(110);
 /// Redraw cadence while the graph is open.
 ///
 /// Twice as often, because the graph is the one view whose whole point is that it moves, and
 /// nine frames a second reads as a slideshow. Only while it is open: the rest of horde has
-/// nothing to animate but a spinner, and paying for twenty frames a second to watch a static
-/// screen is how a terminal multiplexer ends up warming a lap.
+/// nothing to animate but a spinner and the occasional passer-by on the start screen, and
+/// paying for twenty frames a second to watch a static screen is how a terminal multiplexer
+/// ends up warming a lap.
 const ANIM_GRAPH: Duration = Duration::from_millis(50);
+/// Heartbeat for a screen with nothing moving on it.
+///
+/// A start screen between crossings is a photograph, and so is one on a terminal too small
+/// to have drawn a wordmark at all. It still wants a pulse — a toast has to expire, and the
+/// next crossing has to be noticed when it falls due — but a pulse is all it wants, and a
+/// second is well under the point where either reads as late. It also means an idle greeter
+/// now wakes nine times less often than it did before anything walked across it.
+const ANIM_STILL: Duration = Duration::from_millis(1000);
 /// How long the graph's cursor has to sit still before its note is fetched.
 const PREVIEW_SETTLE: Duration = Duration::from_millis(160);
 
-/// The cadence a mode wants.
-fn cadence(mode: &Mode) -> Duration {
-    if matches!(mode, Mode::Graph { .. }) {
-        ANIM_GRAPH
-    } else {
-        ANIM
+/// Start and stop the walk across the wordmark.
+///
+/// Here rather than at the seven places that assign `Mode::Dashboard`, six of which are the
+/// cursor moving one row: a shamble that restarted every time you pressed `j` would be a
+/// twitch rather than a walk. Matching on the variant and not the value is what makes
+/// walking the menu invisible to the animation.
+///
+/// It is also where every reason *not* to run lives — the setting, the calm switch, and
+/// leaving the screen — so nothing downstream has to ask more than whether there is a walk.
+fn sync_zombie(app: &mut App) {
+    let want = matches!(app.mode, Mode::Dashboard { .. }) && app.cfg.zombie && app.cfg.animate;
+    match (want, app.zombie.is_some()) {
+        (true, false) => app.zombie = Some(ui::zombie::Walk::new()),
+        (false, true) => {
+            app.zombie = None;
+            app.zombie_stage = None;
+        }
+        _ => {}
+    }
+}
+
+/// The cadence the client wants right now.
+///
+/// A function of the whole client rather than of the mode alone, because two screens with
+/// the same name can want different things: a start screen with something halfway across it
+/// and a start screen that is a still picture are not the same picture.
+fn cadence(app: &App) -> Duration {
+    match app.mode {
+        Mode::Graph { .. } => ANIM_GRAPH,
+        Mode::Dashboard { .. } if !app.restless() => ANIM_STILL,
+        _ => ANIM,
     }
 }
 const TOAST_LIFE: Duration = Duration::from_secs(6);
@@ -357,6 +391,15 @@ pub struct App {
     /// When the graph opened, which is what the drift is a function of. Time rather than
     /// frames, so the motion looks the same however fast the client is redrawing.
     pub graph_since: Option<Instant>,
+    /// The start screen's occasional passer-by: when its clock started, and the seed its
+    /// schedule is jittered by. `Some` exactly while the start screen is open and the
+    /// setting is on — see [`sync_zombie`], which is the only thing that writes it.
+    pub zombie: Option<ui::zombie::Walk>,
+    /// Where the wordmark was last drawn, or `None` when the terminal was too small for a
+    /// banner. Recorded by the renderer rather than recomputed here, for the reason
+    /// `graph_plot` gives — and it is also the answer to "is there anything to animate",
+    /// which is what stops the loop waking up hopefully on a screen with no stage.
+    pub zombie_stage: Option<ratatui::layout::Rect>,
     /// Whether the note beside the graph is showing.
     pub graph_panel: bool,
     /// The note the panel is showing, and which node it is for.
@@ -433,6 +476,8 @@ impl App {
             graph_plot: None,
             graph_drag: None,
             graph_since: None,
+            zombie: None,
+            zombie_stage: None,
             graph_panel: true,
             preview: None,
             preview_for: None,
@@ -475,6 +520,33 @@ impl App {
 
     pub fn focused_pane(&self) -> Option<PaneId> {
         self.snapshot.as_ref().and_then(|s| s.focused_pane)
+    }
+
+    /// Whether an agent is mid-turn, and so a spinner is turning.
+    fn working(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| {
+            s.panes
+                .iter()
+                .any(|p| p.agent.as_ref().is_some_and(|a| a.state == crate::proto::AgentState::Working))
+        })
+    }
+
+    /// Whether the start screen's passer-by is both on screen and moving.
+    ///
+    /// Both halves matter. A crossing under way with no banner drawn is a crossing happening
+    /// off stage: the clock keeps running, because the alternative is a schedule that resets
+    /// every time someone drags a window edge, but there is nothing to draw and so nothing to
+    /// wake up for.
+    fn walking(&self) -> bool {
+        self.zombie_stage.is_some() && self.zombie.is_some_and(|w| w.phase().walking())
+    }
+
+    /// Whether anything on screen changes on its own.
+    ///
+    /// The whole promise this file makes — that a still screen costs nothing — is this one
+    /// predicate being false.
+    fn restless(&self) -> bool {
+        !self.toasts.is_empty() || self.working() || self.walking()
     }
 
     fn pane_info(&self, id: PaneId) -> Option<&crate::proto::PaneInfo> {
@@ -688,15 +760,18 @@ async fn run_loop(
     mut inbound: mpsc::UnboundedReceiver<ServerFrame>,
 ) -> Result<()> {
     let mut events = spawn_event_reader();
-    let mut beat = cadence(&app.mode);
+    let mut beat = cadence(app);
     let mut anim = tokio::time::interval(beat);
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut needs_draw = true;
 
     loop {
-        // Opening or closing the graph changes how often there is anything new to draw.
-        if cadence(&app.mode) != beat {
-            beat = cadence(&app.mode);
+        // Arriving at or leaving the start screen starts and stops the walk across the
+        // wordmark, which is one of the two things that decide how often there is anything
+        // new to draw. Opening or closing the graph is the other.
+        sync_zombie(app);
+        if cadence(app) != beat {
+            beat = cadence(app);
             anim = tokio::time::interval(beat);
             anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         }
@@ -804,13 +879,9 @@ async fn run_loop(
                         }
                     }
                 }
-                // Only the spinner and elapsed timers change, and only when something is
-                // actually animating.
-                let animating = app.snapshot.as_ref().is_some_and(|s| {
-                    s.panes.iter().any(|p| p.agent.as_ref()
-                        .is_some_and(|a| a.state == crate::proto::AgentState::Working))
-                });
-                if animating || !app.toasts.is_empty() {
+                // Only the spinner, the elapsed timers and whatever is crossing the start
+                // screen change on their own — and each of them only sometimes.
+                if app.restless() {
                     needs_draw = true;
                 }
 
@@ -1414,29 +1485,30 @@ fn handle_key(
                         app.graph_centre = s.centre();
                     }
                 }
-                KeyCode::Enter => {
+                // Read it here, in horde. This used to spawn `$EDITOR` in a split, which was
+                // the right answer in phase 3 when horde had no reader of its own — and the
+                // wrong one ever since, because it drops you into an empty vim beside the
+                // graph rather than into the note.
+                //
+                // Read rather than edit, matching the note browser: arriving at a note from
+                // the graph is arriving to look at it.
+                KeyCode::Enter | KeyCode::Char('e') => {
                     // A ghost has no note to open, so enter on one does nothing rather than
                     // inventing a file the person never asked for.
-                    let node = app
-                        .vault
-                        .as_ref()
-                        .and_then(|v| v.graph.as_ref())
-                        .and_then(|g| g.nodes.get(sel))
-                        .cloned();
-                    if let Some(n) = node.filter(|n| !n.ghost) {
-                        let row = ui::notes::Row {
-                            path: n.path.clone(),
-                            title: n.label.clone(),
-                            tags: Vec::new(),
-                            backlinks: 0,
-                            depth: 0,
-                            folder: false,
-                            open: false,
-                        };
-                        open_note(app, &row, out);
+                    let node =
+                        app.graph.as_ref().and_then(|g| g.nodes.get(sel)).cloned();
+                    if let Some(n) = node.filter(|n| !n.ghost && !n.path.is_empty()) {
+                        if k.code == KeyCode::Char('e') {
+                            edit_note(app, &n.path, out);
+                        } else {
+                            read_note(app, &n.path, out);
+                        }
+                        // The layout is expensive to hold and cheap to rebuild, so it goes —
+                        // but the *mode* is now whatever the note opened into. Setting it to
+                        // the terminal here is what used to make sense when this shelled out
+                        // to `$EDITOR` in a pane, and it silently undid the reader.
                         app.sim = None;
                         app.graph = None;
-                        app.mode = Mode::Terminal;
                     }
                 }
                 _ => {}
@@ -1623,19 +1695,7 @@ fn handle_key(
                         app.follow = Some(target);
                     }
                 }
-                KeyCode::Char('e') => {
-                    let row = ui::notes::Row {
-                        path,
-                        title: String::new(),
-                        tags: Vec::new(),
-                        backlinks: 0,
-                            depth: 0,
-                            folder: false,
-                            open: false,
-                    };
-                    open_note(app, &row, out);
-                    app.mode = Mode::Terminal;
-                }
+                KeyCode::Char('e') => edit_note(app, &path, out),
                 _ => {}
             }
             return Ok(());
@@ -3148,24 +3208,6 @@ fn read_note(app: &mut App, path: &str, out: &mpsc::UnboundedSender<ClientFrame>
     app.mode = Mode::Reader { scroll: 0, link: 0 };
 }
 
-/// Open a note in `$EDITOR`, in a split beside whatever you were doing.
-///
-/// A real editor rather than one horde grew in a hurry: the knowledge layer is useful the
-/// day it can find a note, and the pane that opens is the one you already know how to use.
-/// Native buffers arrive in their own phase, and will have to earn the swap.
-fn open_note(app: &mut App, row: &ui::notes::Row, out: &mpsc::UnboundedSender<ClientFrame>) {
-    let Some(root) = app.vault.as_ref().map(|v| v.root.clone()) else { return };
-    let path = std::path::Path::new(&root).join(&row.path);
-    let editor = crate::client::settings::editor();
-    // Quoted: note names have spaces in them far more often than filenames usually do.
-    let cmd = format!("{editor} '{}'", path.to_string_lossy().replace('\'', r"'\''"));
-    let _ = out.send(ClientFrame::Command(Cmd::SpawnAgent {
-        cmd,
-        name: Some(row.title.clone()),
-        split: Some(crate::proto::Dir::Right),
-    }));
-}
-
 /// What pressing enter on a dashboard row asks the daemon to do.
 ///
 /// A live project is *focused*; a remembered one is opened, which the daemon turns into a
@@ -4597,6 +4639,102 @@ mod tests {
             graph_mouse(&mut app, mouse(kind, 10, 10), 0);
         }
         assert_eq!(app.mode, Mode::Graph { sel: 0 });
+    }
+
+    /// A start screen with nobody working: the only thing that can ask for a frame is the
+    /// passer-by, which is what these tests are about.
+    fn quiet_dashboard() -> App {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Dashboard { sel: 0 };
+        app.toasts.clear();
+        if let Some(s) = app.snapshot.as_mut() {
+            for p in &mut s.panes {
+                p.agent = None;
+            }
+        }
+        app
+    }
+
+    /// A start screen with nothing moving on it must cost nothing. That is a promise this
+    /// file makes in prose in three places and `docs/concepts.md` publishes numbers for, so
+    /// it is asserted rather than believed: through a whole cycle, the tick redraws exactly
+    /// when the schedule says something is walking, and never otherwise.
+    #[test]
+    fn a_still_start_screen_draws_nothing() {
+        let mut app = quiet_dashboard();
+        app.zombie_stage = Some(ratatui::layout::Rect::new(0, 0, 72, 10));
+        let (seed, mut secs) = (7u64, 0.0);
+        let (mut still, mut moving) = (0, 0);
+        while secs < 90.0 {
+            app.zombie =
+                Some(ui::zombie::Walk::seeded(seed, Duration::from_secs_f64(secs)));
+            let walking = ui::zombie::phase_at(seed, secs).walking();
+            assert_eq!(app.restless(), walking, "at {secs}s the client disagrees with the clock");
+            assert_eq!(
+                cadence(&app),
+                if walking { ANIM } else { ANIM_STILL },
+                "at {secs}s the beat is wrong"
+            );
+            if walking {
+                moving += 1
+            } else {
+                still += 1
+            }
+            secs += 0.5;
+        }
+        assert!(still > moving, "the screen must be still more often than not");
+    }
+
+    /// Walking the menu must not restart the walk, which is the trap `Mode::Dashboard`'s
+    /// `sel` sets: every cursor key assigns the mode afresh.
+    #[test]
+    fn moving_the_cursor_does_not_restart_the_walk() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Dashboard { sel: 0 };
+        sync_zombie(&mut app);
+        let started = app.zombie.expect("a walk on the start screen").since();
+        for key in ['j', 'k', 'G'] {
+            app.mode = Mode::Dashboard { sel: if key == 'k' { 0 } else { 1 } };
+            sync_zombie(&mut app);
+        }
+        assert_eq!(app.zombie.map(|w| w.since()), Some(started), "the clock was reset");
+    }
+
+    /// Leaving the start screen, or turning either switch off, stops everything — and there
+    /// is only one place that has to remember to.
+    #[test]
+    fn leaving_or_switching_off_stops_the_walk() {
+        let cases: [(&str, fn(&mut App)); 3] = [
+            ("left the screen", |a| a.mode = Mode::Terminal),
+            ("zombie off", |a| a.cfg.zombie = false),
+            ("animations off", |a| a.cfg.animate = false),
+        ];
+        for (why, change) in cases {
+            let mut app = quiet_dashboard();
+            sync_zombie(&mut app);
+            app.zombie_stage = Some(ratatui::layout::Rect::new(0, 0, 72, 10));
+            assert!(app.zombie.is_some(), "{why}: nothing started");
+
+            change(&mut app);
+            sync_zombie(&mut app);
+            assert!(app.zombie.is_none(), "{why}: still walking");
+            assert!(app.zombie_stage.is_none(), "{why}: the stage was left behind");
+            assert!(!app.restless(), "{why}: still asking to be redrawn");
+        }
+    }
+
+    /// A terminal too small for a wordmark has no stage, and a crossing happening off stage
+    /// must not wake the client up hopefully once a frame.
+    #[test]
+    fn a_crossing_with_no_stage_costs_nothing() {
+        let mut app = quiet_dashboard();
+        app.zombie_stage = None;
+        let mut secs = 0.0;
+        while secs < 90.0 {
+            app.zombie = Some(ui::zombie::Walk::seeded(3, Duration::from_secs_f64(secs)));
+            assert!(!app.restless(), "asked for a frame at {secs}s with nowhere to draw it");
+            secs += 0.5;
+        }
     }
 
     /// Opening horde is arriving, and arriving shows you the state of things. Every attach

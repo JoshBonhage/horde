@@ -464,7 +464,7 @@ pub fn draw(
         area.y + area.height.saturating_sub(2),
         area.width.saturating_sub(4),
         Line::from(Span::styled(
-            "drag pan   scroll zoom   click select   tab next   p note   enter open   esc close"
+            "drag pan   scroll zoom   click select   tab next   p panel   enter read   e edit   esc close"
                 .to_string(),
             Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.bg)),
         )),
