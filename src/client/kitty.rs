@@ -39,19 +39,26 @@ pub struct Place {
     pub rows: u16,
 }
 
-/// Whether this terminal draws images.
+/// Whether to hand this terminal real pixels.
 ///
-/// By name rather than by asking. The protocol has a query — send a one-pixel image and read
-/// the reply — but that means reading from the terminal during startup, racing every other
-/// thing that writes there, and having a timeout policy for terminals that never answer.
-/// The name is right for every terminal that implements this, and `HORDE_IMAGES` settles any
-/// argument in either direction.
+/// **Off unless asked for**, which is the opposite of where this started and the more honest
+/// place for it. Detecting the terminal by name is easy and being wrong about it is not
+/// symmetrical: guessing "no" costs a thumbnail, and guessing "yes" costs the picture
+/// entirely — the rows are reserved for a terminal that then draws nothing in them, so an
+/// image that used to be visible becomes a blank gap. Half blocks always work and were
+/// measured working; this path had only been proven to *emit* the right bytes, which is not
+/// the same as proving a terminal draws them.
+///
+/// `HORDE_IMAGES=1` turns it on. `horde images` says whether this terminal answers, so the
+/// answer can be evidence rather than a guess.
 pub fn supported() -> bool {
-    match std::env::var("HORDE_IMAGES").as_deref() {
-        Ok("1") | Ok("true") | Ok("kitty") => return true,
-        Ok("0") | Ok("false") | Ok("off") => return false,
-        _ => {}
-    }
+    matches!(std::env::var("HORDE_IMAGES").as_deref(), Ok("1") | Ok("true") | Ok("kitty"))
+}
+
+/// Whether the terminal *looks* like one that speaks the protocol.
+///
+/// Only a suggestion — used to tell somebody it is worth trying, never to decide for them.
+pub fn looks_capable() -> bool {
     let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
     let program = std::env::var("TERM_PROGRAM").unwrap_or_default().to_ascii_lowercase();
     term.contains("kitty")
@@ -89,6 +96,19 @@ pub fn fit(pixel_w: u32, pixel_h: u32, max_cols: u16, max_rows: u16) -> (u16, u1
     (cols, max_rows)
 }
 
+/// The same, but drawn where the cursor already is.
+///
+/// For a command run at a shell prompt, where "the top of the screen" is the wrong place and
+/// the right one is "just below what was printed".
+pub fn place_here(id: u32, png: &[u8], p: &Place) -> Vec<u8> {
+    let full = place(id, png, p);
+    // Everything after the cursor move.
+    match full.iter().position(|b| *b == b'H') {
+        Some(i) => full[i + 1..].to_vec(),
+        None => full,
+    }
+}
+
 /// The bytes to send for one placement, cursor move included.
 ///
 /// Separate from writing them so the whole protocol is testable without a terminal — which
@@ -100,18 +120,18 @@ pub fn place(id: u32, png: &[u8], p: &Place) -> Vec<u8> {
     out.extend_from_slice(format!("\x1b[{};{}H", p.y + 1, p.x + 1).as_bytes());
 
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(CHUNK).collect();
+    let split = chunks.len() > 1;
     for (i, chunk) in chunks.iter().enumerate() {
         let more = if i + 1 < chunks.len() { 1 } else { 0 };
         if i == 0 {
+            // `m` only appears when the data is actually split. A lone `m=0` is the final
+            // chunk of a transfer that never started, and terminals disagree about it.
+            let m = if split { format!(",m={more}") } else { String::new() };
             // `a=T` transmits and displays in one go. `f=100` means the payload is a PNG and
             // the terminal decodes it. `q=2` asks for silence: horde does not read replies,
             // and an unread one would land in the keyboard.
             out.extend_from_slice(
-                format!(
-                    "\x1b_Ga=T,f=100,i={id},c={},r={},q=2,m={more};",
-                    p.cols, p.rows
-                )
-                .as_bytes(),
+                format!("\x1b_Ga=T,f=100,i={id},c={},r={},q=2{m};", p.cols, p.rows).as_bytes(),
             );
         } else {
             out.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
@@ -289,7 +309,10 @@ mod tests {
         let bytes = String::from_utf8_lossy(&place(7, &png, &p)).to_string();
 
         assert!(bytes.starts_with("\x1b[10;5H"), "cursor first, one-based: {bytes:?}");
-        assert!(bytes.contains("\x1b_Ga=T,f=100,i=7,c=20,r=10,q=2,m=0;"), "{bytes:?}");
+        // No `m` at all when the data fits in one escape: a lone `m=0` is the final chunk
+        // of a transfer that never started, and terminals disagree about that.
+        assert!(bytes.contains("\x1b_Ga=T,f=100,i=7,c=20,r=10,q=2;"), "{bytes:?}");
+        assert!(!bytes.contains("m="), "unchunked, so no chunk marker: {bytes:?}");
         assert!(bytes.ends_with("\x1b\\"), "terminated: {bytes:?}");
         assert!(bytes.contains("q=2"), "silence, or the reply lands in the keyboard");
     }
@@ -306,6 +329,7 @@ mod tests {
         assert!(opens >= 4, "chunked into {opens} escapes");
         assert_eq!(bytes.matches("\x1b\\").count(), opens, "each one terminated");
         assert_eq!(bytes.matches("m=0;").count(), 1, "exactly one final chunk");
+        assert!(bytes.contains(",m=1;"), "and the first escape says more is coming");
         assert!(bytes.matches("m=1;").count() >= 3, "and the rest say more is coming");
     }
 

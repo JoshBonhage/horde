@@ -259,6 +259,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     note: app.preview.as_deref(),
                     ghost: g.nodes.get(sel).is_some_and(|n| n.ghost),
                 }),
+                &mut app.images,
             );
         }
         statusbar::StatusBar {

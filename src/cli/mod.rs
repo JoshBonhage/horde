@@ -167,6 +167,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check whether this terminal can draw real images, by drawing one.
+    ///
+    /// Detecting the protocol by name is easy and being wrong is not symmetrical: a terminal
+    /// wrongly believed capable reserves rows and draws nothing in them, so a picture that
+    /// worked becomes a blank gap. This makes the answer evidence.
+    Images,
     /// Write a note into the vault.
     ///
     /// The way an agent records something worth keeping. Notes written this way are
@@ -1021,6 +1027,56 @@ pub fn run(cmd: Command) -> Result<()> {
             }
         }
 
+        Command::Images => {
+            use std::io::Write;
+            let looks = crate::client::kitty::looks_capable();
+            let on = crate::client::kitty::supported();
+            println!("terminal:  {}", std::env::var("TERM").unwrap_or_default());
+            println!("           {}", std::env::var("TERM_PROGRAM").unwrap_or_default());
+            println!("looks capable: {}", if looks { "yes" } else { "no" });
+            println!("images on:     {}", if on { "yes (HORDE_IMAGES)" } else { "no" });
+            println!();
+
+            // Four coloured squares, big enough to be unmistakable and small enough to be
+            // obviously not a rendering artefact.
+            let mut img = image::RgbaImage::new(64, 64);
+            for (x, y, p) in img.enumerate_pixels_mut() {
+                *p = match (x < 32, y < 32) {
+                    (true, true) => image::Rgba([220, 40, 40, 255]),
+                    (false, true) => image::Rgba([40, 200, 80, 255]),
+                    (true, false) => image::Rgba([60, 90, 230, 255]),
+                    (false, false) => image::Rgba([240, 200, 40, 255]),
+                };
+            }
+            let dir = std::env::temp_dir().join(format!("horde-imgtest-{}.png", std::process::id()));
+            img.save(&dir)?;
+
+            println!("A red/green/blue/yellow square should appear below.");
+            println!();
+            let place = crate::client::kitty::Place {
+                path: dir.clone(),
+                // Wherever the cursor is; the escape moves it, so put it just below here.
+                x: 0,
+                y: 0,
+                cols: 20,
+                rows: 10,
+            };
+            let mut out = std::io::stdout();
+            if let Some((png, _, _)) = crate::client::kitty::encode(&dir) {
+                // Placed relative to the cursor rather than the screen, so it lands under
+                // this text instead of at the top of the window.
+                out.write_all(&crate::client::kitty::place_here(1, &png, &place))?;
+                out.flush()?;
+            }
+            for _ in 0..place.rows {
+                println!();
+            }
+            let _ = std::fs::remove_file(&dir);
+            println!();
+            println!("Saw it?  run horde with HORDE_IMAGES=1 for full-resolution pictures.");
+            println!("Did not? leave it unset — notes fall back to coloured half blocks,");
+            println!("         which are lower resolution but work in every terminal.");
+        }
         Command::Note { title, body, append, path, by, space } => {
             // Piped input is the point: `cargo test | horde note "Test run" --append` is the
             // shape this verb exists for, and asking for `--body` there would mean shelling

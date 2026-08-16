@@ -126,8 +126,13 @@ pub struct Preview<'a> {
     pub ghost: bool,
 }
 
-/// The note beside the graph.
-fn preview(buf: &mut Buffer, area: TRect, theme: &Theme, p: &Preview<'_>) {
+/// The note beside the graph. Returns any pictures the terminal is to draw itself.
+fn preview(
+    buf: &mut Buffer,
+    area: TRect,
+    theme: &Theme,
+    p: &Preview<'_>,
+) -> Vec<crate::client::kitty::Place> {
     fill(buf, area, theme.ui.panel_bg);
     let (x, w) = (area.x + 2, area.width.saturating_sub(3));
     let faint = Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.panel_bg));
@@ -159,7 +164,7 @@ fn preview(buf: &mut Buffer, area: TRect, theme: &Theme, p: &Preview<'_>) {
             if p.ghost { "not written yet".into() } else { "…".into() },
             faint,
         );
-        return;
+        return Vec::new();
     };
 
     // What the note is joined to, before what it says: from the graph, the connections are
@@ -188,6 +193,21 @@ fn preview(buf: &mut Buffer, area: TRect, theme: &Theme, p: &Preview<'_>) {
     let rendered =
         super::markdown::render_in(text, w, theme, home.at((area.height / 2).clamp(3, 10)));
     let end = area.y + area.height;
+    // Where the terminal draws the picture itself, the panel has to say where the rows
+    // ended up — reserving them and telling nobody is how a picture becomes a blank gap.
+    let top = y;
+    let places: Vec<crate::client::kitty::Place> = rendered
+        .images
+        .iter()
+        .filter(|pic| top + pic.line as u16 + pic.rows < end)
+        .map(|pic| crate::client::kitty::Place {
+            path: pic.path.clone(),
+            x,
+            y: top + pic.line as u16,
+            cols: pic.cols,
+            rows: pic.rows,
+        })
+        .collect();
     for line in rendered.lines.iter().take(end.saturating_sub(y) as usize) {
         // `markdown::render` paints on the page background; this panel has its own.
         let spans: Vec<Span<'static>> = line
@@ -203,6 +223,7 @@ fn preview(buf: &mut Buffer, area: TRect, theme: &Theme, p: &Preview<'_>) {
     if y < end && text.is_empty() {
         say(buf, y, "empty".into(), body);
     }
+    places
 }
 
 /// Draw the graph. Returns `(y, x, node index)` hits for the mouse.
@@ -220,6 +241,8 @@ pub fn draw(
     // Seconds since the graph opened, for the drift. Zero draws it still.
     secs: f64,
     show: Option<Preview<'_>>,
+    // Filled in with any pictures the terminal is to place itself.
+    pictures: &mut Vec<crate::client::kitty::Place>,
 ) -> Vec<(u16, u16, usize)> {
     fill(buf, area, theme.ui.bg);
     let mut hits = Vec::new();
@@ -240,7 +263,7 @@ pub fn draw(
 
     let (plot, panel) = split(area, show.is_some());
     if let (Some(rect), Some(p)) = (panel, show.as_ref()) {
-        preview(buf, rect, theme, p);
+        *pictures = preview(buf, rect, theme, p);
     }
 
     // Edges first, on their own layer, so nodes always sit on top of the lines.
@@ -485,7 +508,7 @@ mod tests {
         sim.settle(200);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &g, &sim, sel, 1.0, sim.centre(), 0, 0.0, None);
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, sel, 1.0, sim.centre(), 0, 0.0, None, &mut Vec::new());
         (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect()
@@ -558,7 +581,7 @@ mod tests {
         let start = std::time::Instant::now();
         let frames = 60;
         for f in 0..frames {
-            draw(&mut buf, area, &theme, &g, &sim, 3, 1.0, sim.centre(), 0, f as f64 * 0.05, None);
+            draw(&mut buf, area, &theme, &g, &sim, 3, 1.0, sim.centre(), 0, f as f64 * 0.05, None, &mut Vec::new());
         }
         let each = start.elapsed() / frames;
         println!("{} nodes, {} edges: {each:?} a frame", g.nodes.len(), g.edges.len());
@@ -579,7 +602,7 @@ mod tests {
         sim.settle(200);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0, 0.0, None);
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0, 0.0, None, &mut Vec::new());
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();
@@ -643,7 +666,7 @@ mod tests {
         sim.settle(300);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0, 0.0, None);
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0, 0.0, None, &mut Vec::new());
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();
@@ -666,7 +689,7 @@ mod tests {
         let sim = Sim::new(&empty);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &empty, &sim, 0, 1.0, Point { x: 0.0, y: 0.0 }, 0, 0.0, None);
+        draw(&mut buf, area, &Theme::horde(), &empty, &sim, 0, 1.0, Point { x: 0.0, y: 0.0 }, 0, 0.0, None, &mut Vec::new());
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect();
