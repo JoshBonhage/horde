@@ -217,7 +217,14 @@ impl Placed {
     /// being read does not move, so re-transmitting on every frame would turn a photograph
     /// into the most expensive thing on the screen.
     pub fn sync(&mut self, out: &mut impl Write, want: &[Place]) -> std::io::Result<()> {
-        if self.shown == want {
+        // Nothing to do only when there is nothing to show and nothing showing. Otherwise the
+        // placements are made again, every drawn frame.
+        //
+        // Not an optimisation left on the table: a placement is about forty bytes once the
+        // picture itself has been sent, and skipping it whenever the *positions* matched meant
+        // anything ratatui painted over an image was never undone. The expensive half is the
+        // transmission, and that is what is cached.
+        if self.shown.is_empty() && want.is_empty() {
             return Ok(());
         }
         // Placements go, the pictures stay. Scrolling a note moves an image every line, and
@@ -348,9 +355,14 @@ mod tests {
         placed.sync(&mut buf, &want).unwrap();
         assert!(!buf.is_empty(), "the first one goes");
 
+        // The second is made again — placements are cheap and anything drawn over an image
+        // has to be undone — but the picture itself is not sent twice.
         let mut again: Vec<u8> = Vec::new();
         placed.sync(&mut again, &want).unwrap();
-        assert!(again.is_empty(), "the second does not");
+        let again = String::from_utf8_lossy(&again).to_string();
+        assert!(again.contains("a=p,i=1"), "placed again: {again:?}");
+        assert!(!again.contains("a=T"), "but not transmitted again");
+        assert!(again.len() < 200, "and it is tiny: {} bytes", again.len());
 
         // Moving it is a change, and a change is sent — but the picture is not sent again.
         // Scrolling a note moves an image every line, and a 4K photograph is two hundred
@@ -362,6 +374,7 @@ mod tests {
         assert!(third.contains("a=p,i=1"), "pointed at, not re-sent: {third:?}");
         assert!(!third.contains("a=T"), "and no transmission: {third:?}");
         assert!(third.len() < buf.len() / 2, "so it is much smaller than the first");
+        let _ = &buf;
 
         // And nothing on screen means the clear still goes, or the last one stays up.
         let mut fourth: Vec<u8> = Vec::new();
