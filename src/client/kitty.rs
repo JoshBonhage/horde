@@ -37,6 +37,14 @@ pub struct Place {
     pub y: u16,
     pub cols: u16,
     pub rows: u16,
+    /// The band of the source image to show, in pixels: `(top, height)`.
+    ///
+    /// `None` means all of it. Cropping is what makes a picture taller than the window
+    /// scrollable: with only whole placements, an image whose top has gone off the top of the
+    /// screen cannot be drawn at all, so a note of tall screenshots shows nothing the moment
+    /// you scroll into one — while the half-block path, being ordinary lines, happily shows
+    /// you the middle of it. This is that same behaviour, in pixels.
+    pub crop: Option<(u32, u32)>,
 }
 
 /// Whether to hand this terminal real pixels.
@@ -113,12 +121,21 @@ pub fn place_here(id: u32, png: &[u8], p: &Place) -> Vec<u8> {
 ///
 /// Separate from writing them so the whole protocol is testable without a terminal — which
 /// matters more here than usual, because a malformed escape does not fail, it prints.
+///
+/// `C=1` says not to move the cursor afterwards. Without it a picture placed near the bottom
+/// walks the cursor past the last row and scrolls the screen, which in an alternate-screen
+/// application shifts everything ratatui believes it has already drawn.
 pub fn place(id: u32, png: &[u8], p: &Place) -> Vec<u8> {
     let payload = base64(png);
     let mut out = Vec::with_capacity(payload.len() + 256);
     // The image lands at the cursor, so the cursor goes first.
     out.extend_from_slice(format!("\x1b[{};{}H", p.y + 1, p.x + 1).as_bytes());
 
+    // The source rectangle, when only a band of the picture is on screen.
+    let crop = match p.crop {
+        Some((y, h)) => format!(",y={y},h={h}"),
+        None => String::new(),
+    };
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(CHUNK).collect();
     let split = chunks.len() > 1;
     for (i, chunk) in chunks.iter().enumerate() {
@@ -131,7 +148,8 @@ pub fn place(id: u32, png: &[u8], p: &Place) -> Vec<u8> {
             // the terminal decodes it. `q=2` asks for silence: horde does not read replies,
             // and an unread one would land in the keyboard.
             out.extend_from_slice(
-                format!("\x1b_Ga=T,f=100,i={id},c={},r={},q=2{m};", p.cols, p.rows).as_bytes(),
+                format!("\x1b_Ga=T,f=100,i={id},c={},r={}{crop},C=1,q=2{m};", p.cols, p.rows)
+                    .as_bytes(),
             );
         } else {
             out.extend_from_slice(format!("\x1b_Gm={more};").as_bytes());
@@ -148,8 +166,12 @@ pub fn place(id: u32, png: &[u8], p: &Place) -> Vec<u8> {
 /// hundred kilobytes of base64, and scrolling changes a placement on every line. Sending the
 /// picture again each time would make scrolling past one crawl.
 pub fn replace(id: u32, p: &Place) -> Vec<u8> {
+    let crop = match p.crop {
+        Some((y, h)) => format!(",y={y},h={h}"),
+        None => String::new(),
+    };
     format!(
-        "\x1b[{};{}H\x1b_Ga=p,i={id},c={},r={},q=2\x1b\\",
+        "\x1b[{};{}H\x1b_Ga=p,i={id},c={},r={}{crop},C=1,q=2\x1b\\",
         p.y + 1,
         p.x + 1,
         p.cols,
@@ -312,13 +334,13 @@ mod tests {
     #[test]
     fn a_placement_moves_the_cursor_then_transmits_and_displays() {
         let png = vec![0u8; 10];
-        let p = Place { path: "x.png".into(), x: 4, y: 9, cols: 20, rows: 10 };
+        let p = Place { path: "x.png".into(), x: 4, y: 9, cols: 20, rows: 10, crop: None };
         let bytes = String::from_utf8_lossy(&place(7, &png, &p)).to_string();
 
         assert!(bytes.starts_with("\x1b[10;5H"), "cursor first, one-based: {bytes:?}");
         // No `m` at all when the data fits in one escape: a lone `m=0` is the final chunk
         // of a transfer that never started, and terminals disagree about that.
-        assert!(bytes.contains("\x1b_Ga=T,f=100,i=7,c=20,r=10,q=2;"), "{bytes:?}");
+        assert!(bytes.contains("\x1b_Ga=T,f=100,i=7,c=20,r=10,C=1,q=2;"), "{bytes:?}");
         assert!(!bytes.contains("m="), "unchunked, so no chunk marker: {bytes:?}");
         assert!(bytes.ends_with("\x1b\\"), "terminated: {bytes:?}");
         assert!(bytes.contains("q=2"), "silence, or the reply lands in the keyboard");
@@ -329,7 +351,7 @@ mod tests {
     #[test]
     fn a_large_image_is_chunked_and_every_chunk_but_the_last_says_more_is_coming() {
         let png = vec![7u8; CHUNK * 3];
-        let p = Place { path: "big.png".into(), x: 0, y: 0, cols: 10, rows: 5 };
+        let p = Place { path: "big.png".into(), x: 0, y: 0, cols: 10, rows: 5, crop: None };
         let bytes = String::from_utf8_lossy(&place(1, &png, &p)).to_string();
 
         let opens = bytes.matches("\x1b_G").count();
@@ -349,7 +371,7 @@ mod tests {
         let path = dir.join("p.png");
         image::RgbaImage::new(4, 4).save(&path).unwrap();
 
-        let want = vec![Place { path: path.clone(), x: 0, y: 0, cols: 4, rows: 2 }];
+        let want = vec![Place { path: path.clone(), x: 0, y: 0, cols: 4, rows: 2, crop: None }];
         let mut placed = Placed::default();
         let mut buf: Vec<u8> = Vec::new();
         placed.sync(&mut buf, &want).unwrap();
@@ -367,7 +389,7 @@ mod tests {
         // Moving it is a change, and a change is sent — but the picture is not sent again.
         // Scrolling a note moves an image every line, and a 4K photograph is two hundred
         // kilobytes of base64.
-        let moved = vec![Place { path, x: 1, y: 0, cols: 4, rows: 2 }];
+        let moved = vec![Place { path, x: 1, y: 0, cols: 4, rows: 2, crop: None }];
         let mut third: Vec<u8> = Vec::new();
         placed.sync(&mut third, &moved).unwrap();
         let third = String::from_utf8_lossy(&third).to_string();

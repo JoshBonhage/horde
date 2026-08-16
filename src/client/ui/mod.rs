@@ -618,14 +618,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         app.images = rendered
             .images
             .iter()
-            .filter(|p| p.line >= scroll && p.line + p.rows as usize <= scroll + rows as usize)
-            .map(|p| crate::client::kitty::Place {
-                path: p.path.clone(),
-                x,
-                y: body_top + (p.line - scroll) as u16,
-                cols: p.cols,
-                rows: p.rows,
-            })
+            .filter_map(|p| markdown::visible(p, scroll, rows as usize, x, body_top))
             .collect();
 
         for (i, line) in rendered.lines.iter().skip(scroll).take(rows as usize).enumerate() {

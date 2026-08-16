@@ -1060,6 +1060,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 y: 0,
                 cols: 20,
                 rows: 10,
+                crop: None,
             };
             let mut out = std::io::stdout();
             if let Some((png, _, _)) = crate::client::kitty::encode(&dir) {

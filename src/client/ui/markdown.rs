@@ -35,6 +35,8 @@ pub struct Picture {
     pub path: std::path::PathBuf,
     pub cols: u16,
     pub rows: u16,
+    /// The source's own size, needed to crop it when only part is on screen.
+    pub pixels: (u32, u32),
 }
 
 /// Inline styling state while walking events.
@@ -153,6 +155,45 @@ pub struct Where<'a> {
     /// suite happens to be running under — which is the same class of mistake as reading
     /// somebody's real notes directory during a test.
     pub pixels: bool,
+}
+
+/// The part of a picture that is on screen, as a placement.
+///
+/// `top` is the first visible line of the view and `height` how many lines it has. A picture
+/// whose top has scrolled away is shown from where it was cut, which is what the half-block
+/// path does for free by being made of lines.
+pub fn visible(
+    pic: &Picture,
+    scroll: usize,
+    height: usize,
+    x: u16,
+    top: u16,
+) -> Option<crate::client::kitty::Place> {
+    let first = pic.line;
+    let last = pic.line + pic.rows as usize;
+    let (view_a, view_b) = (scroll, scroll + height);
+    if last <= view_a || first >= view_b {
+        return None;
+    }
+    let above = view_a.saturating_sub(first);
+    let below = last.saturating_sub(view_b);
+    let rows = (pic.rows as usize).saturating_sub(above + below);
+    if rows == 0 {
+        return None;
+    }
+    // The same band, measured in the source's own pixels.
+    let per_row = pic.pixels.1 as f64 / pic.rows.max(1) as f64;
+    let crop_y = (above as f64 * per_row).round() as u32;
+    let crop_h = ((rows as f64 * per_row).round() as u32).max(1);
+    let whole = above == 0 && below == 0;
+    Some(crate::client::kitty::Place {
+        path: pic.path.clone(),
+        x,
+        y: top + (first.saturating_sub(view_a)) as u16,
+        cols: pic.cols,
+        rows: rows as u16,
+        crop: (!whole).then_some((crop_y, crop_h.min(pic.pixels.1.saturating_sub(crop_y).max(1)))),
+    })
 }
 
 /// Where a note lives, owned — because [`Where`] borrows and the paths have to be somewhere.
@@ -434,6 +475,7 @@ pub fn render_in(text: &str, width: u16, theme: &Theme, at: Where<'_>) -> Render
                                 path: p.clone(),
                                 cols,
                                 rows,
+                                pixels: (pw, ph),
                             });
                             for _ in 0..rows {
                                 out.lines.push(Line::from(""));
@@ -873,6 +915,76 @@ mod tests {
         assert!(text.contains("tags · status"), "{text}");
         assert!(!text.contains("[a, b]"), "the values are not the point: {text}");
         assert!(text.contains("Real"));
+    }
+
+    /// A picture taller than the window is the normal case for a screenshot, and scrolling
+    /// into one must show its middle — which is what the half-block path does for free by
+    /// being made of lines, and what the pixel path did not do at all: an image whose top had
+    /// gone off the top of the screen was simply not drawn, so a note full of SOP screenshots
+    /// showed none of them.
+    #[test]
+    fn scrolling_into_a_tall_picture_shows_the_part_that_is_on_screen() {
+        let pic = Picture {
+            line: 10,
+            path: "x.png".into(),
+            cols: 40,
+            rows: 20,
+            pixels: (800, 400),
+        };
+
+        // Entirely in view: no crop at all.
+        let p = visible(&pic, 0, 40, 3, 2).expect("visible");
+        assert_eq!((p.y, p.rows, p.crop), (12, 20, None));
+
+        // Scrolled so the top five rows are gone: it starts at the top of the view, is five
+        // rows shorter, and shows the source from a quarter of the way down.
+        let p = visible(&pic, 15, 40, 3, 2).expect("visible");
+        assert_eq!(p.y, 2, "pinned to the top of the view");
+        assert_eq!(p.rows, 15);
+        let (cy, ch) = p.crop.expect("cropped");
+        assert_eq!(cy, 100, "five of twenty rows into an 400px image");
+        assert_eq!(ch, 300);
+
+        // Hanging off the bottom: shortened, and cropped from the top of the source.
+        let p = visible(&pic, 0, 20, 3, 2).expect("visible");
+        assert_eq!(p.rows, 10, "only ten rows of view left below it");
+        assert_eq!(p.crop, Some((0, 200)));
+
+        // Scrolled past entirely, and not yet reached.
+        assert!(visible(&pic, 30, 40, 3, 2).is_none());
+        assert!(visible(&pic, 0, 5, 3, 2).is_none());
+    }
+
+    /// The form a real vault actually uses. Obsidian writes `![[shot.png]]`, but everything
+    /// exported from elsewhere writes standard markdown with a relative path — and the vault
+    /// this was built against has 273 images referenced exactly that way, none of them with a
+    /// wikilink.
+    #[test]
+    fn a_standard_markdown_image_with_a_relative_path_resolves() {
+        let root = std::env::temp_dir().join(format!("horde-relimg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Brand")).unwrap();
+        std::fs::create_dir_all(root.join("_attachments/sop")).unwrap();
+        let mut img = image::RgbaImage::new(80, 32);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([10, 20, 30, 255]);
+        }
+        img.save(root.join("_attachments/sop/image-01.png")).unwrap();
+
+        let dir = root.join("Brand");
+        let body = "text\n\n![](../_attachments/sop/image-01.png)\n\nmore";
+        let t = Theme::horde();
+
+        let at = Where { dir: Some(&dir), vault: Some(&root), tall: 22, pixels: true };
+        let out = render_in(body, 96, &t, at);
+        assert_eq!(out.images.len(), 1, "the picture was found and reserved");
+
+        let at = Where { dir: Some(&dir), vault: Some(&root), tall: 22, pixels: false };
+        let out = render_in(body, 96, &t, at);
+        let text: String =
+            out.lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.to_string()).collect();
+        assert!(text.contains('▀'), "and drawn as blocks when there are no pixels");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// `![[shot.png]]` is a picture and `![[Some Note]]` is not, and both arrive here as the

@@ -199,13 +199,8 @@ fn preview(
     let places: Vec<crate::client::kitty::Place> = rendered
         .images
         .iter()
-        .filter(|pic| top + pic.line as u16 + pic.rows < end)
-        .map(|pic| crate::client::kitty::Place {
-            path: pic.path.clone(),
-            x,
-            y: top + pic.line as u16,
-            cols: pic.cols,
-            rows: pic.rows,
+        .filter_map(|pic| {
+            super::markdown::visible(pic, 0, end.saturating_sub(top) as usize, x, top)
         })
         .collect();
     for line in rendered.lines.iter().take(end.saturating_sub(y) as usize) {
