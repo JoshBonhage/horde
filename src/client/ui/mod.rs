@@ -568,18 +568,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             .and_then(|v| v.notes.first())
             .and_then(|n| std::path::Path::new(&n.path).parent().map(|p| p.to_path_buf()))
             .and_then(|rel| root.as_ref().map(|r| r.join(rel)));
-        let mut rendered = markdown::render_in(
-            &body,
-            col,
-            &theme2,
-            markdown::Where {
-                dir: dir.as_deref(),
-                vault: root.as_deref(),
-                // Half the reading area. A picture that fills the screen buries the note it
-                // is in, and the note is the thing you opened.
-                tall: (area.height / 2).clamp(6, 24),
-            },
-        );
+        // Half the reading area. A picture that fills the screen buries the note it is in,
+        // and the note is the thing you opened.
+        let home = markdown::Home { dir: dir.clone(), vault: root.clone() };
+        let mut rendered =
+            markdown::render_in(&body, col, &theme2, home.at((area.height / 2).clamp(6, 24)));
 
         // The work outstanding on this note, appended to it. Here rather than in a panel
         // because it belongs to the note the way its backlinks do — and because scrolling
@@ -618,6 +611,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let selected_line = rendered.links.get(link).map(|(l, _)| *l);
         let body_top = area.y + 2;
         let rows = area.height.saturating_sub(4);
+        // Pictures the terminal draws itself, translated from "which line" into "which cell
+        // on screen". Only the ones actually in view: an image scrolled off the top must be
+        // taken down, not left floating over the text that replaced it.
+        app.images = rendered
+            .images
+            .iter()
+            .filter(|p| p.line >= scroll && p.line + p.rows as usize <= scroll + rows as usize)
+            .map(|p| crate::client::kitty::Place {
+                path: p.path.clone(),
+                x,
+                y: body_top + (p.line - scroll) as u16,
+                cols: p.cols,
+                rows: p.rows,
+            })
+            .collect();
+
         for (i, line) in rendered.lines.iter().skip(scroll).take(rows as usize).enumerate() {
             let y = body_top + i as u16;
             // The link under the cursor is marked in the margin: the reader has to know

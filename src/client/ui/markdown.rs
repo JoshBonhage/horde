@@ -22,6 +22,19 @@ pub struct Rendered {
     /// Link targets in reading order, with the line each sits on, so the reader can walk
     /// them without re-parsing anything.
     pub links: Vec<(usize, String)>,
+    /// Pictures the terminal will draw itself: the line each starts on, where it is, and the
+    /// box it wants. Their rows are left blank in `lines`, because a kitty image is not in
+    /// ratatui's grid and anything written over it would half-erase it.
+    pub images: Vec<Picture>,
+}
+
+/// A picture the terminal draws, and the rows reserved for it.
+#[derive(Debug, Clone)]
+pub struct Picture {
+    pub line: usize,
+    pub path: std::path::PathBuf,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Inline styling state while walking events.
@@ -132,6 +145,14 @@ pub struct Where<'a> {
     pub vault: Option<&'a std::path::Path>,
     /// Rows an image may take. A picture that fills the screen buries the note it is in.
     pub tall: u16,
+    /// Whether the terminal draws real pixels, in which case the rows are reserved for it
+    /// rather than filled with half blocks.
+    ///
+    /// Passed in rather than read from the environment here. A renderer that asks the
+    /// environment what to do is a renderer whose output depends on which terminal the test
+    /// suite happens to be running under — which is the same class of mistake as reading
+    /// somebody's real notes directory during a test.
+    pub pixels: bool,
 }
 
 /// Where a note lives, owned — because [`Where`] borrows and the paths have to be somewhere.
@@ -161,7 +182,12 @@ impl Home {
 
     /// The borrowed form, with a limit on how many rows a picture may take.
     pub fn at(&self, tall: u16) -> Where<'_> {
-        Where { dir: self.dir.as_deref(), vault: self.vault.as_deref(), tall }
+        Where {
+            dir: self.dir.as_deref(),
+            vault: self.vault.as_deref(),
+            tall,
+            pixels: crate::client::kitty::supported(),
+        }
     }
 }
 
@@ -173,7 +199,7 @@ impl Home {
 /// were drawn, and the second of those is a scroll that stops short of the end of a note.
 pub fn render_in(text: &str, width: u16, theme: &Theme, at: Where<'_>) -> Rendered {
     let width = width.max(20) as usize;
-    let mut out = Rendered { lines: Vec::new(), links: Vec::new() };
+    let mut out = Rendered { lines: Vec::new(), links: Vec::new(), images: Vec::new() };
     // An image's alt text is a description of the picture, so it is not read out beside one
     // that is actually on screen.
     let mut skip_alt = false;
@@ -392,11 +418,35 @@ pub fn render_in(text: &str, width: u16, theme: &Theme, at: Where<'_>) -> Render
                     )));
                     continue;
                 }
-                let drawn = crate::client::image::locate(&target, at.dir, at.vault)
-                    .filter(|_| at.tall > 0)
-                    .and_then(|p| {
-                        crate::client::image::cells(&p, width as u16, at.tall, theme)
-                    });
+                let found =
+                    crate::client::image::locate(&target, at.dir, at.vault).filter(|_| at.tall > 0);
+
+                // Where the terminal can draw real pixels, let it: reserve the rows and
+                // record the box. Half blocks are a 40x40 thumbnail of whatever this is, and
+                // a photograph does not survive that.
+                if let Some(p) = found.as_ref().filter(|_| at.pixels) {
+                    if let Ok((pw, ph)) = image::image_dimensions(p) {
+                        let (cols, rows) =
+                            crate::client::kitty::fit(pw, ph, width as u16, at.tall);
+                        if cols > 0 && rows > 0 {
+                            out.images.push(Picture {
+                                line: out.lines.len(),
+                                path: p.clone(),
+                                cols,
+                                rows,
+                            });
+                            for _ in 0..rows {
+                                out.lines.push(Line::from(""));
+                            }
+                            out.lines.push(Line::from(""));
+                            continue;
+                        }
+                    }
+                }
+
+                let drawn = found.and_then(|p| {
+                    crate::client::image::cells(&p, width as u16, at.tall, theme)
+                });
                 match drawn {
                     Some(rows) => {
                         image_rows = rows.len();
@@ -839,7 +889,7 @@ mod tests {
         img.save(dir.join("attachments").join("shot.png")).unwrap();
 
         let t = Theme::horde();
-        let at = Where { dir: Some(&dir), vault: Some(&dir), tall: 8 };
+        let at = Where { dir: Some(&dir), vault: Some(&dir), tall: 8, pixels: false };
         let out = render_in("before\n\n![[shot.png]]\n\nafter", 40, &t, at);
         let text: Vec<String> = out
             .lines
@@ -858,6 +908,24 @@ mod tests {
         assert!(!text.contains('▀'), "not drawn as a broken picture: {text}");
         assert_eq!(out.links.first().map(|(_, t)| t.as_str()), Some("Some Note"), "and followable");
 
+        // Where the terminal draws the pixels itself, the rows are left empty for it and
+        // recorded — anything written into them would half-erase the picture, because a
+        // kitty image is not in ratatui's grid at all.
+        let at = Where { dir: Some(&dir), vault: Some(&dir), tall: 8, pixels: true };
+        let out = render_in("before\n\n![[shot.png]]\n\nafter", 40, &t, at);
+        assert_eq!(out.images.len(), 1, "one picture recorded");
+        let pic = &out.images[0];
+        // 8x4 pixels is 2:1, which in cells twice as tall as they are wide is 4:1 — so it
+        // hits the row limit first and the width comes in to match, rather than squashing.
+        assert_eq!((pic.cols, pic.rows), (32, 8));
+        for i in 0..pic.rows as usize {
+            let row: String = out.lines[pic.line + i].spans.iter().map(|s| s.content.to_string()).collect();
+            assert!(row.trim().is_empty(), "row {i} was not left empty: {row:?}");
+        }
+        let text: String = out.lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.to_string()).collect();
+        assert!(!text.contains('▀'), "and no half blocks under it: {text}");
+
+        let at = Where { dir: Some(&dir), vault: Some(&dir), tall: 8, pixels: false };
         // A picture that is not there is named rather than silently dropped — usually it
         // means the file did not travel with the note.
         let out = render_in("![[missing.png]]", 40, &t, at);

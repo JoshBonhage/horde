@@ -6,6 +6,7 @@
 pub mod clipboard;
 pub mod editor;
 pub mod image;
+pub mod kitty;
 pub mod graph;
 pub mod syntax;
 mod input;
@@ -340,6 +341,11 @@ pub struct App {
     /// underneath does not know the difference.
     pub graph_zoom: f64,
     pub graph_centre: graph::Point,
+    /// Pictures the terminal is to draw, as of the last frame. Filled in by whichever view
+    /// drew them, because only the renderer knows where a line ended up on screen.
+    pub images: Vec<kitty::Place>,
+    /// What the terminal is currently showing, so an unchanged picture is left alone.
+    pub placed: kitty::Placed,
     /// Node hits for the graph: `(y, x, node index)`.
     pub graph_hits: Vec<(u16, u16, usize)>,
     /// The area the graph was last drawn into, so a click can be turned back into a place in
@@ -421,6 +427,8 @@ impl App {
             graph: None,
             graph_zoom: 1.0,
             graph_centre: graph::Point { x: 0.0, y: 0.0 },
+            images: Vec::new(),
+            placed: kitty::Placed::default(),
             graph_hits: Vec::new(),
             graph_plot: None,
             graph_drag: None,
@@ -634,6 +642,12 @@ fn setup_terminal() -> Result<Term> {
 
 fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
+    // Pictures are not part of the screen horde is about to leave, so leaving without taking
+    // them down leaves them over whatever shell comes back.
+    if kitty::supported() {
+        use std::io::Write;
+        let _ = term.backend_mut().write_all(&kitty::clear());
+    }
     execute!(
         term.backend_mut(),
         DisableBracketedPaste,
@@ -687,7 +701,16 @@ async fn run_loop(
             anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         }
         if needs_draw {
+            app.images.clear();
             term.draw(|f| ui::draw(f, app))?;
+            // After the frame, and only after: these are not in ratatui's grid, so anything
+            // it paints would go over them. Doing nothing when nothing moved is what keeps a
+            // photograph from being re-sent twenty times a second.
+            if kitty::supported() {
+                let want = std::mem::take(&mut app.images);
+                let _ = app.placed.sync(&mut std::io::stdout(), &want);
+                app.images = want;
+            }
             needs_draw = false;
         }
         if app.quit {
@@ -1057,6 +1080,10 @@ fn handle_event(
         Event::Key(k) => handle_key(app, k, out),
         Event::Resize(cols, rows) => {
             let _ = out.send(ClientFrame::Resize { cols, rows });
+            // A resize moves or drops whatever the terminal was holding, and this side has no
+            // way to be told which. Forgetting means the next frame places them again rather
+            // than deciding nothing changed and leaving a picture in last frame's place.
+            app.placed.forget();
             Ok(())
         }
         Event::Paste(text) => {
