@@ -46,6 +46,24 @@ use ui::sidebar::Hit;
 
 /// Animation cadence for spinners and toast expiry.
 const ANIM: Duration = Duration::from_millis(110);
+/// Redraw cadence while the graph is open.
+///
+/// Twice as often, because the graph is the one view whose whole point is that it moves, and
+/// nine frames a second reads as a slideshow. Only while it is open: the rest of horde has
+/// nothing to animate but a spinner, and paying for twenty frames a second to watch a static
+/// screen is how a terminal multiplexer ends up warming a lap.
+const ANIM_GRAPH: Duration = Duration::from_millis(50);
+/// How long the graph's cursor has to sit still before its note is fetched.
+const PREVIEW_SETTLE: Duration = Duration::from_millis(160);
+
+/// The cadence a mode wants.
+fn cadence(mode: &Mode) -> Duration {
+    if matches!(mode, Mode::Graph { .. }) {
+        ANIM_GRAPH
+    } else {
+        ANIM
+    }
+}
 const TOAST_LIFE: Duration = Duration::from_secs(6);
 /// Bus messages kept client-side for the drawer.
 const BUS_CAP: usize = 300;
@@ -328,6 +346,19 @@ pub struct App {
     pub graph_plot: Option<ratatui::layout::Rect>,
     /// What the pointer is doing to the graph, while it is doing it.
     pub graph_drag: Option<GraphDrag>,
+    /// When the graph opened, which is what the drift is a function of. Time rather than
+    /// frames, so the motion looks the same however fast the client is redrawing.
+    pub graph_since: Option<Instant>,
+    /// Whether the note beside the graph is showing.
+    pub graph_panel: bool,
+    /// The note the panel is showing, and which node it is for.
+    pub preview: Option<Box<crate::proto::VaultReply>>,
+    pub preview_for: Option<String>,
+    /// When the selection last changed, so a walk through the graph does not ask the daemon
+    /// for every note it passes over.
+    pub preview_at: Option<Instant>,
+    /// A note was asked for by the graph, so the next vault reply belongs to the panel.
+    pub previewing: bool,
     /// Row hits for the note browser.
     pub notes_hits: Vec<(u16, usize)>,
     /// Row hits for the dashboard: `(y, index into its row list)`.
@@ -391,6 +422,12 @@ impl App {
             graph_hits: Vec::new(),
             graph_plot: None,
             graph_drag: None,
+            graph_since: None,
+            graph_panel: true,
+            preview: None,
+            preview_for: None,
+            preview_at: None,
+            previewing: false,
             vault: None,
             follow: None,
             pending_read: None,
@@ -635,11 +672,18 @@ async fn run_loop(
     mut inbound: mpsc::UnboundedReceiver<ServerFrame>,
 ) -> Result<()> {
     let mut events = spawn_event_reader();
-    let mut anim = tokio::time::interval(ANIM);
+    let mut beat = cadence(&app.mode);
+    let mut anim = tokio::time::interval(beat);
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut needs_draw = true;
 
     loop {
+        // Opening or closing the graph changes how often there is anything new to draw.
+        if cadence(&app.mode) != beat {
+            beat = cadence(&app.mode);
+            anim = tokio::time::interval(beat);
+            anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
         if needs_draw {
             term.draw(|f| ui::draw(f, app))?;
             needs_draw = false;
@@ -684,6 +728,36 @@ async fn run_loop(
             _ = anim.tick() => {
                 app.tick = app.tick.wrapping_add(1);
                 app.expire_toasts();
+                // Fetch the note beside the graph once the cursor has stopped moving. A walk
+                // across a vault passes over dozens of notes; asking for each one is a round
+                // trip per keystroke for answers nobody reads.
+                if let Mode::Graph { sel } = app.mode {
+                    let want = app
+                        .graph
+                        .as_ref()
+                        .and_then(|g| g.nodes.get(sel))
+                        .filter(|n| !n.ghost && !n.path.is_empty())
+                        .map(|n| n.path.clone());
+                    let settled =
+                        app.preview_at.is_some_and(|t| t.elapsed() >= PREVIEW_SETTLE);
+                    if app.graph_panel && settled && want != app.preview_for {
+                        app.preview_at = None;
+                        app.preview_for = want.clone();
+                        app.preview = None;
+                        match (want, app.snapshot.as_ref().and_then(|s| s.focused_space)) {
+                            (Some(path), Some(space)) => {
+                                app.previewing = true;
+                                let _ = out.send(ClientFrame::Command(Cmd::VaultQuery {
+                                    space,
+                                    kind: crate::proto::VaultQuery::Note { path },
+                                }));
+                            }
+                            // A ghost, or no project: nothing to ask for, and the panel says so.
+                            _ => app.previewing = false,
+                        }
+                    }
+                }
+
                 // Hand the buffer over when the typing settles. Here rather than in the key
                 // handler because "has stopped typing" is a fact about time passing, which is
                 // the one thing a key handler never hears about.
@@ -719,7 +793,11 @@ async fn run_loop(
                 // a frame, because one would take half a minute to settle — and then *stop*,
                 // which is the whole reason the simulation anneals. A graph left open must
                 // cost exactly as much as any other still picture.
+                // A settled layout still redraws, because the drift is still moving it. That
+                // is the whole difference between a graph that is alive and a photograph of
+                // one — and it costs two sines a node rather than a force pass.
                 if matches!(app.mode, Mode::Graph { .. }) {
+                    needs_draw = true;
                     if let Some(sim) = app.sim.as_mut() {
                         if !sim.settled() {
                             for _ in 0..graph::STEPS_PER_FRAME {
@@ -887,6 +965,12 @@ fn apply_frame(
                 }
                 _ => app.files = Some(*f),
             }
+        }
+        // The note under the graph's cursor. Like the `[[` list below, this is the browser's
+        // reply arriving for somebody else's question.
+        ServerFrame::Vault(v) if app.previewing => {
+            app.previewing = false;
+            app.preview = Some(v);
         }
         // The note list, asked for by `[[` rather than by the browser. Taken before the
         // browser's own handling, because these two want the same reply for different things
@@ -1273,10 +1357,10 @@ fn handle_key(
                 }
                 // Tab walks the nodes, because the arrows are already panning the view.
                 KeyCode::Tab | KeyCode::Char('j') => {
-                    app.mode = Mode::Graph { sel: if sel >= last { 0 } else { sel + 1 } }
+                    graph_select(app, if sel >= last { 0 } else { sel + 1 })
                 }
                 KeyCode::BackTab | KeyCode::Char('k') => {
-                    app.mode = Mode::Graph { sel: if sel == 0 { last } else { sel - 1 } }
+                    graph_select(app, if sel == 0 { last } else { sel - 1 })
                 }
                 KeyCode::Left => app.graph_centre.x -= pan,
                 KeyCode::Right => app.graph_centre.x += pan,
@@ -1287,6 +1371,14 @@ fn handle_key(
                 }
                 KeyCode::Char('-') => app.graph_zoom = (app.graph_zoom / 1.25).max(0.4),
                 // Recentre and reset, for when panning has lost you.
+                // The note beside the graph, on and off. `p` for preview, and free here.
+                KeyCode::Char('p') => {
+                    app.graph_panel = !app.graph_panel;
+                    if app.graph_panel {
+                        app.preview_for = None;
+                        app.preview_at = Some(Instant::now());
+                    }
+                }
                 KeyCode::Char('0') => {
                     app.graph_zoom = 1.0;
                     if let Some(s) = app.sim.as_ref() {
@@ -2312,6 +2404,15 @@ fn create_note(app: &mut App, title: &str, out: &mpsc::UnboundedSender<ClientFra
     app.mode = Mode::Editor { path, scroll: 0, project: false, vim: Vim::Insert };
 }
 
+/// Move the graph's cursor, and start the clock on fetching what it landed on.
+///
+/// One funnel, because the selection changes from three places and a preview that only
+/// followed two of them would look like the panel had frozen.
+fn graph_select(app: &mut App, sel: usize) {
+    app.mode = Mode::Graph { sel };
+    app.preview_at = Some(Instant::now());
+}
+
 /// Drive the graph with the pointer.
 ///
 /// Split out rather than inlined because it is the only view whose mouse handling is more
@@ -2346,7 +2447,7 @@ fn graph_mouse(app: &mut App, m: crossterm::event::MouseEvent, sel: usize) {
                 .map(|(_, _, i)| *i);
             match hit {
                 Some(i) => {
-                    app.mode = Mode::Graph { sel: i };
+                    graph_select(app, i);
                     app.graph_drag = Some(GraphDrag::Node { i });
                 }
                 None => app.graph_drag = Some(GraphDrag::Pan { at: (m.column, m.row) }),
@@ -3105,6 +3206,10 @@ fn run_action(
             // out until the daemon says what the graph is.
             app.sim = None;
             app.graph = None;
+            app.graph_since = Some(Instant::now());
+            app.preview = None;
+            app.preview_for = None;
+            app.preview_at = Some(Instant::now());
             app.graph_zoom = 1.0;
             app.mode = Mode::Graph { sel: 0 };
         }
@@ -4244,7 +4349,8 @@ mod tests {
         // What the renderer would have recorded for these positions.
         app.graph_hits = (0..12)
             .filter_map(|i| {
-                sim.project(i, 100, 30, 1.0, app.graph_centre).map(|(x, y)| (y + 1, x, i))
+                sim.project(i, 100, 30, 1.0, app.graph_centre, 0.0)
+                    .map(|(x, y)| (y.round() as u16 + 1, x.round() as u16, i))
             })
             .collect();
         app.sim = Some(sim);

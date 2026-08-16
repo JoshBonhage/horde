@@ -90,6 +90,117 @@ pub fn plot_of(area: TRect) -> TRect {
     }
 }
 
+/// Where the preview goes, and what is left for the graph.
+///
+/// A side panel where there is width for one, a strip along the bottom where there is not,
+/// and nothing at all on a terminal too small for either — a panel that leaves the graph
+/// twenty columns is worse than no panel, because the thing you clicked has nowhere to be.
+pub fn split(area: TRect, want: bool) -> (TRect, Option<TRect>) {
+    let plot = plot_of(area);
+    if !want || plot.width < 60 || plot.height < 10 {
+        return (plot, None);
+    }
+    if plot.width >= 104 {
+        let w = (plot.width / 3).clamp(32, 54);
+        (
+            TRect { width: plot.width - w, ..plot },
+            Some(TRect { x: plot.x + plot.width - w, width: w, ..plot }),
+        )
+    } else if plot.height >= 18 {
+        let h = 7;
+        (
+            TRect { height: plot.height - h, ..plot },
+            Some(TRect { y: plot.y + plot.height - h, height: h, ..plot }),
+        )
+    } else {
+        (plot, None)
+    }
+}
+
+/// What the panel knows about the note under the cursor.
+pub struct Preview<'a> {
+    pub title: &'a str,
+    /// `None` while the answer is still coming, so the panel can say so rather than look empty.
+    pub note: Option<&'a crate::proto::VaultReply>,
+    /// A link target nobody has written. There is nothing to fetch and nothing to wait for.
+    pub ghost: bool,
+}
+
+/// The note beside the graph.
+fn preview(buf: &mut Buffer, area: TRect, theme: &Theme, p: &Preview<'_>) {
+    fill(buf, area, theme.ui.panel_bg);
+    let (x, w) = (area.x + 2, area.width.saturating_sub(3));
+    let faint = Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.panel_bg));
+    let body = Style::default().fg(color(theme.ui.text_dim)).bg(color(theme.ui.panel_bg));
+
+    put_line(
+        buf,
+        x,
+        area.y,
+        w,
+        Line::from(Span::styled(
+            truncate(p.title, w as usize),
+            Style::default()
+                .fg(color(theme.ui.text))
+                .bg(color(theme.ui.panel_bg))
+                .add_modifier(Modifier::BOLD),
+        )),
+    );
+
+    let mut y = area.y + 1;
+    let say = |buf: &mut Buffer, y: u16, s: String, st: Style| {
+        put_line(buf, x, y, w, Line::from(Span::styled(s, st)));
+    };
+
+    let Some(note) = p.note else {
+        say(
+            buf,
+            y,
+            if p.ghost { "not written yet".into() } else { "…".into() },
+            faint,
+        );
+        return;
+    };
+
+    // What the note is joined to, before what it says: from the graph, the connections are
+    // the reason you clicked it.
+    let counts = [
+        (note.backlinks.len(), "linked here"),
+        (note.tasks.iter().filter(|t| !t.done && !t.dropped).count(), "open"),
+    ];
+    let counts: Vec<String> = counts
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+    if !counts.is_empty() {
+        say(buf, y, counts.join("  ·  "), faint);
+        y += 1;
+    }
+    y += 1;
+
+    // The note itself, rendered rather than shown as source — the same reader the full view
+    // uses, so a heading looks like a heading in both.
+    let text = note.body.as_deref().unwrap_or("");
+    let rendered = super::markdown::render(text, w, theme);
+    let end = area.y + area.height;
+    for line in rendered.lines.iter().take(end.saturating_sub(y) as usize) {
+        // `markdown::render` paints on the page background; this panel has its own.
+        let spans: Vec<Span<'static>> = line
+            .spans
+            .iter()
+            .map(|s| {
+                Span::styled(s.content.to_string(), s.style.bg(color(theme.ui.panel_bg)))
+            })
+            .collect();
+        put_line(buf, x, y, w, Line::from(spans));
+        y += 1;
+    }
+    if y < end && text.is_empty() {
+        say(buf, y, "empty".into(), body);
+    }
+}
+
 /// Draw the graph. Returns `(y, x, node index)` hits for the mouse.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
@@ -102,6 +213,9 @@ pub fn draw(
     zoom: f64,
     centre: Point,
     now: u64,
+    // Seconds since the graph opened, for the drift. Zero draws it still.
+    secs: f64,
+    show: Option<Preview<'_>>,
 ) -> Vec<(u16, u16, usize)> {
     fill(buf, area, theme.ui.bg);
     let mut hits = Vec::new();
@@ -120,7 +234,10 @@ pub fn draw(
         return hits;
     }
 
-    let plot = plot_of(area);
+    let (plot, panel) = split(area, show.is_some());
+    if let (Some(rect), Some(p)) = (panel, show.as_ref()) {
+        preview(buf, rect, theme, p);
+    }
 
     // Edges first, on their own layer, so nodes always sit on top of the lines.
     //
@@ -130,7 +247,7 @@ pub fn draw(
     // blocks. Nodes still round, because a node is a glyph.
     let (w, h) = (plot.width, plot.height);
     let projected: Vec<Option<(f64, f64)>> =
-        (0..graph.nodes.len()).map(|i| sim.project_f(i, w, h, zoom, centre)).collect();
+        (0..graph.nodes.len()).map(|i| sim.project(i, w, h, zoom, centre, secs)).collect();
     let sel_edges: Vec<bool> = graph
         .edges
         .iter()
@@ -222,7 +339,10 @@ pub fn draw(
 
     for i in order {
         let node = &graph.nodes[i];
-        let Some((x, y)) = sim.project(i, w, h, zoom, centre) else { continue };
+        let Some((x, y)) = projected[i].map(|(x, y)| (x.round() as u16, y.round() as u16))
+        else {
+            continue;
+        };
         let (cx, cy) = (plot.x + x, plot.y + y);
         if cx >= plot.x + plot.width || cy >= plot.y + plot.height {
             continue;
@@ -322,7 +442,8 @@ pub fn draw(
         area.y + area.height.saturating_sub(2),
         area.width.saturating_sub(4),
         Line::from(Span::styled(
-            "drag pan   scroll zoom   click select   tab next   enter open   esc close".to_string(),
+            "drag pan   scroll zoom   click select   tab next   p note   enter open   esc close"
+                .to_string(),
             Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.bg)),
         )),
     );
@@ -360,7 +481,7 @@ mod tests {
         sim.settle(200);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &g, &sim, sel, 1.0, sim.centre(), 0);
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, sel, 1.0, sim.centre(), 0, 0.0, None);
         (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect()
@@ -377,6 +498,72 @@ mod tests {
         assert!(ghost.contains("not written yet"), "a ghost says so: {ghost}");
     }
 
+    /// A panel that leaves the graph twenty columns is worse than no panel: the thing you
+    /// clicked has nowhere to be drawn, so there is nothing to read the note *about*.
+    #[test]
+    fn the_note_panel_gives_way_when_there_is_no_room_for_it() {
+        let wide = TRect::new(0, 0, 150, 40);
+        let (plot, panel) = split(wide, true);
+        let panel = panel.expect("a side panel");
+        assert_eq!(plot.width + panel.width, wide.width, "between them they use it all");
+        assert_eq!(panel.x, plot.x + plot.width, "and do not overlap");
+        assert!(plot.width > panel.width, "the graph keeps the larger share");
+
+        // Narrower: along the bottom instead, where it costs rows rather than columns.
+        let (plot, panel) = split(TRect::new(0, 0, 84, 40), true);
+        let panel = panel.expect("a strip");
+        assert_eq!(panel.width, plot.width);
+        assert_eq!(panel.y, plot.y + plot.height);
+
+        // Smaller still: nothing, because a graph is what this view is.
+        assert!(split(TRect::new(0, 0, 50, 20), true).1.is_none());
+        assert!(split(wide, false).1.is_none(), "and it is off when it is not asked for");
+    }
+
+    /// "Floaty" must not quietly mean "hot laptop". Twenty frames a second only pays for
+    /// itself if a frame is cheap, and this is the size of vault it has to be cheap at.
+    #[test]
+    fn a_frame_of_a_real_sized_vault_is_cheap() {
+        let n = 176;
+        let mut nodes = Vec::new();
+        for i in 0..n {
+            nodes.push(GraphNode {
+                path: format!("n{i}.md"),
+                label: format!("note {i}"),
+                degree: (i % 12) as u16,
+                group: format!("g{}", i % 6),
+                ghost: false,
+                by: None,
+                mtime: 0,
+            });
+        }
+        let mut edges = Vec::new();
+        for i in 3..n as u16 {
+            edges.push((i % 3, i));
+            if i % 2 == 0 {
+                edges.push((i, (i + 7) % n as u16));
+            }
+        }
+        let g = VaultGraph { nodes, edges };
+        let mut sim = Sim::new(&g);
+        sim.settle(400);
+
+        let area = TRect::new(0, 0, 150, 40);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::horde();
+        let start = std::time::Instant::now();
+        let frames = 60;
+        for f in 0..frames {
+            draw(&mut buf, area, &theme, &g, &sim, 3, 1.0, sim.centre(), 0, f as f64 * 0.05, None);
+        }
+        let each = start.elapsed() / frames;
+        println!("{} nodes, {} edges: {each:?} a frame", g.nodes.len(), g.edges.len());
+        assert!(
+            each < std::time::Duration::from_millis(10),
+            "a frame costs {each:?}, which at twenty a second is a fifth of a core"
+        );
+    }
+
     /// The graph is the one view that shows the vault whole, so it is the one place "how
     /// much of this did I write" is answerable at a glance. A note written on somebody's
     /// behalf has to look different from one they wrote — and say whose it is when selected.
@@ -388,7 +575,7 @@ mod tests {
         sim.settle(200);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0);
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0, 0.0, None);
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();
@@ -452,7 +639,7 @@ mod tests {
         sim.settle(300);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0);
+        draw(&mut buf, area, &Theme::horde(), &g, &sim, 0, 1.0, sim.centre(), 0, 0.0, None);
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();
@@ -475,7 +662,7 @@ mod tests {
         let sim = Sim::new(&empty);
         let area = TRect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &empty, &sim, 0, 1.0, Point { x: 0.0, y: 0.0 }, 0);
+        draw(&mut buf, area, &Theme::horde(), &empty, &sim, 0, 1.0, Point { x: 0.0, y: 0.0 }, 0, 0.0, None);
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect();

@@ -236,7 +236,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // else is something you do to a session you can still see. A start screen is not.
     if let Mode::Graph { sel } = app.mode {
         // Recorded so the mouse handler resolves a cell the same way the renderer placed it.
-        app.graph_plot = Some(graph_view::plot_of(area));
+        app.graph_plot = Some(graph_view::split(area, app.graph_panel).0);
         if let (Some(sim), Some(g)) = (app.sim.as_ref(), app.graph.as_ref()) {
             app.graph_hits = graph_view::draw(
                 f.buffer_mut(),
@@ -253,6 +253,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
+                app.graph_since.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0),
+                app.graph_panel.then(|| graph_view::Preview {
+                    title: g.nodes.get(sel).map(|n| n.label.as_str()).unwrap_or(""),
+                    note: app.preview.as_deref(),
+                    ghost: g.nodes.get(sel).is_some_and(|n| n.ghost),
+                }),
             );
         }
         statusbar::StatusBar {

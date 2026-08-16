@@ -41,6 +41,12 @@ pub const ANIMATE_LIMIT: usize = 2_000;
 /// twice as tall as it is wide and read as though it were square, which turns every circle
 /// into an ellipse and every even spread into a smear.
 pub const CELL_ASPECT: f64 = 0.5;
+/// How far a settled node wanders, in cells.
+///
+/// A third of a cell, which at braille resolution is most of a dot: enough that the picture is
+/// alive rather than a photograph, small enough that nothing appears to have moved anywhere.
+/// Larger and the graph looks like it is still deciding, which is the opposite of the point.
+const DRIFT: f64 = 0.34;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
@@ -229,24 +235,26 @@ impl Sim {
         fit * zoom
     }
 
-    /// Where node `i` lands, in cells but not rounded to one.
+    /// Where node `i` lands at `secs`, in cells and not rounded to one.
     ///
     /// The fractional part is the whole point. Edges are drawn on a braille canvas that packs
     /// 2x4 dots into a cell, and rounding the endpoints to cells first — which is what this
     /// used to do for everything — threw away eight times the resolution the canvas was
     /// offering. That discarded precision *was* the blockiness.
-    pub fn project_f(
+    pub fn project(
         &self,
         i: usize,
         w: u16,
         h: u16,
         zoom: f64,
         centre: Point,
+        secs: f64,
     ) -> Option<(f64, f64)> {
         let p = self.pos.get(i)?;
         let s = self.scale(w, h, zoom);
-        let x = (p.x - centre.x) * s + w as f64 / 2.0;
-        let y = (p.y - centre.y) * s * CELL_ASPECT + h as f64 / 2.0;
+        let (dx, dy) = if secs == 0.0 { (0.0, 0.0) } else { self.drift(i, secs) };
+        let x = (p.x - centre.x) * s + w as f64 / 2.0 + dx;
+        let y = (p.y - centre.y) * s * CELL_ASPECT + h as f64 / 2.0 + dy;
         let (max_x, max_y) = (w.saturating_sub(1) as f64, h.saturating_sub(1) as f64);
         if !(0.0..=max_x).contains(&x) || !(0.0..=max_y).contains(&y) {
             return None; // off screen at this zoom
@@ -254,15 +262,31 @@ impl Sim {
         Some((x, y))
     }
 
-    /// The same, rounded to a cell — because a node is a glyph and a glyph occupies one.
-    pub fn project(&self, i: usize, w: u16, h: u16, zoom: f64, centre: Point) -> Option<(u16, u16)> {
-        self.project_f(i, w, h, zoom, centre)
-            .map(|(x, y)| (x.round() as u16, y.round() as u16))
+    /// A small wandering offset for node `i` at `secs`, in cells.
+    ///
+    /// **Floaty is not the same as unsettled.** The simulation still anneals and stops —
+    /// that decision was measured, and a layout that never comes to rest burns a core forever
+    /// on a picture nobody can see changing. This is separate: once the physics is done, each
+    /// node wanders a third of a braille dot on its own slow circle, which costs two sines per
+    /// node per frame and cannot feed back into the forces because it is applied at projection
+    /// time and never written to a position.
+    ///
+    /// Two frequencies rather than one, and prime-ish ratios, so neighbours never fall into
+    /// step and start pulsing together — a crowd breathing in unison reads as a bug.
+    ///
+    /// Time-based, so it looks the same whatever the frame rate.
+    pub fn drift(&self, i: usize, secs: f64) -> (f64, f64) {
+        // The golden angle again, which is the one number in here that already means "spread
+        // these apart as evenly as possible".
+        let phase = i as f64 * 2.399_963_2;
+        let x = (secs * 0.41 + phase).sin() + 0.5 * (secs * 0.23 + phase * 1.7).sin();
+        let y = (secs * 0.37 + phase * 1.3).cos() + 0.5 * (secs * 0.19 + phase).cos();
+        (x * DRIFT, y * DRIFT * CELL_ASPECT)
     }
 
     /// A point on screen, back into the layout's own coordinates.
     ///
-    /// The inverse of [`Sim::project_f`], and the reason dragging a node and zooming toward
+    /// The inverse of [`Sim::project`], and the reason dragging a node and zooming toward
     /// the pointer are possible at all: both are questions about where in the graph a
     /// particular cell is.
     pub fn unproject(&self, cell: (f64, f64), w: u16, h: u16, zoom: f64, centre: Point) -> Point {
@@ -374,6 +398,33 @@ mod tests {
         assert!(spread > half * 0.3, "it still uses the space it has: {spread:.0}");
     }
 
+    /// Floaty is not the same as unsettled. The physics still has to come to rest — a layout
+    /// that never does burns a core forever — so the drift must live entirely outside it and
+    /// must never feed back into a force.
+    #[test]
+    fn the_drift_moves_the_picture_without_waking_the_physics() {
+        let mut sim = Sim::new(&graph(40, &[(0, 1), (1, 2), (3, 4)]));
+        sim.settle(400);
+        assert!(sim.settled());
+        let rest = sim.pos.clone();
+
+        let c = sim.centre();
+        let still = sim.project(7, 90, 28, 1.0, c, 0.0).expect("on screen");
+        let later = sim.project(7, 90, 28, 1.0, c, 3.0).expect("on screen");
+        assert_ne!(still, later, "the picture moved");
+        assert!(
+            (still.0 - later.0).abs() < 1.0 && (still.1 - later.1).abs() < 1.0,
+            "but barely: {still:?} -> {later:?}"
+        );
+
+        assert!(sim.settled(), "and the layout is still at rest");
+        assert_eq!(sim.pos, rest, "because no position was written");
+
+        // Neighbours must not fall into step, or the whole graph pulses as one.
+        let (a, b) = (sim.drift(11, 4.0), sim.drift(12, 4.0));
+        assert!((a.0 - b.0).abs() > 1e-3 || (a.1 - b.1).abs() > 1e-3, "{a:?} {b:?}");
+    }
+
     /// A layout that did not put linked notes together would be a picture of nothing.
     #[test]
     fn linked_notes_end_up_closer_together_than_unlinked_ones() {
@@ -417,8 +468,8 @@ mod tests {
         let c = sim.centre();
         for zoom in [0.5, 1.0, 2.5] {
             for i in 0..40 {
-                if let Some((x, y)) = sim.project(i, 80, 24, zoom, c) {
-                    assert!(x < 80 && y < 24, "node {i} at {x},{y} zoom {zoom}");
+                if let Some((x, y)) = sim.project(i, 80, 24, zoom, c, 0.0) {
+                    assert!(x < 80.0 && y < 24.0, "node {i} at {x},{y} zoom {zoom}");
                 }
             }
         }
@@ -433,21 +484,18 @@ mod tests {
         sim.settle(300);
         let c = sim.centre();
         let fractional = (0..24)
-            .filter_map(|i| sim.project_f(i, 80, 24, 1.0, c))
+            .filter_map(|i| sim.project(i, 80, 24, 1.0, c, 0.0))
             .filter(|(x, y)| x.fract() > 1e-9 || y.fract() > 1e-9)
             .count();
         assert!(fractional > 0, "every node landed exactly on a cell, which cannot be right");
 
-        // And the rounded form still agrees with it, because nodes are glyphs.
-        for i in 0..24 {
-            match (sim.project_f(i, 80, 24, 1.0, c), sim.project(i, 80, 24, 1.0, c)) {
-                (Some((fx, fy)), Some((x, y))) => {
-                    assert_eq!((fx.round() as u16, fy.round() as u16), (x, y));
-                }
-                (None, None) => {}
-                (a, b) => panic!("the two disagree about whether node {i} is on screen: {a:?} {b:?}"),
-            }
-        }
+        // And a node still lands on a whole cell when it is drawn, because it is a glyph.
+        let on_cells = (0..24)
+            .filter_map(|i| sim.project(i, 80, 24, 1.0, c, 0.0))
+            .map(|(x, y)| (x.round() as u16, y.round() as u16))
+            .filter(|(x, y)| *x < 80 && *y < 24)
+            .count();
+        assert!(on_cells > 0, "and they are drawable where they land");
     }
 
     /// A terminal cell is about twice as tall as it is wide, and the layout used to be fitted
@@ -464,7 +512,7 @@ mod tests {
         }
         let c = Point { x: 0.0, y: 0.0 };
         let pts: Vec<(f64, f64)> =
-            (0..16).filter_map(|i| sim.project_f(i, 100, 30, 1.0, c)).collect();
+            (0..16).filter_map(|i| sim.project(i, 100, 30, 1.0, c, 0.0)).collect();
         assert_eq!(pts.len(), 16, "all of them on screen");
 
         // In pixels — cells are twice as tall as wide — the ring's width and height must
@@ -490,7 +538,7 @@ mod tests {
         let c = sim.centre();
         for zoom in [0.5, 1.0, 2.5] {
             for i in 0..30 {
-                let Some(cell) = sim.project_f(i, 90, 28, zoom, c) else { continue };
+                let Some(cell) = sim.project(i, 90, 28, zoom, c, 0.0) else { continue };
                 let back = sim.unproject(cell, 90, 28, zoom, c);
                 assert!(
                     (back.x - sim.pos[i].x).abs() < 1e-6 && (back.y - sim.pos[i].y).abs() < 1e-6,
