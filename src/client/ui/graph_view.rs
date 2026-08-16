@@ -21,15 +21,37 @@ use crate::client::graph::{Point, Sim};
 use crate::proto::{Rgb, VaultGraph};
 use crate::theme::Theme;
 
-/// Above this many edges, drawing them all fills every cell with braille and the picture
-/// becomes a solid block with a graph somewhere inside it.
+/// A guard against a pathological vault, not a display decision.
 ///
-/// Found by pointing this at a real 170-note vault: 888 edges over a terminal-sized canvas
-/// is not a diagram, it is a texture. Past the limit only the selected node's links are
-/// drawn, which is the question a person actually has — *what does this connect to* — and
-/// the clustering is still legible, because that is carried by where nodes sit rather than
-/// by the lines between them.
-const EDGE_LIMIT: usize = 160;
+/// This used to be 160, and past it only the selected node's links were drawn — because 888
+/// edges over a terminal-sized canvas measured as a texture rather than a diagram. What made
+/// that true was that every endpoint was rounded to a cell first, so the lines were eight
+/// times coarser than the canvas could draw. With fractional endpoints the whole web can be
+/// laid down faintly and read as a web, which is the thing this was always imitating.
+const EDGE_LIMIT: usize = 4_000;
+
+/// How far the unselected web is pushed toward the background.
+///
+/// High, deliberately. Every edge at a readable weight is a grey rectangle; the web is meant
+/// to be felt rather than followed, with the one neighbourhood you asked about picked out on
+/// top of it.
+const WEB_FADE: f32 = 0.72;
+
+/// The share of the canvas the faint web may cover.
+///
+/// Measured rather than chosen. A terminal 150 cells wide is 300x148 braille dots — about 44
+/// thousand. The reference vault's 888 edges are roughly 40 dots each, so drawing all of them
+/// covers about eighty per cent of the canvas and the result is a solid block: not a dim web
+/// behind the graph, a wall in front of it. Clusters are legible because of the *space*
+/// between them, so the ink has to leave some.
+const WEB_INK: f64 = 0.15;
+
+/// Shorter than this, in braille dots, an edge is inside its own endpoints.
+///
+/// Two notes a cell apart are already drawn as two glyphs touching; the line between them
+/// says nothing and costs a cell of ink. Skipping them is what stops the ink budget being
+/// spent entirely inside the densest cluster, where it buys the least.
+const WEB_MIN: f64 = 4.0;
 
 /// How recently a note has to have been written to read as "just now".
 ///
@@ -53,6 +75,19 @@ fn group_color(group: &str, theme: &Theme) -> Rgb {
         h = (h ^ *b as u32).wrapping_mul(16777619);
     }
     theme.space_accent((h % crate::theme::SPACE_ACCENTS as u32) as u8)
+}
+
+/// The area the graph itself is drawn into, inside the header and hint rows.
+///
+/// Public and used by both the renderer and the mouse handler, because the two have to agree
+/// about where a cell is. Computed twice, they would agree until one of them changed.
+pub fn plot_of(area: TRect) -> TRect {
+    TRect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(3),
+    }
 }
 
 /// Draw the graph. Returns `(y, x, node index)` hits for the mouse.
@@ -85,25 +120,56 @@ pub fn draw(
         return hits;
     }
 
-    // Leave a row top and bottom for the header and hint.
-    let plot = TRect {
-        x: area.x,
-        y: area.y + 1,
-        width: area.width,
-        height: area.height.saturating_sub(2),
-    };
+    let plot = plot_of(area);
 
     // Edges first, on their own layer, so nodes always sit on top of the lines.
+    //
+    // Kept fractional. The braille canvas packs 2x4 dots into a cell, so an endpoint that has
+    // been rounded to a cell first is an endpoint drawn at an eighth of the resolution the
+    // canvas is capable of — which is what made every line look like it was built out of
+    // blocks. Nodes still round, because a node is a glyph.
     let (w, h) = (plot.width, plot.height);
-    let projected: Vec<Option<(u16, u16)>> =
-        (0..graph.nodes.len()).map(|i| sim.project(i, w, h, zoom, centre)).collect();
+    let projected: Vec<Option<(f64, f64)>> =
+        (0..graph.nodes.len()).map(|i| sim.project_f(i, w, h, zoom, centre)).collect();
     let sel_edges: Vec<bool> = graph
         .edges
         .iter()
         .map(|(a, b)| *a as usize == sel || *b as usize == sel)
         .collect();
 
-    let dim = theme.ui.border;
+    // Which of the web to draw, shortest first, until the ink runs out.
+    //
+    // Shortest first is the whole trick. The long edges are the ones that cross the canvas
+    // and turn it into texture; the short ones trace the outlines of the clusters, which is
+    // the thing a graph is being looked at for. Spending a bounded amount of ink on the short
+    // ones draws the shape of the vault and leaves the space that makes it readable.
+    let mut lengths: Vec<(usize, f64)> = graph
+        .edges
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (a, b))| {
+            let (Some(p), Some(q)) = (projected[*a as usize], projected[*b as usize]) else {
+                return None;
+            };
+            // In braille dots: two across a cell, four down it.
+            let (dx, dy) = ((p.0 - q.0) * 2.0, (p.1 - q.1) * 4.0);
+            let len = (dx * dx + dy * dy).sqrt();
+            (len >= WEB_MIN).then_some((i, len))
+        })
+        .collect();
+    lengths.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let ink = w as f64 * 2.0 * h as f64 * 4.0 * WEB_INK;
+    let mut spent = 0.0;
+    let mut web = vec![false; graph.edges.len()];
+    for (i, len) in lengths {
+        if spent + len > ink {
+            break;
+        }
+        spent += len;
+        web[i] = true;
+    }
+
+    let dim = crate::theme::mix(theme.ui.border, theme.ui.bg, WEB_FADE);
     let hot = theme.ui.accent;
     Canvas::default()
         .marker(Marker::Braille)
@@ -111,27 +177,43 @@ pub fn draw(
         .y_bounds([0.0, h.max(1) as f64])
         .paint(|ctx| {
             let dense = graph.edges.len() > EDGE_LIMIT;
-            for (i, (a, b)) in graph.edges.iter().enumerate() {
-                if dense && !sel_edges[i] {
-                    continue;
+            // The neighbourhood last, so it lies on top of the web rather than under it.
+            for pass in [false, true] {
+                for (i, (a, b)) in graph.edges.iter().enumerate() {
+                    if sel_edges[i] != pass || (!sel_edges[i] && (dense || !web[i])) {
+                        continue;
+                    }
+                    let (Some((x1, y1)), Some((x2, y2))) =
+                        (projected[*a as usize], projected[*b as usize])
+                    else {
+                        continue;
+                    };
+                    // Canvas y increases upward; the buffer's increases down.
+                    let flip = |y: f64| (h.saturating_sub(1) as f64 - y).max(0.0);
+                    ctx.draw(&CanvasLine {
+                        x1,
+                        y1: flip(y1),
+                        x2,
+                        y2: flip(y2),
+                        color: color(if sel_edges[i] { hot } else { dim }),
+                    });
                 }
-                let (Some((x1, y1)), Some((x2, y2))) =
-                    (projected[*a as usize], projected[*b as usize])
-                else {
-                    continue;
-                };
-                // The canvas has y increasing upward; the buffer has it increasing down.
-                let flip = |y: u16| (h.saturating_sub(1) - y.min(h.saturating_sub(1))) as f64;
-                ctx.draw(&CanvasLine {
-                    x1: x1 as f64,
-                    y1: flip(y1),
-                    x2: x2 as f64,
-                    y2: flip(y2),
-                    color: color(if sel_edges[i] { hot } else { dim }),
-                });
             }
         })
         .render(plot, buf);
+
+    // Which nodes get a name.
+    //
+    // A budget, not a threshold. A threshold that reads well on one vault is a wall of text on
+    // the next — this one has sixty notes with ten or more links, and naming all of them
+    // buries the diagram they are drawn on. So: the biggest handful that will fit, and more of
+    // them as you zoom in, which is what zooming is for.
+    let room = (plot.width as usize * plot.height as usize) / 400;
+    let budget = ((room as f64) * zoom.clamp(0.6, 3.0)) as usize;
+    let mut named: Vec<usize> = (0..graph.nodes.len()).collect();
+    named.sort_by_key(|i| std::cmp::Reverse(graph.nodes[*i].degree));
+    named.truncate(budget.clamp(3, 40));
+    let named: std::collections::HashSet<usize> = named.into_iter().collect();
 
     // Nodes over the top. Drawn selection-last so its glyph and label win any overlap.
     let mut label_rows: Vec<(u16, u16, u16)> = Vec::new();
@@ -140,7 +222,7 @@ pub fn draw(
 
     for i in order {
         let node = &graph.nodes[i];
-        let Some((x, y)) = projected[i] else { continue };
+        let Some((x, y)) = sim.project(i, w, h, zoom, centre) else { continue };
         let (cx, cy) = (plot.x + x, plot.y + y);
         if cx >= plot.x + plot.width || cy >= plot.y + plot.height {
             continue;
@@ -158,8 +240,12 @@ pub fn draw(
             ("◆", if fresh(node.mtime, now) { theme.ui.working } else { theme.ui.serving })
         } else if node.degree >= 6 {
             ("●", group_color(&node.group, theme))
-        } else {
+        } else if node.degree >= 2 {
             ("•", group_color(&node.group, theme))
+        } else {
+            // A third size for the leaves. Most of a vault is notes with one link, and drawing
+            // them at the same weight as a hub is what makes a graph read as gravel.
+            ("·", group_color(&node.group, theme))
         };
         let style = Style::default().bg(color(theme.ui.bg)).fg(color(if selected {
             theme.ui.accent
@@ -173,7 +259,7 @@ pub fn draw(
         // Labels for the selection and for hubs — but only where one fits without landing
         // on another. Unchecked, a dense vault writes every name over its neighbour and the
         // result is a paragraph nobody can read, laid over a diagram nobody can see.
-        if selected || node.degree >= 10 {
+        if selected || named.contains(&i) {
             let label = truncate(&node.label, 18);
             let lx = cx + 2;
             let lw = super::width(&label) as u16;
@@ -231,10 +317,12 @@ pub fn draw(
     put_line(
         buf,
         area.x + 2,
-        area.y + area.height.saturating_sub(1),
+        // One up from the bottom: the last row belongs to the status bar, which is drawn
+        // after this. Three views had this wrong.
+        area.y + area.height.saturating_sub(2),
         area.width.saturating_sub(4),
         Line::from(Span::styled(
-            "tab next   ↑↓←→ pan   +- zoom   enter open   esc close".to_string(),
+            "drag pan   scroll zoom   click select   tab next   enter open   esc close".to_string(),
             Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.bg)),
         )),
     );
@@ -324,7 +412,7 @@ mod tests {
     #[test]
     fn nodes_and_edges_are_both_drawn() {
         let text = render(0);
-        let nodes = text.chars().filter(|c| "●•○".contains(*c)).count();
+        let nodes = text.chars().filter(|c| "●•·○◆".contains(*c)).count();
         assert_eq!(nodes, 3, "one glyph per node:\n{text}");
         let braille = text.chars().filter(|c| ('\u{2800}'..='\u{28FF}').contains(c)).count();
         assert!(braille > 0, "edges drawn on the braille canvas:\n{text}");
@@ -335,7 +423,9 @@ mod tests {
     /// header has to say so, or a missing line reads as a missing link.
     #[test]
     fn a_dense_graph_draws_only_the_selected_nodes_links_and_says_so() {
-        let n = 40;
+        // Past `EDGE_LIMIT`, which is now a guard against a pathological vault rather than a
+        // display decision — the ordinary dense case draws its whole web faintly.
+        let n = 95;
         let mut nodes = Vec::new();
         for i in 0..n {
             nodes.push(GraphNode {

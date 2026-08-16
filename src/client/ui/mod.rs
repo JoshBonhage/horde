@@ -235,8 +235,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // them. Everything else in horde is an overlay over a dimmed frame, because everything
     // else is something you do to a session you can still see. A start screen is not.
     if let Mode::Graph { sel } = app.mode {
-        if let (Some(sim), Some(g)) = (app.sim.as_ref(), app.vault.as_ref().and_then(|v| v.graph.as_ref()))
-        {
+        // Recorded so the mouse handler resolves a cell the same way the renderer placed it.
+        app.graph_plot = Some(graph_view::plot_of(area));
+        if let (Some(sim), Some(g)) = (app.sim.as_ref(), app.graph.as_ref()) {
             app.graph_hits = graph_view::draw(
                 f.buffer_mut(),
                 area,

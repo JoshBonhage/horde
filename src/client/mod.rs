@@ -144,6 +144,18 @@ impl DocSync {
     }
 }
 
+/// What a held mouse button is doing to the graph.
+///
+/// Grabbing a node moves the node; grabbing the background moves the view. Which one you get
+/// is decided by what was under the pointer when the button went down, which is the rule
+/// every graph editor uses and nobody has to be told.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GraphDrag {
+    /// Panning. Holds the last pointer cell, so each event moves by its own delta.
+    Pan { at: (u16, u16) },
+    Node { i: usize },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     /// Keystrokes go to the focused pane.
@@ -298,12 +310,24 @@ pub struct App {
     pub search: String,
     /// The graph layout, alive only while the graph is open.
     pub sim: Option<graph::Sim>,
+    /// The graph itself, held apart from `vault`.
+    ///
+    /// It used to be read back out of the last vault reply, which meant any *other* vault
+    /// query — a note being previewed, a search — replaced it with a reply carrying no graph
+    /// at all, and the picture vanished. A graph outlives the query that fetched it.
+    pub graph: Option<crate::proto::VaultGraph>,
     /// How far in, and where the view is centred. Panning moves the centre; the layout
     /// underneath does not know the difference.
     pub graph_zoom: f64,
     pub graph_centre: graph::Point,
     /// Node hits for the graph: `(y, x, node index)`.
     pub graph_hits: Vec<(u16, u16, usize)>,
+    /// The area the graph was last drawn into, so a click can be turned back into a place in
+    /// the layout. Recorded by the renderer rather than recomputed, because two copies of
+    /// the same geometry agree only until one of them changes.
+    pub graph_plot: Option<ratatui::layout::Rect>,
+    /// What the pointer is doing to the graph, while it is doing it.
+    pub graph_drag: Option<GraphDrag>,
     /// Row hits for the note browser.
     pub notes_hits: Vec<(u16, usize)>,
     /// Row hits for the dashboard: `(y, index into its row list)`.
@@ -361,9 +385,12 @@ impl App {
             yank: None,
             search: String::new(),
             sim: None,
+            graph: None,
             graph_zoom: 1.0,
             graph_centre: graph::Point { x: 0.0, y: 0.0 },
             graph_hits: Vec::new(),
+            graph_plot: None,
+            graph_drag: None,
             vault: None,
             follow: None,
             pending_read: None,
@@ -917,8 +944,8 @@ fn apply_frame(
                         Mode::Editor { path: note.path.clone(), scroll: 0, project: false, vim: Vim::Insert };
                 }
             }
-            if let Some(g) = v.graph.as_ref() {
-                let mut sim = graph::Sim::new(g);
+            if let Some(g) = v.graph.clone() {
+                let mut sim = graph::Sim::new(&g);
                 // Past the animation limit the picture is a shape rather than a story, and
                 // watching two thousand nodes shuffle costs more than it explains.
                 if g.nodes.len() > graph::ANIMATE_LIMIT {
@@ -926,6 +953,7 @@ fn apply_frame(
                 }
                 app.graph_centre = sim.centre();
                 app.sim = Some(sim);
+                app.graph = Some(g);
             }
             app.vault = Some(*v);
         }
@@ -1240,6 +1268,7 @@ fn handle_key(
                     // keep, and holding it would pin a vault's worth of points in a client
                     // that may not open the graph again this session.
                     app.sim = None;
+                    app.graph = None;
                     app.mode = Mode::Terminal;
                 }
                 // Tab walks the nodes, because the arrows are already panning the view.
@@ -1285,6 +1314,7 @@ fn handle_key(
                         };
                         open_note(app, &row, out);
                         app.sim = None;
+                        app.graph = None;
                         app.mode = Mode::Terminal;
                     }
                 }
@@ -2282,6 +2312,92 @@ fn create_note(app: &mut App, title: &str, out: &mpsc::UnboundedSender<ClientFra
     app.mode = Mode::Editor { path, scroll: 0, project: false, vim: Vim::Insert };
 }
 
+/// Drive the graph with the pointer.
+///
+/// Split out rather than inlined because it is the only view whose mouse handling is more
+/// than "what row is that", and because every branch of it needs the same three facts —
+/// where the plot is, what the layout is, and where in the layout the pointer is.
+fn graph_mouse(app: &mut App, m: crossterm::event::MouseEvent, sel: usize) {
+    let (Some(plot), true) = (app.graph_plot, app.sim.is_some()) else { return };
+    let (w, h) = (plot.width, plot.height);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let (zoom, centre) = (app.graph_zoom, app.graph_centre);
+    // Where the pointer is inside the plot. Saturating rather than checked: a pointer above
+    // or left of the plot reads as its nearest edge, which is what a drag off the top of the
+    // window should do anyway.
+    let at = |col: u16, row: u16| {
+        (col.saturating_sub(plot.x) as f64, row.saturating_sub(plot.y) as f64)
+    };
+    let here = at(m.column, m.row);
+    let where_is = |app: &App, cell: (f64, f64), zoom: f64| -> graph::Point {
+        app.sim.as_ref().map(|s| s.unproject(cell, w, h, zoom, centre)).unwrap_or(centre)
+    };
+
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // A node within a cell of the pointer is the node you meant. One cell of slack,
+            // because a glyph is one cell and nobody clicks the middle of anything.
+            let hit = app
+                .graph_hits
+                .iter()
+                .find(|(hy, hx, _)| *hy == m.row && hx.abs_diff(m.column) <= 1)
+                .map(|(_, _, i)| *i);
+            match hit {
+                Some(i) => {
+                    app.mode = Mode::Graph { sel: i };
+                    app.graph_drag = Some(GraphDrag::Node { i });
+                }
+                None => app.graph_drag = Some(GraphDrag::Pan { at: (m.column, m.row) }),
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => match app.graph_drag {
+            Some(GraphDrag::Node { i }) => {
+                let to = where_is(app, here, zoom);
+                if let Some(s) = app.sim.as_mut() {
+                    s.place(i, to);
+                }
+            }
+            Some(GraphDrag::Pan { at: last }) => {
+                // The view moves opposite the pointer, so the map follows your hand rather
+                // than fleeing it. Measured in layout units, or panning would move by
+                // different amounts at different zooms.
+                let from = where_is(app, at(last.0, last.1), zoom);
+                let to = where_is(app, here, zoom);
+                app.graph_centre.x -= to.x - from.x;
+                app.graph_centre.y -= to.y - from.y;
+                app.graph_drag = Some(GraphDrag::Pan { at: (m.column, m.row) });
+            }
+            None => {}
+        },
+        MouseEventKind::Up(_) => {
+            // Letting go of a node lets its neighbours answer. Only then — reheating while
+            // it is still held would fight the hand holding it.
+            if matches!(app.graph_drag, Some(GraphDrag::Node { .. })) {
+                if let Some(s) = app.sim.as_mut() {
+                    s.nudge();
+                }
+            }
+            app.graph_drag = None;
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            // Zoom about the pointer: whatever is under it stays under it. Zooming about the
+            // centre instead is what makes a graph lurch away from the thing you were
+            // reaching for, and is the single difference between this feeling like a map and
+            // feeling like a slideshow.
+            let before = where_is(app, here, zoom);
+            let step = if matches!(m.kind, MouseEventKind::ScrollUp) { 1.2 } else { 1.0 / 1.2 };
+            app.graph_zoom = (zoom * step).clamp(0.4, 8.0);
+            let after = where_is(app, here, app.graph_zoom);
+            app.graph_centre.x += before.x - after.x;
+            app.graph_centre.y += before.y - after.y;
+        }
+        _ => {}
+    }
+    let _ = sel;
+}
+
 // -- the editor's keyboard ---------------------------------------------------
 //
 // Split by mode rather than nested in one match, because insert and normal share almost no
@@ -2988,6 +3104,7 @@ fn run_action(
             // The layout is built when the answer arrives, not here: there is nothing to lay
             // out until the daemon says what the graph is.
             app.sim = None;
+            app.graph = None;
             app.graph_zoom = 1.0;
             app.mode = Mode::Graph { sel: 0 };
         }
@@ -3148,6 +3265,14 @@ fn handle_mouse(
             }
             _ => {}
         }
+        return Ok(());
+    }
+
+    // The graph is the one view where the mouse is the primary instrument rather than a
+    // convenience: grabbing a node, pulling the map about and zooming into a corner are all
+    // things a keyboard can only approximate.
+    if let Mode::Graph { sel } = app.mode {
+        graph_mouse(app, m, sel);
         return Ok(());
     }
 
@@ -4090,6 +4215,135 @@ mod tests {
         let shown: Vec<&str> =
             c.matching("horde d").iter().map(|i| i.label.as_str()).collect();
         assert_eq!(shown, ["Horde Dev Plan"], "and case does not matter");
+    }
+
+    // -- driving the graph with the pointer --------------------------------
+
+    /// A graph open on screen, laid out and with its plot recorded, as the renderer leaves it.
+    fn graphing() -> App {
+        let mut app = app_with_snapshot();
+        let g = crate::proto::VaultGraph {
+            nodes: (0..12)
+                .map(|i| crate::proto::GraphNode {
+                    path: format!("n{i}.md"),
+                    label: format!("n{i}"),
+                    degree: 2,
+                    group: "g".into(),
+                    ghost: false,
+                    by: None,
+                    mtime: 0,
+                })
+                .collect(),
+            edges: (0..11).map(|i| (i, i + 1)).collect(),
+        };
+        let mut sim = graph::Sim::new(&g);
+        sim.settle(400);
+        app.graph_centre = sim.centre();
+        app.graph_plot = Some(ratatui::layout::Rect::new(0, 1, 100, 30));
+        app.mode = Mode::Graph { sel: 0 };
+        // What the renderer would have recorded for these positions.
+        app.graph_hits = (0..12)
+            .filter_map(|i| {
+                sim.project(i, 100, 30, 1.0, app.graph_centre).map(|(x, y)| (y + 1, x, i))
+            })
+            .collect();
+        app.sim = Some(sim);
+        app.graph = Some(g);
+        app
+    }
+
+    fn mouse(kind: MouseEventKind, col: u16, row: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE }
+    }
+
+    /// `graph_hits` was filled in by the renderer and read by nothing — clicking a node did
+    /// not select it, because there was no mouse handler for this mode at all.
+    #[test]
+    fn clicking_a_node_selects_it() {
+        let mut app = graphing();
+        let (row, col, want) = app.graph_hits[5];
+        graph_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), col, row), 0);
+        assert_eq!(app.mode, Mode::Graph { sel: want });
+        assert_eq!(app.graph_drag, Some(GraphDrag::Node { i: want }), "and is holding it");
+    }
+
+    /// Grabbing a node moves the node; grabbing the background moves the view. Which one you
+    /// get is decided by what was under the pointer, which is the rule nobody has to be told.
+    #[test]
+    fn dragging_the_background_pans_and_dragging_a_node_moves_it() {
+        let mut app = graphing();
+        let empty = app
+            .graph_hits
+            .iter()
+            .all(|(r, c, _)| !(*r == 2 && c.abs_diff(1) <= 1))
+            .then_some((1u16, 2u16))
+            .expect("a corner with no node in it");
+
+        let before = app.graph_centre;
+        graph_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), empty.0, empty.1), 0);
+        assert!(matches!(app.graph_drag, Some(GraphDrag::Pan { .. })));
+        graph_mouse(&mut app, mouse(MouseEventKind::Drag(MouseButton::Left), empty.0 + 20, empty.1), 0);
+        assert!(app.graph_centre.x < before.x, "the map followed the hand, not fled it");
+
+        // A node instead: the layout moves, the view does not.
+        let mut app = graphing();
+        let (row, col, i) = app.graph_hits[3];
+        let was = app.sim.as_ref().unwrap().pos[i];
+        let centre = app.graph_centre;
+        // Toward the middle of the plot, deliberately: a settled layout pins its outermost
+        // nodes against the wall of the field, and dragging one further out is a no-op that
+        // would read as the drag not working.
+        let (tx, ty) = (50u16, 16u16);
+        graph_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), col, row), 0);
+        graph_mouse(&mut app, mouse(MouseEventKind::Drag(MouseButton::Left), tx, ty), 0);
+        assert_ne!(app.sim.as_ref().unwrap().pos[i], was, "the node moved");
+        assert_eq!(app.graph_centre, centre, "and the view did not");
+
+        // Letting go lets its neighbours answer, which they cannot do from a settled layout.
+        graph_mouse(&mut app, mouse(MouseEventKind::Up(MouseButton::Left), tx, ty), 0);
+        assert_eq!(app.graph_drag, None);
+        assert!(!app.sim.as_ref().unwrap().settled(), "the layout has work to do again");
+    }
+
+    /// Whatever is under the pointer stays under it. Zooming about the centre instead is what
+    /// makes a graph lurch away from the thing you were reaching for.
+    #[test]
+    fn scrolling_zooms_about_the_pointer() {
+        let mut app = graphing();
+        let (w, h) = (100u16, 30u16);
+        let pointer = (72.0, 8.0);
+        let under = |app: &App| {
+            app.sim.as_ref().unwrap().unproject(pointer, w, h, app.graph_zoom, app.graph_centre)
+        };
+
+        let before = under(&app);
+        graph_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 72, 9), 0);
+        assert!(app.graph_zoom > 1.0, "it zoomed in");
+        let after = under(&app);
+        assert!(
+            (after.x - before.x).abs() < 1e-6 && (after.y - before.y).abs() < 1e-6,
+            "the point under the pointer moved: {before:?} -> {after:?}"
+        );
+
+        // And back out again, to the same place.
+        graph_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 72, 9), 0);
+        assert!((app.graph_zoom - 1.0).abs() < 1e-9, "{}", app.graph_zoom);
+    }
+
+    /// A graph with no layout yet is a real state — the reply has not arrived — and the
+    /// pointer must do nothing rather than panic on it.
+    #[test]
+    fn the_pointer_does_nothing_to_a_graph_that_is_not_there_yet() {
+        let mut app = app_with_snapshot();
+        app.mode = Mode::Graph { sel: 0 };
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+        ] {
+            graph_mouse(&mut app, mouse(kind, 10, 10), 0);
+        }
+        assert_eq!(app.mode, Mode::Graph { sel: 0 });
     }
 
     /// Opening horde is arriving, and arriving shows you the state of things. Every attach
