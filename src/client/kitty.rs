@@ -25,9 +25,16 @@ const CHUNK: usize = 4096;
 
 /// The widest an image is sent at.
 ///
-/// The terminal scales into the cell box either way, so sending a 4K wallpaper at full size
-/// buys nothing and costs a megabyte of base64 down a pipe on every placement.
-const MAX_WIDTH: u32 = 1600;
+///4K, so a 4K picture goes exactly as it was made. Anything wider is a panorama or a scan and
+/// gets one careful downscale — the terminal would have to shrink it to fit a screen anyway,
+/// and doing it once here beats sending forty megabytes of base64.
+const MAX_WIDTH: u32 = 3840;
+
+/// The largest file sent without touching it.
+///
+/// Past this the base64 alone is thirty megabytes down a pipe, which is worth one resample to
+/// avoid even though the picture is technically "as it came".
+const MAX_ORIGINAL: u64 = 24 * 1024 * 1024;
 
 /// Where one image is drawn, in cells on the screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +82,25 @@ pub fn looks_capable() -> bool {
         || std::env::var("KITTY_WINDOW_ID").is_ok()
 }
 
+/// How big one cell is, in real pixels, if the terminal will say.
+///
+/// `TIOCGWINSZ` carries a pixel size alongside the character size, and a terminal that fills
+/// it in has just answered the only question that matters here: how many cells an image needs
+/// in order to be drawn at its own resolution and no other.
+///
+/// Asked through an ioctl rather than by writing `\x1b[16t` and reading the reply, because
+/// reading from the terminal means racing whatever else is writing to it and having a policy
+/// for terminals that never answer.
+pub fn cell_size() -> Option<(u32, u32)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `ioctl` writes only the `winsize` it is handed.
+    let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+    if !ok || ws.ws_col == 0 || ws.ws_row == 0 || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
+        return None;
+    }
+    Some((ws.ws_xpixel as u32 / ws.ws_col as u32, ws.ws_ypixel as u32 / ws.ws_row as u32))
+}
+
 /// How many cells tall an image `cols` wide should be, to keep its shape.
 ///
 /// A cell is about twice as tall as it is wide, so a square picture is half as many rows as
@@ -93,15 +119,46 @@ pub fn rows_for(pixel_w: u32, pixel_h: u32, cols: u16, limit: u16) -> u16 {
 /// tall picture into the width it was offered, which is the same distortion the half-block
 /// path was fixed for.
 pub fn fit(pixel_w: u32, pixel_h: u32, max_cols: u16, max_rows: u16) -> (u16, u16) {
+    fit_in(pixel_w, pixel_h, max_cols, max_rows, cell_size())
+}
+
+/// The same, with the cell size supplied — so the arithmetic is testable.
+///
+/// **Natural size first.** The box asked for is a *limit*, not a size to fill. Stretching every
+/// picture to the width of the text column is what made a 871-pixel screenshot draw across
+/// fifteen hundred device pixels on a retina display: upscaled almost twice, and blurred
+/// exactly as much. A picture that fits is drawn at its own resolution and no other; only one
+/// too big to fit is scaled, and then only down.
+pub fn fit_in(
+    pixel_w: u32,
+    pixel_h: u32,
+    max_cols: u16,
+    max_rows: u16,
+    cell: Option<(u32, u32)>,
+) -> (u16, u16) {
     if pixel_w == 0 || pixel_h == 0 || max_cols == 0 || max_rows == 0 {
         return (0, 0);
     }
-    let rows = rows_for(pixel_w, pixel_h, max_cols, u16::MAX);
-    if rows <= max_rows {
-        return (max_cols, rows.max(1));
+    let Some((cw, ch)) = cell.filter(|(w, h)| *w > 0 && *h > 0) else {
+        // The terminal did not say how big a cell is, so the best available answer is the
+        // shape of the thing and the width on offer.
+        let rows = rows_for(pixel_w, pixel_h, max_cols, u16::MAX);
+        if rows <= max_rows {
+            return (max_cols, rows.max(1));
+        }
+        let cols = (max_cols as f64 * max_rows as f64 / rows as f64).round().max(1.0) as u16;
+        return (cols, max_rows);
+    };
+
+    let want_c = pixel_w.div_ceil(cw).max(1) as f64;
+    let want_r = pixel_h.div_ceil(ch).max(1) as f64;
+    if want_c <= max_cols as f64 && want_r <= max_rows as f64 {
+        // It fits, so it is drawn as it is.
+        return (want_c as u16, want_r as u16);
     }
-    let cols = (max_cols as f64 * max_rows as f64 / rows as f64).round().max(1.0) as u16;
-    (cols, max_rows)
+    // Too big for the room: down, and in proportion.
+    let s = (max_cols as f64 / want_c).min(max_rows as f64 / want_r);
+    (((want_c * s).round() as u16).max(1), ((want_r * s).round() as u16).max(1))
 }
 
 /// The same, but drawn where the cursor already is.
@@ -195,10 +252,20 @@ pub fn clear() -> Vec<u8> {
 /// Cached alongside the half-block cache for the same reason: a 4K wallpaper decoded and
 /// re-encoded per frame would cost more than everything else horde does put together.
 pub fn encode(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    let (w, h) = image::image_dimensions(path).ok()?;
+    // A PNG that is already a reasonable size goes exactly as it is. Decoding and re-encoding
+    // it produces the same picture at the cost of doing the work, and any filter applied on
+    // the way is a filter applied for no reason.
+    let already = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
+        && std::fs::metadata(path).is_ok_and(|m| m.len() <= MAX_ORIGINAL);
+    if already && w <= MAX_WIDTH {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Some((bytes, w, h));
+        }
+    }
     let img = image::open(path).ok()?;
-    let (w, h) = (img.width(), img.height());
     let img = if w > MAX_WIDTH {
-        img.resize(MAX_WIDTH, u32::MAX, image::imageops::FilterType::Triangle)
+        img.resize(MAX_WIDTH, u32::MAX, image::imageops::FilterType::Lanczos3)
     } else {
         img
     };
@@ -318,17 +385,43 @@ mod tests {
 
     /// A malformed escape does not fail, it prints — so the shape of one is worth pinning
     /// rather than finding out by watching gibberish scroll past.
+    /// The box is a limit, not a size to fill. Stretching every picture to the width of the
+    /// text column is what made an 871-pixel screenshot draw across fifteen hundred device
+    /// pixels on a retina display — upscaled nearly twice, and blurred exactly that much.
+    #[test]
+    fn a_picture_that_fits_is_drawn_at_its_own_resolution() {
+        // A retina cell: 16x34 device pixels.
+        let cell = Some((16, 34));
+        // The SOP screenshot that started this. 871/16 = 55 columns, 346/34 = 11 rows.
+        assert_eq!(fit_in(871, 346, 96, 24, cell), (55, 11));
+        // Not stretched to the 96 columns on offer, which is the whole point.
+        assert!(fit_in(871, 346, 96, 24, cell).0 < 96);
+
+        // Something small stays small rather than being blown up to fill the column.
+        assert_eq!(fit_in(64, 64, 96, 24, cell), (4, 2));
+
+        // Too big for the room: down, in proportion, never up.
+        let (c, r) = fit_in(3840, 2400, 96, 24, cell);
+        assert!(c <= 96 && r <= 24, "{c}x{r}");
+        assert!((c as f64 / r as f64 - 240.0 / 71.0).abs() < 0.6, "shape kept: {c}x{r}");
+
+        // A terminal that will not say how big a cell is falls back to the old guess, which
+        // is the width on offer and the shape of the thing.
+        assert_eq!(fit_in(871, 346, 96, 24, None).0, 96);
+        assert_eq!(fit_in(0, 0, 96, 24, cell), (0, 0));
+    }
+
     /// Both dimensions give way. Capping only the height squashes a tall picture into the
     /// width it was offered, which is the distortion the half-block path was already fixed for.
     #[test]
     fn a_tall_picture_narrows_rather_than_squashing() {
-        assert_eq!(fit(100, 100, 40, 99), (40, 20), "it fits, so it uses the width");
-        let (c, r) = fit(100, 400, 40, 20);
+        assert_eq!(fit_in(100, 100, 40, 99, None), (40, 20), "no cell size: use the width");
+        let (c, r) = fit_in(100, 400, 40, 20, None);
         assert_eq!(r, 20, "height-limited");
         assert!(c < 40, "so the width came in too: {c}");
         // Still the right shape: 1:4 in pixels is 1:2 in cells.
         assert!(((r as f64 / c as f64) - 2.0).abs() < 0.35, "{c}x{r}");
-        assert_eq!(fit(0, 0, 40, 20), (0, 0));
+        assert_eq!(fit_in(0, 0, 40, 20, None), (0, 0));
     }
 
     #[test]
