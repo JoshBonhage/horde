@@ -139,6 +139,9 @@ impl Answers {
         vec![
             ("vault.home", Value::Str(self.vault.clone())),
             ("triggers.unattended", Value::Bool(self.unattended)),
+            // Last, and written whatever the answers were: it records that the walkthrough
+            // happened, not what it decided. See `mark_done` for the skipped path.
+            ("setup.done", Value::Bool(true)),
         ]
     }
 
@@ -186,6 +189,16 @@ impl Answers {
         }
         out
     }
+}
+
+/// Record that the walkthrough has been offered, without applying any of it.
+///
+/// What `esc` does. Skipping used to change nothing at all, which meant it was not a skip: the
+/// next launch found no answer recorded and asked again, and so did the one after that. Saying
+/// "not now" once should be believed, and the walkthrough is still on the settings page.
+pub fn mark_done() -> Result<(), String> {
+    settings::write("setup.done", Value::Bool(true))
+        .map_err(|e| format!("could not save setup.done: {e:#}"))
 }
 
 /// How many choices the step offers, for cursor bounds.
@@ -427,6 +440,30 @@ mod tests {
         assert!(warnings.is_empty(), "it must parse cleanly: {warnings:?}");
         assert_eq!(cfg.vault_home, std::path::PathBuf::from("/tmp/my-notes"));
         assert!(cfg.unattended);
+        assert!(cfg.setup_done, "finishing records that it happened: {text}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Skipping is a decision, and it used to be forgotten the instant it was made: `esc` wrote
+    /// nothing, so the next launch found nothing recorded and asked all over again.
+    #[test]
+    fn skipping_is_remembered_and_applies_none_of_the_answers() {
+        let dir = std::env::temp_dir().join(format!("horde-skip-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        settings::write_to(&path, "setup.done", Value::Bool(true)).expect("it writes");
+
+        let (cfg, warnings) = crate::config::Config::load_from(&path);
+        assert!(warnings.is_empty(), "it must parse cleanly: {warnings:?}");
+        assert!(cfg.setup_done, "so it is not offered again");
+        assert_eq!(
+            cfg.vault_home,
+            crate::config::Config::default().vault_home,
+            "and nothing the walkthrough would have set was set"
+        );
+        assert!(!cfg.unattended, "least of all this one");
 
         let _ = std::fs::remove_dir_all(dir);
     }

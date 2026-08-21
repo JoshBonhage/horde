@@ -577,6 +577,25 @@ The sidebar footer shows `◈ 2 triggers armed` whenever anything could fire, be
 allowed to act on its own should be visible rather than remembered. Full reference:
 [unattended](unattended.md).
 
+## `setup.done` — the walkthrough happened
+
+```toml
+[setup]
+done = true
+```
+
+Written by the first-run walkthrough, when you finish it *or* skip it with `esc`. Its absence is
+what makes horde offer the walkthrough, so deleting the line is how you ask for it again from
+outside horde. Settings → Agents does the same from inside.
+
+Nothing else writes it, and it is deliberately **not** in
+[config.example.toml](../config.example.toml). Whether a person has been walked through setup is
+its own fact and horde used to guess at it from whether `config.toml` existed, which is a
+different fact wearing the same clothes: copy the example config, restore your dotfiles, or set
+one key on the settings page, and the walkthrough was skipped forever without anything saying so.
+The other direction was just as wrong — `esc` wrote nothing, so a skip was re-offered on every
+single launch.
+
 ## Bad values do not stop startup
 
 A malformed key spec, an unknown theme, a misspelled key — each produces a warning toast and

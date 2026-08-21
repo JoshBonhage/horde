@@ -21,11 +21,15 @@ horde
 That is all. horde starts its own background daemon, creates a space named after the
 directory, and drops you into a shell.
 
-With no `config.toml` yet, the first thing you see is a three-question walkthrough: where notes
+The first thing you see is a three-question walkthrough: where notes
 live, whether Claude Code should report its own state through hooks (see
 [below](#worth-doing-once) — the walkthrough can do this for you), and whether horde may act
 while nobody is attached. Every answer is already chosen, so `enter` through it is fine and
 `esc` skips it. It is all config afterwards, and reopenable from Settings → Agents.
+
+You get it once. Finishing it or skipping it writes `setup.done`, which is the only thing that
+decides whether you are asked — not whether a `config.toml` happens to exist, so a config you
+copied or restored from dotfiles does not silently cost you the walkthrough.
 
 `ctrl+b d` detaches. **Your agents keep running.** `horde` reattaches.
 

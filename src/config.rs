@@ -89,6 +89,8 @@ struct RawConfig {
     #[serde(default)]
     vault: RawVault,
     #[serde(default)]
+    setup: RawSetup,
+    #[serde(default)]
     keys: HashMap<String, String>,
     #[serde(default)]
     agents: RawAgents,
@@ -176,6 +178,20 @@ struct RawTheme {
 }
 
 /// Where a project's notes live, and whether to look for them at all.
+/// Whether the first-run walkthrough has already happened.
+///
+/// Its own section, and written by nothing but the walkthrough itself. The alternative — and
+/// what this replaced — was inferring it from whether `config.toml` exists at all, which is a
+/// different fact wearing the same clothes. A file exists because someone copied the example
+/// config, or restored their dotfiles, or set one key on the settings page; none of those mean
+/// a person has been walked through anything, and every one of them silently skipped the
+/// walkthrough forever.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSetup {
+    done: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVault {
@@ -249,6 +265,7 @@ const SECTIONS: &[&str] = &[
     "theme",
     "ui",
     "vault",
+    "setup",
     "keys",
     "agents",
     "kanban",
@@ -327,6 +344,7 @@ fn read_sections(text: &str, warnings: &mut Vec<String>) -> Option<RawConfig> {
             "theme" => raw.theme = part(value, &named, warnings).unwrap_or_default(),
             "ui" => raw.ui = part(value, &named, warnings).unwrap_or_default(),
             "vault" => raw.vault = part(value, &named, warnings).unwrap_or_default(),
+            "setup" => raw.setup = part(value, &named, warnings).unwrap_or_default(),
             "agents" => raw.agents = part(value, &named, warnings).unwrap_or_default(),
             "kanban" => raw.kanban = part(value, &named, warnings).unwrap_or_default(),
             "notifications" => {
@@ -571,6 +589,11 @@ pub struct Config {
     /// machine gives up". A lead agent building a fleet is the intended use, so the number is
     /// a working team rather than a token allowance.
     pub max_fleet: usize,
+    /// Whether the first-run walkthrough has already run.
+    ///
+    /// Recorded rather than inferred — see [`RawSetup`]. False means nobody has been walked
+    /// through setup on this machine, whatever else the config file happens to contain.
+    pub setup_done: bool,
     /// Whether triggers may fire at all. Off by default: acting with nobody watching is a
     /// different promise from running side by side, and has to be asked for.
     pub unattended: bool,
@@ -698,6 +721,7 @@ impl Default for Config {
             // watching the board behave for a day before switching it on. Needs `board = true`.
             task_nudge: false,
             max_fleet: 6,
+            setup_done: false,
             board: true,
             // Empty: anyone may add. Naming roles here is opting into a hierarchy, which is a
             // choice about how you work rather than a default worth having.
@@ -961,6 +985,7 @@ impl Config {
         cfg.force_inject = raw.agents.force_inject.unwrap_or(cfg.force_inject);
         cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
         cfg.max_fleet = raw.agents.max_fleet.unwrap_or(cfg.max_fleet);
+        cfg.setup_done = raw.setup.done.unwrap_or(cfg.setup_done);
         cfg.board = raw.agents.board.unwrap_or(cfg.board);
         // Normalised through the same funnel as a pane's role and a task's, so `Project Manager`
         // in config and `pm`... do not silently fail to match. A name that normalises to nothing
@@ -1031,7 +1056,11 @@ impl Config {
 // Keys
 // ---------------------------------------------------------------------------
 
-/// Where the config file lives. Its absence is how horde knows it has never been set up.
+/// Where the config file lives.
+///
+/// Its absence used to be how horde knew it had never been set up. It is not that: a file
+/// exists for plenty of reasons that have nothing to do with a person having been walked
+/// through anything. `setup.done` records that instead.
 pub fn config_path() -> std::path::PathBuf {
     config_dir().join("config.toml")
 }

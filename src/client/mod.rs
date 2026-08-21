@@ -1019,6 +1019,36 @@ async fn run_loop(
     }
 }
 
+/// What the first attach of a session opens on.
+///
+/// Every attach opens on the start screen. Opening horde is arriving, and what you want on
+/// arrival is the state of things — which agents need you, which projects are live — not
+/// whichever pane happened to be focused last time. The daemon and its agents are untouched by
+/// this: they keep running whether or not anyone is looking, which is the whole point of the
+/// daemon. Only the *view* resets, and `esc` is one keystroke away from the terminal.
+///
+/// Ahead of that comes the walkthrough, once. Being asked three questions once beats
+/// discovering them by hitting them — "no vault" the first time you write a note is not a
+/// prompt, it is a wall.
+///
+/// Whether it has happened is read from `setup.done`, which the walkthrough writes when it is
+/// finished *or* skipped. It used to be inferred from whether `config.toml` existed, and that
+/// was wrong in both directions: a file that exists for any other reason — the example config
+/// copied, dotfiles restored, one key set on the settings page — meant nobody was ever walked
+/// through anything, while pressing `esc` wrote nothing and so asked again on every launch
+/// forever.
+///
+/// A pure function of the config so all three cases can be asserted, which none of them were.
+fn greet_mode(cfg: &Config) -> Mode {
+    if !cfg.setup_done {
+        Mode::Setup { step: ui::setup::Step::Vault }
+    } else if cfg.dashboard {
+        Mode::Dashboard { sel: 0 }
+    } else {
+        Mode::Terminal
+    }
+}
+
 /// Apply one server frame. Returns a reason string when the session must end.
 ///
 /// Takes the sender because one answer can lead to another: following a wikilink asks the
@@ -1095,17 +1125,11 @@ fn apply_frame(
             if !app.greeted {
                 app.greeted = true;
                 if app.mode == Mode::Terminal {
-                    // No config file means horde has never been set up here, which is a fact
-                    // on disk rather than a guess about the person. Being asked four
-                    // questions once beats discovering them by hitting them — "no vault" the
-                    // first time you write a note is not a prompt, it is a wall.
-                    app.mode = if !crate::config::config_path().exists() {
-                        Mode::Setup { step: ui::setup::Step::Vault }
-                    } else if app.cfg.dashboard {
-                        Mode::Dashboard { sel: 0 }
-                    } else {
-                        Mode::Terminal
-                    };
+                    app.mode = greet_mode(&app.cfg);
+                    if let Mode::Setup { .. } = app.mode {
+                        app.setup.cursor =
+                            ui::setup::cursor_for(ui::setup::Step::Vault, &app.setup);
+                    }
                 }
             }
             // A project was opened and is now focused: list it.
@@ -1699,9 +1723,21 @@ fn handle_key(
             };
 
             match k.code {
-                // Skipping is allowed and changes nothing: someone who wants to look around
-                // first should not have to answer four questions to be let in.
-                KeyCode::Esc => app.mode = Mode::Dashboard { sel: 0 },
+                // Skipping is allowed and applies none of the answers: someone who wants to
+                // look around first should not have to answer three questions to be let in.
+                // It does record that the offer was made, so "not now" is not re-asked on
+                // every launch, and says where to find it again.
+                KeyCode::Esc => {
+                    if let Err(e) = ui::setup::mark_done() {
+                        app.toast(NoticeLevel::Warn, e);
+                    } else {
+                        app.toast(
+                            NoticeLevel::Info,
+                            "setup skipped — Settings → Agents runs it again".to_string(),
+                        );
+                    }
+                    app.mode = Mode::Dashboard { sel: 0 };
+                }
                 KeyCode::Enter => advance(app, out, step),
                 KeyCode::Down | KeyCode::Tab => {
                     app.setup.cursor = (app.setup.cursor + 1).min(count.saturating_sub(1))
@@ -4873,6 +4909,55 @@ fn plural(n: usize, word: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The bug a friend hit: a `config.toml` that exists for some other reason — the example
+    /// config copied, dotfiles restored — used to mean the walkthrough never ran, silently.
+    /// What decides it is the recorded fact, and nothing else.
+    #[test]
+    fn a_config_file_that_says_nothing_about_setup_still_gets_the_walkthrough() {
+        let dir = std::env::temp_dir().join(format!("horde-greet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // A full, valid config — every question the walkthrough asks already answered by hand,
+        // which is exactly what copying config.example.toml leaves you with.
+        std::fs::write(
+            &path,
+            "[vault]\nhome = \"~/notes\"\n\n[triggers]\nunattended = true\n",
+        )
+        .unwrap();
+        let (cfg, warnings) = Config::load_from(&path);
+        assert!(warnings.is_empty(), "the file is valid: {warnings:?}");
+        assert!(!cfg.setup_done, "answering by hand is not being walked through");
+        assert!(
+            matches!(greet_mode(&cfg), Mode::Setup { .. }),
+            "so the walkthrough is still offered"
+        );
+
+        // And once it has run, it is not offered again.
+        std::fs::write(&path, "[setup]\ndone = true\n").unwrap();
+        let (cfg, _) = Config::load_from(&path);
+        assert!(cfg.setup_done);
+        assert!(
+            !matches!(greet_mode(&cfg), Mode::Setup { .. }),
+            "asked once, not on every launch"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With setup behind you the start screen is the dashboard, and `ui.dashboard = false`
+    /// lands you in the terminal instead. Pinned because the walkthrough check sits in front of
+    /// both and used to swallow them.
+    #[test]
+    fn once_setup_is_done_the_start_screen_is_the_one_you_configured() {
+        let mut cfg = Config::default();
+        cfg.setup_done = true;
+        cfg.dashboard = true;
+        assert!(matches!(greet_mode(&cfg), Mode::Dashboard { .. }));
+        cfg.dashboard = false;
+        assert_eq!(greet_mode(&cfg), Mode::Terminal);
+    }
+
     /// `tab_at` duplicates `TabBar`'s layout arithmetic, so pin them together: the column
     /// range a tab is drawn at must be the range that resolves back to it.
     #[test]
@@ -7119,10 +7204,16 @@ mod tests {
     /// Opening horde is arriving, and arriving shows you the state of things. Every attach
     /// starts here — including a reattach to a session full of running agents, because what
     /// you want after being away is the board, not whichever pane was last focused.
+    ///
+    /// `setup_done` is stated rather than defaulted: what is being asserted is where an attach
+    /// lands *after* the walkthrough, and leaving it to the default made this test pass or fail
+    /// on whether the person running it happened to have a `config.toml` in their own home
+    /// directory — which is what it read before the fact was recorded in the config itself.
     #[test]
     fn every_attach_opens_on_the_start_screen() {
         for panes in [0, 3] {
-            let mut app = App::new_for_test(Config::default());
+            let mut app =
+                App::new_for_test(Config { setup_done: true, ..Config::default() });
             let mut snap = crate::client::roster::tests::snap();
             snap.panes.truncate(panes);
             apply_frame(&mut app, ServerFrame::Snapshot(Box::new(snap)), &sink());
@@ -7148,7 +7239,7 @@ mod tests {
     /// Turning it off has to actually turn it off, on the one path that shows it.
     #[test]
     fn the_greeter_can_be_switched_off() {
-        let cfg = Config { dashboard: false, ..Config::default() };
+        let cfg = Config { dashboard: false, setup_done: true, ..Config::default() };
         let mut app = App::new_for_test(cfg);
         let snap = crate::client::roster::tests::snap();
         apply_frame(&mut app, ServerFrame::Snapshot(Box::new(snap)), &sink());

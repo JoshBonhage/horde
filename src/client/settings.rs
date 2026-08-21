@@ -413,7 +413,8 @@ pub enum Value {
 ///
 /// Deferred to the loader rather than rebuilt from `config_dir()`, so the page cannot end up
 /// writing to a path the loader does not read — the failure that looks like "settings do
-/// nothing", and which the first-run check would report as never having been set up.
+/// nothing" — and which would also lose `setup.done`, so the walkthrough would be offered
+/// again on the next launch.
 pub fn config_file() -> PathBuf {
     crate::config::config_path()
 }
@@ -471,6 +472,18 @@ fn set_path(doc: &mut DocumentMut, key: &str, value: Value) {
                 let mut t = Table::new();
                 // Implicit would omit the [header] and produce dotted keys instead.
                 t.set_implicit(false);
+                // A comment dangling at the end of the file was written under the last
+                // section, and a new table appended after it steals it: the starter config
+                // ends with a commented-out `# zoom = "prefix+f"` under `[keys]`, and writing
+                // any new section left that example sitting under the new header — where
+                // uncommenting it would be a key in the wrong table. Carry the trailing
+                // trivia onto the new header instead, which leaves it exactly where it was.
+                let trailing = doc.trailing().as_str().unwrap_or_default().to_string();
+                if !trailing.trim().is_empty() {
+                    doc.set_trailing("");
+                    t.decor_mut()
+                        .set_prefix(format!("{}\n\n", trailing.trim_end_matches('\n')));
+                }
                 doc[first] = Item::Table(t);
             }
             doc[first][second] = item;
@@ -549,6 +562,29 @@ pub fn editor() -> String {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// The starter config ends with a commented-out example under `[keys]`. Appending a new
+    /// section used to print it *after* the new header, so the first thing the walkthrough did
+    /// to a brand-new config was move somebody's example into the wrong table.
+    #[test]
+    fn a_new_section_does_not_adopt_the_comment_above_it() {
+        let dir = tmpdir("trailing");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, template()).unwrap();
+
+        write_to(&path, "setup.done", Value::Bool(true)).expect("it writes");
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        let comment = text.find("# zoom").expect("the example survives");
+        let header = text.find("[setup]").expect("and the new section is there");
+        assert!(comment < header, "the comment stays under [keys]:\n{text}");
+
+        let (cfg, warnings) = crate::config::Config::load_from(&path);
+        assert!(warnings.is_empty(), "and it still parses: {warnings:?}");
+        assert!(cfg.setup_done);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("horde-settings-{name}"));
