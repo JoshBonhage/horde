@@ -87,6 +87,12 @@ impl Widget for Sidebar<'_> {
                 (o, _) => summary.push(("◇", o, "tasks open", AgentState::Unknown)),
             }
         }
+        // Your own board's deadline, beside the agents'. Only what is due or already late —
+        // a count of everything on it would be a number that never changes and so never
+        // means anything, which is the failure of every badge that counts a whole inbox.
+        if self.snap.cards_due > 0 {
+            summary.push(("◈", self.snap.cards_due, "cards due", AgentState::Blocked));
+        }
         // That horde is allowed to act on its own should never be something you have to
         // remember rather than see. Counted, not a bare word, because "which rules" is the
         // immediate next question and `horde trigger list` is the answer.

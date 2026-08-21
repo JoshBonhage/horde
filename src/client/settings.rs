@@ -57,6 +57,7 @@ pub enum Field {
     BusWidth,
     PaneTitles,
     Animate,
+    Zombie,
     Notifications,
     RestoreAgents,
     DetectionLines,
@@ -74,6 +75,11 @@ pub enum Action {
     Reload,
     /// Install the Claude Code lifecycle hooks.
     InstallClaudeHooks,
+    /// Run the first-run walkthrough again.
+    ///
+    /// The walkthrough has always told you it lives here. It did not, so the one thing it
+    /// promised about itself was the one thing it got wrong.
+    RunSetup,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +139,8 @@ pub fn rows(cfg: &Config, cat: Category) -> Vec<Row> {
             setting("Pane titles", onoff(cfg.pane_titles), Field::PaneTitles),
             setting("Animations", onoff(cfg.animate), Field::Animate),
             note("Spinners for working agents; off is calmer over ssh."),
+            setting("Wordmark walk", onoff(cfg.zombie), Field::Zombie),
+            note("Something crosses the start screen now and then. Needs Animations."),
             separator(),
             Row {
                 label: "Edit config.toml".into(),
@@ -171,10 +179,10 @@ pub fn rows(cfg: &Config, cat: Category) -> Vec<Row> {
             note("Rows of the live buffer that screen detection matches against."),
             separator(),
             setting("Force message delivery", onoff(cfg.force_inject), Field::ForceInject),
-            note("Parked while the bus is reworked — nothing is delivered to force."),
+            note("Deliver even mid-turn. Races what the agent is writing; off is safer."),
             separator(),
             setting("Nudge idle agents", onoff(cfg.task_nudge), Field::TaskNudge),
-            note("Parked while the board is reworked — this has no effect yet."),
+            note("Tell one enlisted idle agent when its project's board has work."),
             separator(),
             Row {
                 label: "Install Claude Code hooks".into(),
@@ -182,6 +190,13 @@ pub fn rows(cfg: &Config, cat: Category) -> Vec<Row> {
                 kind: Kind::Action(Action::InstallClaudeHooks),
             },
             note("Hooks beat screen detection; a narrow pane can hide the marker."),
+            separator(),
+            Row {
+                label: "Run setup again".into(),
+                value: "the first-run walkthrough".into(),
+                kind: Kind::Action(Action::RunSetup),
+            },
+            note("Notes location, hooks, and whether horde may act unattended."),
         ],
 
         Category::Notifications => vec![
@@ -208,6 +223,19 @@ pub fn rows(cfg: &Config, cat: Category) -> Vec<Row> {
         Category::About => vec![
             read_only("horde", env!("CARGO_PKG_VERSION").into()),
             read_only("protocol", crate::proto::PROTOCOL_VERSION.to_string()),
+            separator(),
+            // Reported, not asked. Grammars are compiled in, so this is a fact about the
+            // binary — which is why it belongs here rather than in the walkthrough, where it
+            // was a question whose answer nothing could act on.
+            read_only("highlighting", {
+                let langs = crate::client::syntax::available();
+                if langs.is_empty() {
+                    "markdown only — built without language features".into()
+                } else {
+                    langs.join(", ")
+                }
+            }),
+            note("Compiled in. A smaller build is `--no-default-features`."),
             separator(),
             read_only("config", config_file().display().to_string()),
             read_only("socket", crate::config::socket_path().display().to_string()),
@@ -283,6 +311,10 @@ pub fn bump(cfg: &mut Config, field: Field, delta: i32) -> (String, Value) {
         Field::Animate => {
             cfg.animate = !cfg.animate;
             ("ui.animate".into(), Value::Bool(cfg.animate))
+        }
+        Field::Zombie => {
+            cfg.zombie = !cfg.zombie;
+            ("ui.zombie".into(), Value::Bool(cfg.zombie))
         }
         Field::Notifications => {
             let order = [Notify::Horde, Notify::System, Notify::Off];
@@ -369,10 +401,21 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Str(String),
+    /// A list of strings, written inline — `columns = ["Backlog", "Todo"]`.
+    ///
+    /// Inline rather than as an array of tables, because these are values a person reads in
+    /// one glance and edits by hand. Appended to the enum rather than inserted, out of the
+    /// same habit the wire enums keep.
+    List(Vec<String>),
 }
 
+/// The file the settings page writes.
+///
+/// Deferred to the loader rather than rebuilt from `config_dir()`, so the page cannot end up
+/// writing to a path the loader does not read — the failure that looks like "settings do
+/// nothing", and which the first-run check would report as never having been set up.
 pub fn config_file() -> PathBuf {
-    crate::config::config_dir().join("config.toml")
+    crate::config::config_path()
 }
 
 /// Write one dotted key into the user's `config.toml`.
@@ -411,6 +454,13 @@ fn set_path(doc: &mut DocumentMut, key: &str, value: Value) {
         Value::Bool(b) => toml_edit::value(b),
         Value::Int(i) => toml_edit::value(i),
         Value::Str(s) => toml_edit::value(s),
+        Value::List(items) => {
+            let mut arr = toml_edit::Array::new();
+            for i in items {
+                arr.push(i);
+            }
+            toml_edit::value(arr)
+        }
     };
     let mut parts = key.split('.');
     let first = parts.next().unwrap_or(key);
@@ -428,11 +478,19 @@ fn set_path(doc: &mut DocumentMut, key: &str, value: Value) {
     }
 }
 
-/// Starting point written when no config exists, so opening it in an editor is useful
-/// rather than a blank buffer.
+/// Starting point written when no config exists — by "Edit config.toml" with nothing there
+/// yet, and by the setup walkthrough, which merges its answers into this.
+///
+/// Every value here is horde's actual default, so a fresh file changes nothing by existing.
+/// That is the property to preserve when editing this: a starter config that quietly differs
+/// from the defaults turns "I opened the config" into "something changed".
+///
+/// The complete, commented reference is `config.example.toml` in the repository and
+/// `horde docs configuration`. This is deliberately the short version.
 pub fn template() -> String {
     "\
-# horde configuration. Everything here is optional.
+# horde configuration. Everything here is optional — horde runs with no config at all.
+# Full reference: `horde docs configuration`.
 # Run `horde keys` for the full list of rebindable action names.
 
 prefix = \"ctrl+b\"
@@ -452,11 +510,23 @@ bus = false
 bus_width = 30
 pane_titles = true
 animate = true
+zombie = true
+
+[vault]
+# Where notes go when you are not in a project that keeps its own.
+# home = \"~/notes\"
+# Notes alongside a project's code, in this subdirectory, which win while you are in it.
+dir = \"notes\"
 
 [agents]
 # Resume agents after a daemon restart, when a session id was reported.
 restore = true
 detection_lines = 40
+
+[triggers]
+# Whether horde may start and nudge agents while nobody is attached. See
+# `horde docs unattended` before turning this on.
+unattended = false
 
 [notifications]
 # horde · system · off
@@ -743,15 +813,36 @@ sidebar_width = 30
         assert_eq!(loaded.scrollback, cfg.scrollback);
     }
 
+    /// The starter file has to parse, and every value in it has to *be* the default.
+    ///
+    /// It is written when someone opens a config that does not exist yet and when the setup
+    /// walkthrough merges its answers in. If a value here drifted from the default, opening the
+    /// config in an editor — or finishing the walkthrough — would change how horde behaves,
+    /// which is the last thing either of those should do.
     #[test]
-    fn the_template_parses_cleanly() {
+    fn the_template_parses_cleanly_and_only_restates_the_defaults() {
         let dir = tmpdir("template");
         let p = dir.join("config.toml");
         std::fs::write(&p, template()).unwrap();
         let (cfg, warnings) = Config::load_from(&p);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(cfg.theme.name, "horde");
-        assert_eq!(cfg.scrollback, 10_000);
+
+        let d = Config::default();
+        assert_eq!(cfg.theme.name, d.theme.name);
+        assert_eq!(cfg.prefix, d.prefix);
+        assert_eq!(cfg.scrollback, d.scrollback);
+        assert_eq!(cfg.sidebar, d.sidebar);
+        assert_eq!(cfg.sidebar_width, d.sidebar_width);
+        assert_eq!(cfg.bus, d.bus);
+        assert_eq!(cfg.bus_width, d.bus_width);
+        assert_eq!(cfg.pane_titles, d.pane_titles);
+        assert_eq!(cfg.animate, d.animate);
+        assert_eq!(cfg.zombie, d.zombie);
+        assert_eq!(cfg.vault_dir, d.vault_dir);
+        assert_eq!(cfg.restore_agents, d.restore_agents);
+        assert_eq!(cfg.detection_lines, d.detection_lines);
+        assert_eq!(cfg.unattended, d.unattended, "a starter config must never arm this");
+        assert_eq!(cfg.notify, d.notify);
     }
 
     #[test]

@@ -1103,6 +1103,7 @@ impl Session {
             recents: Vec::new(),
             tasks_open: 0,
             tasks_claimed: 0,
+            cards_due: 0,
             triggers_armed: 0,
         }
     }
@@ -1278,7 +1279,7 @@ mod tests {
         }
 
         // Closing it is the same path as any other pane.
-        s.close_pane(&cfg, doc);
+        s.close_pane(&cfg, doc).expect("closing a doc pane is the ordinary path");
         assert!(!s.tab(tab).unwrap().layout.panes().contains(&doc));
         let _ = std::fs::remove_file(file);
     }

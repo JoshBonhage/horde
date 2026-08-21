@@ -30,6 +30,11 @@ pub const PAGES: &[(&str, &str, &str)] = &[
         include_str!("../../docs/worktrees.md"),
     ),
     ("keys", "keybindings, mouse, right-click menus", include_str!("../../docs/keys.md")),
+    (
+        "kanban",
+        "your own board — columns, due dates, and handing a card to the agents",
+        include_str!("../../docs/kanban.md"),
+    ),
     ("wsl", "running horde on Windows, under WSL2", include_str!("../../docs/wsl.md")),
     ("troubleshooting", "when something looks wrong", include_str!("../../docs/troubleshooting.md")),
 ];

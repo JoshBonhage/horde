@@ -88,6 +88,60 @@ enum Edit {
 /// is worse. Forty is about a line of prose.
 const MAX_GROUP: usize = 40;
 
+/// Where a line has to break to be drawn `w` columns wide, as char offsets into it.
+///
+/// Always starts with `0`, so the count of breaks is the count of rows and an empty line is
+/// one row rather than none. Greedy, and on a space where there is one: a word is broken
+/// across two rows only when it is longer than the row itself. Every character is kept —
+/// the offsets partition the line — because the cursor is counted in these same characters
+/// and a wrap that quietly dropped a space would put it in the wrong place.
+pub fn wrap_breaks(s: &str, w: usize) -> Vec<usize> {
+    let mut breaks = vec![0usize];
+    if w == 0 {
+        return breaks;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let cw = |c: char| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+    let mut start = 0usize;
+    let mut used = 0usize;
+    // The offset just after the last space of the row so far, which is where it prefers to
+    // break. `None` until there is one, and reset by every break.
+    let mut after_space: Option<usize> = None;
+    for i in 0..chars.len() {
+        let cwi = cw(chars[i]);
+        // A space that does not fit hangs past the edge instead of starting a row of its
+        // own. Breaking on it would push the word before it down for the sake of a character
+        // nobody can see, and leave the row that follows starting with a blank.
+        if used + cwi > w && i > start && chars[i] == ' ' {
+            used += cwi;
+            after_space = Some(i + 1);
+            continue;
+        }
+        if used + cwi > w && i > start {
+            let at = match after_space {
+                Some(sp) if sp > start && sp <= i => sp,
+                _ => i,
+            };
+            breaks.push(at);
+            start = at;
+            after_space = None;
+            used = chars[start..i].iter().map(|c| cw(*c)).sum();
+            // A word carried down that still does not fit is split where it stands, rather
+            // than spilling past the edge it was moved to avoid.
+            if used + cwi > w && start < i {
+                breaks.push(i);
+                start = i;
+                used = 0;
+            }
+        }
+        used += cwi;
+        if chars[i] == ' ' {
+            after_space = Some(i + 1);
+        }
+    }
+    breaks
+}
+
 /// A text buffer and a cursor into it.
 #[derive(Debug, Clone)]
 pub struct Buffer {
@@ -325,6 +379,68 @@ impl Buffer {
 
     pub fn saved(&mut self) {
         self.dirty = false;
+    }
+
+    // -- soft wrap ---------------------------------------------------------
+    //
+    // A line is as long as the sentence it holds. The screen is not, so the screen is what
+    // gives: a long line is drawn across as many rows as it needs, and the file keeps the
+    // one line it had. Wrapping by inserting line breaks would be the editor writing into
+    // the note on its own — and a vault read anywhere else expects a paragraph to be a
+    // paragraph, not a column of fragments.
+
+    /// How many screen rows line `line` takes at `w` columns.
+    pub fn height_at(&self, line: usize, w: usize) -> usize {
+        wrap_breaks(self.lines.get(line).map(|s| s.as_str()).unwrap_or(""), w).len()
+    }
+
+    /// Where the cursor lands once its line is wrapped: rows below the top of that line,
+    /// and the column within that row.
+    ///
+    /// A cursor exactly at the wrap point belongs at the start of the next row, not one
+    /// column off the end of this one — that is where the next character will go.
+    pub fn wrapped_cursor(&self, w: usize) -> (usize, usize) {
+        if w == 0 {
+            return (0, 0);
+        }
+        let line = self.lines.get(self.line).map(|s| s.as_str()).unwrap_or("");
+        let breaks = wrap_breaks(line, w);
+        let row = breaks.iter().rposition(|b| *b <= self.col).unwrap_or(0);
+        let start = breaks[row];
+        let col: usize = line
+            .chars()
+            .skip(start)
+            .take(self.col.saturating_sub(start))
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        if w > 0 && col >= w { (row + 1, 0) } else { (row, col) }
+    }
+
+    /// The first line to draw so that the cursor is on screen.
+    ///
+    /// Scrolls as little as it can: it walks up from the cursor's line while the rows still
+    /// fit, and stops at the line already at the top. The view follows the cursor and never
+    /// moves it.
+    pub fn follow(&self, scroll: usize, w: usize, rows: usize) -> usize {
+        if self.line < scroll {
+            return self.line;
+        }
+        if rows == 0 || w == 0 {
+            return scroll.min(self.line);
+        }
+        // Down to the cursor's own row, not the whole line: a paragraph taller than the
+        // screen still shows the end you are typing at.
+        let mut used = self.wrapped_cursor(w).0 + 1;
+        let mut top = self.line;
+        while top > scroll {
+            let h = self.height_at(top - 1, w);
+            if used + h > rows {
+                break;
+            }
+            used += h;
+            top -= 1;
+        }
+        top
     }
 
     // -- normal mode -------------------------------------------------------
@@ -985,6 +1101,75 @@ third");
         assert_eq!((b.line, b.col), (0, 2));
         assert!(b.search("x", false));
         assert_eq!((b.line, b.col), (2, 2), "past the top and back to the bottom");
+    }
+
+    /// A row of a wrapped line has to fit the width, and the rows together have to be the
+    /// line — nothing dropped, nothing doubled. The cursor is counted in those same
+    /// characters, so a wrap that lost a space would put it somewhere the text is not.
+    #[test]
+    fn wrapping_breaks_on_spaces_and_keeps_every_character() {
+        let line = "the quick brown fox jumps over the lazy dog";
+        for w in 3..30 {
+            let breaks = wrap_breaks(line, w);
+            assert_eq!(breaks[0], 0, "a line always starts at its start");
+            let chars: Vec<char> = line.chars().collect();
+            let mut rebuilt = String::new();
+            for (i, start) in breaks.iter().enumerate() {
+                let end = breaks.get(i + 1).copied().unwrap_or(chars.len());
+                let row: String = chars[*start..end].iter().collect();
+                // Trailing spaces are allowed to hang past the edge — they draw as nothing,
+                // and moving a word down to make room for one would be the wrap doing harm.
+                let used: usize = row
+                    .trim_end()
+                    .chars()
+                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+                    .sum();
+                assert!(used <= w, "width {w}, row {row:?} is {used} columns");
+                rebuilt.push_str(&row);
+            }
+            assert_eq!(rebuilt, line, "width {w}");
+        }
+        // Where it prefers to break, given the choice: after the space, so the row below
+        // starts with the word rather than with a blank.
+        assert_eq!(wrap_breaks("one two three", 7), vec![0, 8]);
+        // A word with no room to be moved is split where it stands.
+        assert!(wrap_breaks("supercalifragilistic", 6).len() > 1);
+        assert_eq!(wrap_breaks("", 10), vec![0], "an empty line is still a row");
+        assert_eq!(wrap_breaks("fits", 4), vec![0], "an exact fit does not break");
+    }
+
+    /// Typing past the edge is the case this exists for: the character just typed is on the
+    /// next row, and so is the cursor waiting for the one after it.
+    #[test]
+    fn the_cursor_follows_its_line_onto_the_next_row() {
+        let mut b = Buffer::new("hello world again");
+        b.goto(0, 17);
+        assert_eq!(b.height_at(0, 12), 2, "it takes two rows at twelve columns");
+        let (row, col) = b.wrapped_cursor(12);
+        assert_eq!((row, col), (1, 5), "on the second row, after \"again\"");
+
+        // Sitting exactly on the break belongs at the start of the next row, which is where
+        // the next character will land.
+        let mut b = Buffer::new("abcdefghij");
+        b.goto(0, 10);
+        assert_eq!(b.wrapped_cursor(10), (1, 0));
+        assert_eq!(b.wrapped_cursor(0), (0, 0), "no width, and nothing divides by zero");
+    }
+
+    /// Scrolling counts rows on the screen, not lines in the file. A paragraph longer than
+    /// the screen used to leave the end you were typing at below the bottom of it.
+    #[test]
+    fn the_view_follows_the_cursor_through_a_wrapped_paragraph() {
+        let long = "word ".repeat(40); // ten rows at twenty columns
+        let mut b = Buffer::new(&format!("first\n{long}\nlast"));
+        b.goto(1, long.chars().count());
+        // Eight rows of screen cannot hold the ten the paragraph takes, so it starts at the
+        // paragraph rather than showing the line above it.
+        assert_eq!(b.follow(0, 20, 8), 1);
+        // Room for everything: the top stays where it was rather than jumping about.
+        assert_eq!(b.follow(0, 20, 40), 0);
+        b.goto(0, 0);
+        assert_eq!(b.follow(1, 20, 8), 0, "and it comes back up for a cursor above the top");
     }
 
     #[test]

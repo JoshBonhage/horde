@@ -189,6 +189,10 @@ impl Widget for StatusBar<'_> {
                 crate::client::editor::Vim::Command(_) => chip(" : ", t.ui.accent_alt, t),
                 crate::client::editor::Vim::Search(_) => chip(" / ", t.ui.accent_alt, t),
             }),
+            // The chip is the view's own name for itself, so the board and its list are told
+            // apart by the thing that tells you which keys are live.
+            Mode::Kanban { view, .. } => left.push(chip(view.chip(), t.ui.accent_alt, t)),
+            Mode::Card { .. } => left.push(chip(" CARD ", t.ui.accent_alt, t)),
             Mode::Setup { .. } => left.push(chip(" SETUP ", t.ui.accent_alt, t)),
             Mode::Files { .. } => left.push(chip(" FILES ", t.ui.accent_alt, t)),
             Mode::Help => left.push(chip(" HELP ", t.ui.accent_alt, t)),
@@ -367,6 +371,7 @@ mod tests {
             tabbar: Rect::default(),
             tasks_open: 0,
             tasks_claimed: 0,
+            cards_due: 0,
             triggers_armed: 0,
             recents: Vec::new(),
         }

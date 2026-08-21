@@ -48,6 +48,13 @@ pub fn tasks_path() -> PathBuf {
     config_dir().join("tasks.jsonl")
 }
 
+/// The personal board. Its own file, deliberately: the agent board is work agents may take,
+/// this is work you are keeping track of, and one file holding both would mean every read of
+/// either having to say which it meant.
+pub fn kanban_path() -> PathBuf {
+    config_dir().join("kanban.jsonl")
+}
+
 /// Scheduled rules. Its own log for the same reason the board has one: replayed on start, and
 /// the record of what fired has to survive the restart it may have caused.
 pub fn triggers_path() -> PathBuf {
@@ -85,6 +92,8 @@ struct RawConfig {
     keys: HashMap<String, String>,
     #[serde(default)]
     agents: RawAgents,
+    #[serde(default)]
+    kanban: RawKanban,
     #[serde(default)]
     notifications: RawNotifications,
     #[serde(default)]
@@ -187,6 +196,7 @@ struct RawUi {
     tab_bar: Option<bool>,
     status_bar: Option<bool>,
     animate: Option<bool>,
+    zombie: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,6 +212,17 @@ struct RawAgents {
     max_fleet: Option<usize>,
     /// Whether the shared task board accepts anything at all.
     board: Option<bool>,
+    /// Roles permitted to put work on the board. Empty means anyone.
+    task_authors: Option<Vec<String>>,
+}
+
+/// Your own board — see `daemon/kanban.rs`. Nothing here reaches the agents' one.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawKanban {
+    columns: Option<Vec<String>>,
+    author: Option<String>,
+    assist: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -216,6 +237,125 @@ struct RawNotifications {
 struct RawTriggers {
     unattended: Option<bool>,
     max_spawned: Option<usize>,
+}
+
+/// Every top-level name config.toml may use. Named here so an unknown one can be reported
+/// alongside the real ones rather than as a bare complaint about a word.
+const SECTIONS: &[&str] = &[
+    "prefix",
+    "leader",
+    "scrollback",
+    "shell",
+    "theme",
+    "ui",
+    "vault",
+    "keys",
+    "agents",
+    "kanban",
+    "notifications",
+    "triggers",
+    "roles",
+    "handover",
+    "env",
+    "models",
+    "lsp",
+];
+
+/// Deserialize one piece of the file, reporting a problem against that piece.
+fn part<T: serde::de::DeserializeOwned>(
+    value: toml::Value,
+    named: &str,
+    warnings: &mut Vec<String>,
+) -> Option<T> {
+    match value.try_into::<T>() {
+        Ok(t) => Some(t),
+        Err(e) => {
+            warnings.push(format!("{named} was ignored: {e}"));
+            None
+        }
+    }
+}
+
+/// Deserialize a table of named blocks — `[models.<name>]`, `[lsp.<name>]`, `[keys]`, `[env]` —
+/// one entry at a time, so a mistake in one entry does not take the others with it.
+fn part_map<T: serde::de::DeserializeOwned>(
+    value: toml::Value,
+    section: &str,
+    warnings: &mut Vec<String>,
+) -> HashMap<String, T> {
+    let Some(table) = part::<toml::Table>(value, &format!("[{section}]"), warnings) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for (name, v) in table {
+        if let Some(t) = part::<T>(v, &format!("[{section}.{name}]"), warnings) {
+            out.insert(name, t);
+        }
+    }
+    out
+}
+
+/// Read the file one section at a time.
+///
+/// The strict shape is deliberate: `deny_unknown_fields` is what turns a misspelt key into a
+/// message rather than a setting that silently does nothing. What was wrong was the blast
+/// radius. One unknown key anywhere failed the whole document, horde started on every default,
+/// and the only warning was a single line about the file — so someone who typed `sidbar` lost
+/// their theme, their keybindings and their model profiles too, and was told about none of them.
+///
+/// Each section now stands or falls on its own. A mistake in `[ui]` costs `[ui]`.
+///
+/// A file that is not valid TOML *at all* is still all-or-nothing, and has to be: when the
+/// parser cannot tell where one section ends there are no sections to keep.
+fn read_sections(text: &str, warnings: &mut Vec<String>) -> Option<RawConfig> {
+    let table: toml::Table = match text.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            warnings.push(format!("config.toml is not valid TOML, so none of it was read: {e}"));
+            return None;
+        }
+    };
+
+    let mut raw = RawConfig::default();
+    for (key, value) in table {
+        let named = format!("[{key}]");
+        match key.as_str() {
+            "prefix" => raw.prefix = part(value, "prefix", warnings),
+            "leader" => raw.leader = part(value, "leader", warnings),
+            "scrollback" => raw.scrollback = part(value, "scrollback", warnings),
+            "shell" => raw.shell = part(value, "shell", warnings),
+            "theme" => raw.theme = part(value, &named, warnings).unwrap_or_default(),
+            "ui" => raw.ui = part(value, &named, warnings).unwrap_or_default(),
+            "vault" => raw.vault = part(value, &named, warnings).unwrap_or_default(),
+            "agents" => raw.agents = part(value, &named, warnings).unwrap_or_default(),
+            "kanban" => raw.kanban = part(value, &named, warnings).unwrap_or_default(),
+            "notifications" => {
+                raw.notifications = part(value, &named, warnings).unwrap_or_default()
+            }
+            "triggers" => raw.triggers = part(value, &named, warnings).unwrap_or_default(),
+            "handover" => raw.handover = part(value, &named, warnings).unwrap_or_default(),
+            // An array of blocks. Taken one at a time for the same reason as the maps below:
+            // one malformed role should not cost you the others.
+            "roles" => {
+                let items: Vec<toml::Value> =
+                    part(value, "[[roles]]", warnings).unwrap_or_default();
+                raw.roles = items
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| part(v, &format!("[[roles]] #{}", i + 1), warnings))
+                    .collect();
+            }
+            "keys" => raw.keys = part_map(value, "keys", warnings),
+            "env" => raw.env = part_map(value, "env", warnings),
+            "models" => raw.models = part_map(value, "models", warnings),
+            "lsp" => raw.lsp = part_map(value, "lsp", warnings),
+            other => warnings.push(format!(
+                "unknown setting {other:?} in config.toml — ignored. Known: {}",
+                SECTIONS.join(", ")
+            )),
+        }
+    }
+    Some(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +529,12 @@ pub struct Config {
     pub tab_bar: bool,
     pub status_bar: bool,
     pub animate: bool,
+    /// Let something shamble across the wordmark on the start screen, now and then.
+    ///
+    /// Twenty-five seconds of motion and then about a minute of a completely still screen.
+    /// Only while the start screen is up, only when there is room for the banner, and only
+    /// when `animate` is on — that switch means calm, and this is not calmer than a spinner.
+    pub zombie: bool,
     pub restore_agents: bool,
     pub detection_lines: usize,
     pub force_inject: bool,
@@ -400,6 +546,23 @@ pub struct Config {
     /// agents *taking work* nobody watched them take. Wanting the first without the second is a
     /// coherent position, and before this the only way to hold it was to hope nobody tried.
     pub board: bool,
+    /// Roles allowed to put work on the board, normalised. Empty means anyone may.
+    ///
+    /// The lead-agent pattern: name `["pm"]` and a worker can no longer write its own next job,
+    /// which is the difference between a fleet that finishes and a fleet that finds more to do.
+    /// The human is never subject to it — a call from outside a pane is a person at a keyboard.
+    pub task_authors: Vec<String>,
+    /// The columns on your own board, in order.
+    ///
+    /// Cards hold a column *name*, so this list is a display order and a set of names to
+    /// offer — not the identity of anything. Editing it cannot orphan a card: one naming a
+    /// column that is no longer here still shows, in a column of its own at the end.
+    pub kanban_columns: Vec<String>,
+    /// The name on comments you write. Defaults to `user@host`.
+    pub kanban_author: Option<String>,
+    /// How close to its due date a card is handed to the agents, when you arm one without
+    /// saying. Millis.
+    pub kanban_assist: u64,
     /// How many live panes agents may have started between them.
     ///
     /// Separate from `triggers.max_spawned`, which bounds what horde starts with nobody
@@ -527,6 +690,7 @@ impl Default for Config {
             tab_bar: true,
             status_bar: true,
             animate: true,
+            zombie: true,
             restore_agents: true,
             detection_lines: 40,
             force_inject: false,
@@ -535,6 +699,21 @@ impl Default for Config {
             task_nudge: false,
             max_fleet: 6,
             board: true,
+            // Empty: anyone may add. Naming roles here is opting into a hierarchy, which is a
+            // choice about how you work rather than a default worth having.
+            task_authors: Vec::new(),
+            // Four, because a board you have to scroll sideways is a list with extra steps,
+            // and because these are the four states work is actually in: not started, next,
+            // now, finished. Rename them to whatever you call those.
+            kanban_columns: ["Backlog", "Todo", "Doing", "Done"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            kanban_author: None,
+            // Two days: long enough that an agent has time to do the thing before the date
+            // you set matters, short enough that arming a card is not the same as handing it
+            // over now.
+            kanban_assist: 2 * 24 * 60 * 60 * 1000,
             unattended: false,
             max_spawned: 2,
             env: HashMap::new(),
@@ -569,12 +748,8 @@ impl Config {
             }
         };
 
-        let raw: RawConfig = match toml::from_str(&text) {
-            Ok(r) => r,
-            Err(e) => {
-                warnings.push(format!("config.toml is invalid, using defaults: {e}"));
-                return (cfg, warnings);
-            }
+        let Some(raw) = read_sections(&text, &mut warnings) else {
+            return (cfg, warnings);
         };
 
         if let Some(p) = &raw.prefix {
@@ -779,6 +954,7 @@ impl Config {
         cfg.tab_bar = ui.tab_bar.unwrap_or(cfg.tab_bar);
         cfg.status_bar = ui.status_bar.unwrap_or(cfg.status_bar);
         cfg.animate = ui.animate.unwrap_or(cfg.animate);
+        cfg.zombie = ui.zombie.unwrap_or(cfg.zombie);
 
         cfg.restore_agents = raw.agents.restore.unwrap_or(cfg.restore_agents);
         cfg.detection_lines = raw.agents.detection_lines.unwrap_or(cfg.detection_lines).clamp(5, 200);
@@ -786,6 +962,39 @@ impl Config {
         cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
         cfg.max_fleet = raw.agents.max_fleet.unwrap_or(cfg.max_fleet);
         cfg.board = raw.agents.board.unwrap_or(cfg.board);
+        // Normalised through the same funnel as a pane's role and a task's, so `Project Manager`
+        // in config and `pm`... do not silently fail to match. A name that normalises to nothing
+        // is dropped with a complaint rather than left as an entry no role can ever equal.
+        if let Some(list) = &raw.agents.task_authors {
+            for name in list {
+                match normalise_role(name) {
+                    Some(r) => cfg.task_authors.push(r),
+                    None => warnings.push(format!(
+                        "agents.task_authors: {name:?} is not a usable role name"
+                    )),
+                }
+            }
+        }
+
+        // The kanban. A column list that came out empty after trimming is a typo rather than
+        // an instruction: a board with no columns has nowhere to put a card, and silently
+        // agreeing to that would be a config file that deletes the feature.
+        if let Some(cols) = raw.kanban.columns {
+            let cleaned: Vec<String> =
+                cols.iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+            match cleaned.len() {
+                0 => warnings.push("kanban.columns is empty — keeping the default columns".into()),
+                _ => cfg.kanban_columns = cleaned,
+            }
+        }
+        cfg.kanban_author = raw.kanban.author.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+        if let Some(spec) = &raw.kanban.assist {
+            match crate::cli::parse_duration(spec) {
+                Ok(secs) => cfg.kanban_assist = secs * 1000,
+                Err(e) => warnings.push(format!("kanban.assist: {e}")),
+            }
+        }
+
         cfg.unattended = raw.triggers.unattended.unwrap_or(cfg.unattended);
         // Clamped rather than trusted: this bounds how many full-permission agents can run
         // unwatched, and a typo'd 200 should not be taken at face value.
@@ -1014,6 +1223,12 @@ pub enum Action {
     Dashboard,
     /// Open this project's notes.
     Notes,
+    /// Open the vault: its home note, with the tree of notes beside it.
+    ///
+    /// Distinct from [`Action::Notes`], which is a finder — you reach for that one knowing
+    /// roughly what the note is called. This is the other half: somewhere to *be* in the
+    /// vault, with what else is in it visible while you read and write.
+    Vault,
     /// Write a new note, from wherever you are.
     NoteNew,
     /// This project's files.
@@ -1022,6 +1237,8 @@ pub enum Action {
     Graph,
     /// Open the full-screen roster.
     Roster,
+    /// Open your own board — the kanban, which is not the agents' task board.
+    Kanban,
     /// Open the approval queue: every agent blocked on a decision, in one list.
     Approvals,
     /// Step the agent list's filter.
@@ -1208,8 +1425,13 @@ impl Default for Keymap {
             ("leader", Trigger::Prefix(d("space")), Action::Leader),
             ("dashboard", Trigger::Prefix(d("0")), Action::Dashboard),
             ("notes", Trigger::Prefix(d("N")), Action::Notes),
+            ("vault", Trigger::Prefix(d("V")), Action::Vault),
             ("note_new", Trigger::Prefix(d("w")), Action::NoteNew),
             ("graph", Trigger::Prefix(d("G")), Action::Graph),
+            // `T` rather than the obvious `K`, which is resize-up. Taking a bound key to make
+            // a mnemonic is how a keymap rots; the leader carries the mnemonic instead, at
+            // `leader k`, and this is the fast key for the hand that lives on the prefix.
+            ("kanban", Trigger::Prefix(d("T")), Action::Kanban),
             ("files", Trigger::Prefix(d("F")), Action::Files),
             ("send_leader", Trigger::Leader(seq(&["ctrl+space"])), Action::SendLeader),
             // -- leader tables ------------------------------------------------------------
@@ -1249,7 +1471,15 @@ impl Default for Keymap {
             ("leader_note_browser", Trigger::Leader(seq(&["n", "o"])), Action::Notes),
             ("leader_note_find", Trigger::Leader(seq(&["n", "f"])), Action::Notes),
             ("leader_note_graph", Trigger::Leader(seq(&["n", "g"])), Action::Graph),
+            ("leader_note_vault", Trigger::Leader(seq(&["n", "v"])), Action::Vault),
             ("leader_graph", Trigger::Leader(seq(&["g", "g"])), Action::Graph),
+            // Your own board. `k` was free at the top of the leader table, which is the one
+            // place the mnemonic could actually be had — `ctrl+b K` is resize-up.
+            //
+            // One key rather than `k k`: a group with a single member draws in which-key as
+            // though the first key did the thing, and then pressing it sits there waiting for
+            // a second. A hint that lies about what a key does is worse than no hint.
+            ("leader_kanban", Trigger::Leader(seq(&["k"])), Action::Kanban),
             ("leader_finder", Trigger::Leader(seq(&["space"])), Action::Palette),
             ("leader_help", Trigger::Leader(seq(&["?"])), Action::Help),
             ("leader_settings", Trigger::Leader(seq(&["."])), Action::Settings),
@@ -1578,7 +1808,7 @@ mod tests {
     ///
     /// It exists to be copied, and it documents settings by using them — so a key renamed in
     /// `RawConfig` breaks it silently, and the first person to find out is whoever copied it.
-    /// `deny_unknown_fields` means a stale key is a hard error here, which is the point.
+    /// A stale key warns and costs its section, which is what this asserts the absence of.
     #[test]
     fn the_example_config_parses_with_no_warnings() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
@@ -1596,6 +1826,58 @@ mod tests {
         // The example must never carry a secret. It is committed to a public repository, and the
         // whole design keeps keys in the agent's own credential store instead.
         assert!(cfg.env.is_empty(), "the example must not ship an [env] block");
+    }
+
+    /// which-key draws a one-member group as though its first key did the thing, and then
+    /// that key sits there waiting for a second one. So the board's leader entry is one key,
+    /// and this pins that it stays one.
+    #[test]
+    fn the_kanban_leader_entry_reads_as_words() {
+        let km = Keymap::default();
+        let k = Chord::parse("k").unwrap();
+        let top: Vec<(Chord, String, bool)> = km.leader_continuations(&[]);
+        let (_, label, group) = top.iter().find(|(c, _, _)| *c == k).expect("k is on the table");
+        assert!(!group, "one key, and it opens the board rather than waiting for a second");
+        assert_eq!(label, "kanban", "words, not a binding name");
+    }
+
+    #[test]
+    fn the_kanban_section_is_read() {
+        let p = write_tmp(
+            "kanban",
+            r#"
+[kanban]
+columns = ["  Backlog  ", "Now", "Done"]
+author = "josh@joshmacbook"
+assist = "12h"
+"#,
+        );
+        let (cfg, warnings) = Config::load_from(&p);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.kanban_columns, ["Backlog", "Now", "Done"], "and they are trimmed");
+        assert_eq!(cfg.kanban_author.as_deref(), Some("josh@joshmacbook"));
+        assert_eq!(cfg.kanban_assist, 12 * 3_600_000);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A board with no columns has nowhere to put a card, so an empty list is treated as the
+    /// typo it is rather than as an instruction to delete the feature.
+    #[test]
+    fn an_empty_column_list_keeps_the_defaults_and_says_so() {
+        let p = write_tmp("kanban-empty", "[kanban]\ncolumns = [\"\", \"   \"]\n");
+        let (cfg, warnings) = Config::load_from(&p);
+        assert_eq!(cfg.kanban_columns.len(), 4, "the defaults survived");
+        assert!(warnings.iter().any(|w| w.contains("kanban.columns")), "{warnings:?}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn an_unreadable_assist_window_warns_and_falls_back() {
+        let p = write_tmp("kanban-assist", "[kanban]\nassist = \"whenever\"\n");
+        let (cfg, warnings) = Config::load_from(&p);
+        assert_eq!(cfg.kanban_assist, Config::default().kanban_assist);
+        assert!(warnings.iter().any(|w| w.contains("kanban.assist")), "{warnings:?}");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
@@ -1751,6 +2033,71 @@ bogus_action = "prefix+q"
         let _ = std::fs::remove_file(p);
     }
 
+    /// A typo costs the section it is in and nothing else.
+    ///
+    /// Before this, `deny_unknown_fields` failed the whole document on one unknown key: horde
+    /// started with every default, and the single warning was about "config.toml" rather than
+    /// about the word that was wrong. Losing your theme because you misspelled a sidebar
+    /// setting is the kind of thing that makes a config file feel haunted.
+    #[test]
+    fn a_typo_in_one_section_does_not_discard_the_rest_of_the_file() {
+        let p = write_tmp(
+            "typo",
+            "prefix = \"ctrl+a\"\n\
+             [theme]\nname = \"gruvbox\"\n\
+             [ui]\nsidbar = false\nbus_width = 40\n\
+             [agents]\nrestore = false\n",
+        );
+        let (cfg, warnings) = Config::load_from(&p);
+
+        // The bad section is named, and so is the key inside it.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("[ui]"), "{:?}", warnings[0]);
+        assert!(warnings[0].contains("sidbar"), "{:?}", warnings[0]);
+
+        // Everything outside it still applied.
+        assert_eq!(cfg.theme.name, "gruvbox", "the theme survived a mistake elsewhere");
+        assert!(!cfg.restore_agents, "and so did [agents]");
+        assert_eq!(cfg.prefix, Chord::parse("ctrl+a").unwrap(), "and so did the prefix");
+        // While the section that had the typo fell back to its defaults, whole.
+        assert_eq!(cfg.bus_width, Config::default().bus_width);
+
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// An unknown *section* is reported with the real ones, because the usual cause is a name
+    /// remembered slightly wrong, and a list is the shortest possible answer to that.
+    #[test]
+    fn an_unknown_section_is_named_alongside_the_ones_that_exist() {
+        let p = write_tmp("unknown-section", "[uii]\nsidebar = false\n[theme]\nname = \"terminal\"\n");
+        let (cfg, warnings) = Config::load_from(&p);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("uii"), "{:?}", warnings[0]);
+        assert!(warnings[0].contains("vault"), "it lists what is real: {:?}", warnings[0]);
+        assert_eq!(cfg.theme.name, "terminal", "the rest of the file still applied");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// One broken model profile must not cost you the working ones. This is the section most
+    /// likely to hold several blocks, and the one where losing them silently means an agent
+    /// starts on a model nobody chose.
+    #[test]
+    fn a_broken_block_in_a_named_section_costs_only_that_block() {
+        let p = write_tmp(
+            "one-bad-profile",
+            "[models.free]\ncmd = \"opencode --model {model}\"\norder = [\"a:free\"]\n\
+             [models.broken]\ncmd = \"x --model {model}\"\norder = [\"b\"]\nnonsense = 3\n",
+        );
+        let (cfg, warnings) = Config::load_from(&p);
+        assert!(cfg.models.contains_key("free"), "the good profile is there");
+        assert!(!cfg.models.contains_key("broken"), "the bad one is not");
+        assert!(
+            warnings.iter().any(|w| w.contains("[models.broken]") && w.contains("nonsense")),
+            "{warnings:?}"
+        );
+        let _ = std::fs::remove_file(p);
+    }
+
     #[test]
     fn widths_are_clamped_to_something_usable() {
         let p = write_tmp("clamp", "[ui]\nsidebar_width = 2\nbus_width = 900\n");
@@ -1856,8 +2203,8 @@ bogus_action = "prefix+q"
         assert!(warnings.iter().any(|w| w.contains("twice")), "{warnings:?}");
     }
 
-    /// The documented example is the first config most people copy, and `deny_unknown_fields`
-    /// means one stale key there costs the reader their *entire* config, not just that line.
+    /// The documented example is the first config most people copy, so one stale key there costs
+    /// the reader a whole section of theirs and a warning they will assume is their own fault.
     /// Adding a second `[theme]` table while writing these docs is how this test came to exist.
     #[test]
     fn the_documented_example_config_parses_without_warnings() {

@@ -78,6 +78,31 @@ pub fn build(eng: &Engine, since: u64) -> Digest {
         }
     }
 
+    // Work nobody present can take. It is open, it is fresh, it is scoped to a live project, and
+    // it is going to sit there — because the role it names is not among the agents enlisted here.
+    // Without this it reads as a board with nothing happening on it, which is indistinguishable
+    // from a board being worked. Reported as a warning rather than a task line: the thing to do
+    // about it is start or label an agent, which is a decision, not a task.
+    for space in &eng.session.spaces {
+        let present = eng.roles_enlisted_in(&space.name);
+        let stranded = eng.board.stranded(&space.name, &present);
+        if stranded.is_empty() {
+            continue;
+        }
+        let mut roles: Vec<&str> =
+            stranded.iter().filter_map(|t| t.role.as_deref()).collect();
+        roles.sort_unstable();
+        roles.dedup();
+        warnings.push(format!(
+            "{} task{} on the {} board need{} {}, and no agent enlisted there has that role",
+            stranded.len(),
+            if stranded.len() == 1 { "" } else { "s" },
+            space.name,
+            if stranded.len() == 1 { "s" } else { "" },
+            roles.join(" or "),
+        ));
+    }
+
     let messages: Vec<Message> =
         eng.bus.recent(200).into_iter().filter(|m| m.ts >= since).collect();
 

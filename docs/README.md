@@ -12,6 +12,7 @@ Read any page from the terminal with `horde docs <topic>`.
 | [quick-start](quick-start.md) | install, first session, first agent |
 | [concepts](concepts.md) | spaces, tabs, panes, the daemon, why the split matters |
 | [keys](keys.md) | every keybinding, the mouse, right-click menus |
+| [kanban](kanban.md) | your own board — not the agents' one |
 
 ## Agents
 

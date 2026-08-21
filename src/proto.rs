@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -481,6 +481,13 @@ pub struct Snapshot {
     pub tasks_open: usize,
     #[serde(default)]
     pub tasks_claimed: usize,
+    /// Cards on your own board that are due today or already late.
+    ///
+    /// Only the ones with a deadline that has arrived. A count of everything on the board
+    /// would be a number that never changes, and a badge that never changes is a badge nobody
+    /// reads. See `daemon::kanban`.
+    #[serde(default)]
+    pub cards_due: usize,
     /// Triggers that could fire right now — enabled, with the master switch on.
     ///
     /// Zero when `unattended` is off, however many rules exist: the question the sidebar is
@@ -693,6 +700,28 @@ pub enum Cmd {
     /// and the vault belongs to the daemon. A client attached from another host pastes its
     /// own clipboard, which is the only answer that is ever right.
     Attach { space: SpaceId, name: String, bytes: Vec<u8> },
+
+    // -- the kanban ----------------------------------------------------------
+    // The personal board. Its own verbs rather than a reuse of the `task.*` ones, because
+    // they are a different board with different rules — see `daemon/kanban.rs`.
+    /// Read the board. `space` of `None` asks for every project, not for none.
+    KanbanQuery { space: Option<SpaceId> },
+    CardNew { space: Option<SpaceId>, column: String, title: String },
+    CardEdit { id: u64, patch: CardPatch },
+    /// Move a card, landing behind `after`, or at the top when that is `None`.
+    ///
+    /// Behind a *card* rather than at an index, because the client may be looking at a
+    /// filtered board: an index into the three cards it is showing is not an index into the
+    /// eleven that are there, and translating it client-side would mean the client keeping
+    /// track of the cards it deliberately is not showing.
+    CardMove { id: u64, column: String, after: Option<u64> },
+    CardComment { id: u64, body: String },
+    CardArchive { id: u64, archived: bool },
+    /// Hand this card to the agents now, without waiting for its armed window.
+    CardHandOff { id: u64 },
+    /// Rename a column, carrying its cards. The configured list is the client's to edit; this
+    /// is the daemon-side half that keeps the cards from being orphaned by that edit.
+    ColumnRename { from: String, to: String },
 }
 
 // Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
@@ -801,6 +830,37 @@ pub struct VaultReply {
     pub tasks: Vec<TaskLine>,
 }
 
+// ---------------------------------------------------------------------------
+// The kanban
+//
+// The personal board, as distinct from the agents' one — see `daemon/kanban.rs`. Its cards
+// travel whole rather than as a summary line: a card *is* its description, dates and thread,
+// and a `CardLine` that dropped them would only mean a second round trip to read one.
+// ---------------------------------------------------------------------------
+
+/// What to change about a card, and nothing else.
+///
+/// Every field is "leave it alone" when `None`. The doubled options are how "clear this" is
+/// said apart from "do not touch this" — `Some(None)` unsets, `Some(Some(x))` sets. Ugly to
+/// read and unambiguous to apply, which is the right way round for a patch: the alternative
+/// is a parallel set of `clear_due`-style booleans that can contradict the value beside them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CardPatch {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub due: Option<Option<u64>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub project: Option<Option<String>>,
+    /// The armed window, in millis. See `daemon::kanban::Card::assist`.
+    #[serde(default)]
+    pub assist: Option<Option<u64>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dir {
     Left,
@@ -837,6 +897,91 @@ pub enum ServerFrame {
     Diagnostics { path: String, diags: Vec<Diag> },
     /// Answer to [`Cmd::Complete`]. Late by definition — the cursor has usually moved on.
     Completions { path: String, items: Vec<Completion> },
+    /// Answer to [`Cmd::KanbanQuery`], and to every command that changes a card.
+    ///
+    /// Re-sent after each mutation rather than the client patching its own copy, for the
+    /// reason the whole client works this way: one authoritative picture, replaced wholesale,
+    /// so a dropped or reordered update cannot leave the board showing something that was
+    /// never true. A board is a few hundred cards at most.
+    Kanban(Box<KanbanReply>),
+}
+
+/// One entry in a card's thread.
+///
+/// Authored and timestamped, which almost nothing else in this space does: of a dozen
+/// terminal kanbans surveyed, most store comments as bare strings and the rest store a
+/// timestamp without a name. That is fine for a board only you write to, and useless the
+/// moment an agent writes to it — "done, tests green" means nothing without knowing who said
+/// it and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Comment {
+    /// `josh@joshmacbook` for the person at the keyboard, the agent's own name for an agent,
+    /// and `horde` for the daemon reporting on itself.
+    pub by: String,
+    /// Unix millis.
+    pub at: u64,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Card {
+    pub id: u64,
+    pub title: String,
+    /// Which column, by name. Matched case-insensitively against the configured list.
+    pub column: String,
+    /// Dense position within the column, renumbered on every move.
+    pub pos: u32,
+    /// The description. Multi-line, empty rather than absent when unset.
+    #[serde(default)]
+    pub body: String,
+    /// Unix millis at local noon of the due day.
+    ///
+    /// Noon rather than midnight so that neither a timezone change nor a daylight-saving
+    /// boundary can move the date by a day, which is the entire class of bug that dates
+    /// stored as instants produce.
+    #[serde(default)]
+    pub due: Option<u64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Which project, by space *name*.
+    ///
+    /// The same rule as [`crate::daemon::tasks::Task::space`] and for the same reason: ids are
+    /// persisted by position and are not stable across a restart, so a card holding one would
+    /// point at a different project the next morning. `None` is work that is not about a
+    /// repository, which a personal board has plenty of.
+    #[serde(default)]
+    pub project: Option<String>,
+    pub created: u64,
+    #[serde(default)]
+    pub updated: u64,
+    /// Kept rather than deleted, so the record of the work survives. Hidden by default.
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub comments: Vec<Comment>,
+    /// Armed: hand this to the agents once the due date is this close, in millis.
+    #[serde(default)]
+    pub assist: Option<u64>,
+    /// The board task it was handed to, once it has been.
+    #[serde(default)]
+    pub handed: Option<u64>,
+}
+
+/// The personal board, as of now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KanbanReply {
+    /// Every card, archived ones included — hiding them is the view's decision, and a client
+    /// that had to ask again to show them would flicker on a keypress that should not.
+    pub cards: Vec<Card>,
+    /// The configured columns, in order, as the daemon has them.
+    ///
+    /// Sent rather than read from the client's own config so that both halves agree even when
+    /// a client is attached from another machine with its own `config.toml`. Columns are a
+    /// property of the board, not of whoever is looking at it.
+    pub columns: Vec<String>,
+    /// The project the query was scoped to, if any — echoed back so a reply that arrives
+    /// after you changed projects can be told apart from one that did not.
+    pub project: Option<String>,
 }
 
 /// One thing that could be typed here.
@@ -1166,7 +1311,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 19, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 20, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the
@@ -1234,7 +1379,15 @@ mod digest_tests {
                 | Cmd::DocChanged { .. }
                 | Cmd::DocClosed { .. }
                 | Cmd::Complete { .. }
-                | Cmd::Attach { .. } => {}
+                | Cmd::Attach { .. }
+                | Cmd::KanbanQuery { .. }
+                | Cmd::CardNew { .. }
+                | Cmd::CardEdit { .. }
+                | Cmd::CardMove { .. }
+                | Cmd::CardComment { .. }
+                | Cmd::CardArchive { .. }
+                | Cmd::CardHandOff { .. }
+                | Cmd::ColumnRename { .. } => {}
             }
         }
 
@@ -1257,7 +1410,8 @@ mod digest_tests {
                 | ServerFrame::Vault(..)
                 | ServerFrame::Files(..)
                 | ServerFrame::Diagnostics { .. }
-                | ServerFrame::Completions { .. } => {}
+                | ServerFrame::Completions { .. }
+                | ServerFrame::Kanban(..) => {}
             }
             match e {
                 Event::AgentStateChanged { .. }
@@ -1285,6 +1439,7 @@ mod digest_tests {
                 tabbar: _,
                 tasks_open: _,
                 tasks_claimed: _,
+                cards_due: _,
                 triggers_armed: _,
                 recents: _,
             } = snap;

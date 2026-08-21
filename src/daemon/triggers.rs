@@ -95,7 +95,15 @@ const DAY_NAMES: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum What {
     /// Put work on the board. The one to reach for: it composes with the nudge and the claim.
-    Task { text: String },
+    ///
+    /// `role`, when given, is who the work is for — the same filter a hand-added task carries, so
+    /// a nightly review lands on the board as reviewer work rather than as the next thing any
+    /// idle agent picks up.
+    Task {
+        text: String,
+        #[serde(default)]
+        role: Option<String>,
+    },
     /// Push a line at one named agent. Bypasses the board, so it also bypasses everything the
     /// board guarantees — worth it only when the work belongs to a specific agent.
     Send { to: String, body: String },
@@ -143,7 +151,10 @@ fn describe_days(days: u8) -> Option<String> {
 impl What {
     pub fn describe(&self) -> String {
         match self {
-            What::Task { text } => format!("board: {text}"),
+            What::Task { text, role } => match role {
+                Some(r) => format!("board: {text} [{r}]"),
+                None => format!("board: {text}"),
+            },
             What::Send { to, body } => format!("send {to}: {body}"),
             What::Spawn { cmd, name } => match name {
                 Some(n) => format!("spawn {cmd} as {n}"),
@@ -308,7 +319,7 @@ impl Store {
                 ));
             }
         }
-        if let What::Task { text } = &what {
+        if let What::Task { text, .. } = &what {
             if text.trim().is_empty() {
                 return Err(anyhow!("a task needs a description"));
             }
@@ -626,7 +637,7 @@ pub fn owner_tag(id: u64) -> String {
 /// Do the thing. Returns a phrase for the record, plus any event clients should see.
 fn perform(eng: &mut Engine, t: &Trigger) -> Result<(String, Vec<Event>)> {
     match &t.what {
-        What::Task { text } => {
+        What::Task { text, role } => {
             // A trigger reaches the board directly rather than through the socket, so the RPC
             // gate does not cover it. Without this check a closed board would still fill up on
             // a schedule — which is the exact combination someone turning it off is avoiding.
@@ -638,7 +649,10 @@ fn perform(eng: &mut Engine, t: &Trigger) -> Result<(String, Vec<Event>)> {
             // Scoped to the space the rule was created in, so a scheduled task lands in the
             // project it was written for rather than being offered to whoever is idle.
             let space = t.space.clone();
-            let task = eng.board.add(text, &owner_tag(t.id), space.as_deref())?;
+            let task = eng.board.add(super::tasks::NewTask {
+                role: role.as_deref(),
+                ..super::tasks::NewTask::new(text, &owner_tag(t.id), space.as_deref())
+            })?;
             // The sidebar carries the open count, so it has to be told.
             eng.touch();
             Ok((format!("put task #{} on the board: {}", task.id, task.text), Vec::new()))
@@ -646,7 +660,7 @@ fn perform(eng: &mut Engine, t: &Trigger) -> Result<(String, Vec<Event>)> {
         What::Send { to, body } => {
             let cfg = eng.cfg.clone();
             let Engine { bus, session, .. } = eng;
-            let m = bus.send(session, &cfg, None, to, body, false, false, None)?;
+            let m = bus.send(session, &cfg, super::bus::Outgoing::plain(None, to, body))?;
             Ok((format!("sent to {}", m.to), vec![Event::BusMessage(m)]))
         }
         What::Spawn { cmd, name } => {
@@ -865,7 +879,7 @@ mod tests {
     }
 
     fn task_what() -> What {
-        What::Task { text: "review yesterday's diff".into() }
+        What::Task { text: "review yesterday's diff".into(), role: None }
     }
 
     /// An engine with the master switch on, a trigger store, and its own logs.
@@ -1194,7 +1208,7 @@ mod tests {
         assert_eq!(e.board.open_count(), 1, "one in flight, not two");
 
         // Claimed still counts as in flight — an agent is working on it.
-        e.board.claim("worker0", None, None).unwrap();
+        e.board.claim("worker0", None, Default::default()).unwrap();
         wind_back(&mut e, 1, 120_000);
         fire_due(&mut e);
         assert_eq!(e.board.all().len(), 1);
@@ -1222,7 +1236,7 @@ mod tests {
         assert_eq!(e.triggers.get(1).unwrap().last_fired, before, "a skip is not a firing");
 
         // So the moment the work clears, it goes — without waiting out another interval.
-        e.board.claim("worker0", None, None).unwrap();
+        e.board.claim("worker0", None, Default::default()).unwrap();
         e.board.done("worker0", None, None).unwrap();
         fire_due(&mut e);
         assert_eq!(e.board.all().len(), 2);
@@ -1247,7 +1261,7 @@ mod tests {
             e.triggers
                 .add(
                     When::Every { secs: 60 },
-                    What::Task { text: format!("job {i}") },
+                    What::Task { text: format!("job {i}"), role: None },
                     "user",
                     None,
                     None,

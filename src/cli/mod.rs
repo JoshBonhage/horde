@@ -2,7 +2,9 @@
 //! an agent orchestrate horde with nothing but a shell.
 
 pub mod docs;
-mod integration;
+/// Public because the client drives the install directly: the settings page and the setup
+/// walkthrough do the same work as `horde integration install claude` without its printing.
+pub mod integration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -281,6 +283,9 @@ pub enum TriggerCmd {
         /// Work to put on the board.
         #[arg(long, conflicts_with = "to")]
         task: Option<String>,
+        /// Only an agent with this role may take the work, with --task.
+        #[arg(long, requires = "task")]
+        role: Option<String>,
         /// Agent to push a line at instead of using the board.
         #[arg(long, requires = "body")]
         to: Option<String>,
@@ -325,6 +330,9 @@ pub enum TaskCmd {
         /// Put it on another project's board, by space name.
         #[arg(long)]
         space: Option<String>,
+        /// Only an agent with this role may take it. Omit for work anyone free can do.
+        #[arg(long)]
+        role: Option<String>,
     },
     /// Take board work in this project from now on. Without this, nothing is ever offered.
     Work {
@@ -729,8 +737,22 @@ pub fn run(cmd: Command) -> Result<()> {
                 "bus.broadcast",
                 json!({ "body": body, "from": self_pane(), "space": space }),
             )?;
-            let n = v.as_array().map(|a| a.len()).unwrap_or(0);
-            println!("sent to {n} agent(s)");
+            // Broken out, because "sent to 4 agents" reads as four agents having heard it when
+            // three of them were mid-turn. Queued is a normal outcome and worth naming as one.
+            let msgs = v.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            fn delivery(m: &Value) -> &str {
+                m.get("delivery").and_then(|d| d.as_str()).unwrap_or("")
+            }
+            let now = msgs.iter().filter(|m| delivery(m) == "delivered").count();
+            let queued = msgs.iter().filter(|m| delivery(m) == "queued").count();
+            match (msgs.len(), queued) {
+                (0, _) => println!("nobody to send it to — `horde roster` shows who is here"),
+                (n, 0) => println!("delivered to {n} agent(s)"),
+                (_, q) if q == msgs.len() => {
+                    println!("queued for {q} agent(s) — they are busy; horde delivers as they free up")
+                }
+                (_, q) => println!("delivered to {now}, queued for {q}"),
+            }
         }
 
         Command::Spawn { cmd, profile, brief, name, split, worktree, role, board, task } => {
@@ -830,16 +852,25 @@ pub fn run(cmd: Command) -> Result<()> {
         }
 
         Command::Task { cmd } => match cmd {
-            TaskCmd::Add { text, space } => {
+            TaskCmd::Add { text, space, role } => {
                 let text = text.join(" ");
-                let t =
-                    call("task.add", json!({ "text": text, "from": self_pane(), "space": space }))?;
+                let t = call(
+                    "task.add",
+                    json!({ "text": text, "from": self_pane(), "space": space, "role": role }),
+                )?;
                 let where_ = t.get("space").and_then(|s| s.as_str()).unwrap_or("");
+                let for_ = t.get("role").and_then(|s| s.as_str()).unwrap_or("");
                 println!(
-                    "#{} added{}",
+                    "#{} added{}{}",
                     t.get("id").and_then(|x| x.as_u64()).unwrap_or(0),
-                    if where_.is_empty() { String::new() } else { format!(" to {where_}") }
+                    if where_.is_empty() { String::new() } else { format!(" to {where_}") },
+                    if for_.is_empty() { String::new() } else { format!(" for {for_}") }
                 );
+                // Said here because here is where it can still be changed. Work for a role
+                // nobody has is not offered to anyone and reads afterwards as a quiet board.
+                if let Some(w) = t.get("warning").and_then(|w| w.as_str()) {
+                    eprintln!("note: {w}");
+                }
             }
             TaskCmd::Work { off } => {
                 let v = call("task.work", json!({ "from": self_pane(), "on": !off }))?;
@@ -906,6 +937,13 @@ pub fn run(cmd: Command) -> Result<()> {
                     println!("board is empty — add work with `horde task add \"...\"`");
                     return Ok(());
                 }
+                // Which roles could actually take something here, so work that will sit can be
+                // marked as such. Asked once for the whole listing rather than per row.
+                let covered: Vec<String> = call("task.roles", json!({ "from": self_pane() }))
+                    .ok()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                let mut stranded = 0usize;
                 for t in shown {
                     let owner =
                         t.owner.as_ref().map(|o| format!("  [{o}]")).unwrap_or_default();
@@ -915,21 +953,40 @@ pub fn run(cmd: Command) -> Result<()> {
                         (true, Some(sp)) => format!("  ({sp})"),
                         _ => String::new(),
                     };
-                    println!("{} #{:<4} {}{where_}{owner}", t.state.glyph(), t.id, t.text);
+                    // Who it is for, and whether anybody here is that. An open task naming a
+                    // role no enlisted agent has is never offered and never claimed, so it says
+                    // so rather than looking like the next thing to be picked up.
+                    let for_ = match &t.role {
+                        None => String::new(),
+                        Some(r) if !t.is_open() => format!("  <{r}>"),
+                        Some(r) if covered.iter().any(|c| c == r) => format!("  <{r}>"),
+                        Some(r) => {
+                            stranded += 1;
+                            format!("  <{r}: nobody here>")
+                        }
+                    };
+                    println!("{} #{:<4} {}{for_}{where_}{owner}", t.state.glyph(), t.id, t.text);
                     if let Some(r) = &t.result {
                         println!("       → {r}");
                     }
+                }
+                if stranded > 0 {
+                    println!(
+                        "\n{stranded} task{} waiting on a role nobody enlisted here has — \
+                         `horde spawn --role <role> --board`, or claim it by number to override",
+                        if stranded == 1 { "" } else { "s" }
+                    );
                 }
             }
         },
 
         Command::Trigger { cmd } => match cmd {
-            TriggerCmd::Add { every, at, days, when, task, to, body, spawn, name } => {
+            TriggerCmd::Add { every, at, days, when, task, role, to, body, spawn, name } => {
                 let v = call(
                     "trigger.add",
                     json!({
                         "every": every, "at": at, "days": days, "when": when,
-                        "task": task, "to": to, "body": body,
+                        "task": task, "role": role, "to": to, "body": body,
                         "spawn": spawn, "name": name,
                         "from": self_pane(),
                     }),
@@ -1264,8 +1321,16 @@ pub fn run(cmd: Command) -> Result<()> {
                 println!("renamed");
             }
             PaneCmd::Role { pane, role } => {
-                let v =
-                    call("pane.role", json!({ "pane": pane, "role": role.unwrap_or_default() }))?;
+                // `from` is sent so the daemon can tell an agent relabelling itself from a person
+                // at a shell doing the labelling. See the `pane.role` handler.
+                let v = call(
+                    "pane.role",
+                    json!({
+                        "pane": pane,
+                        "role": role.unwrap_or_default(),
+                        "from": self_pane(),
+                    }),
+                )?;
                 // The normalised form, so a script that filters on what it just set matches.
                 match v.get("role").and_then(|v| v.as_str()) {
                     Some(r) => println!("{r}"),

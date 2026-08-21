@@ -54,6 +54,8 @@ pub enum Act {
     NewProject,
     WriteNote,
     Notes,
+    Vault,
+    Kanban,
     Roster,
     Digest,
     Settings,
@@ -64,12 +66,14 @@ pub enum Act {
 
 impl Act {
     /// In menu order: the note side and the multiplexer first, then the ways out.
-    pub fn all() -> [Act; 10] {
+    pub fn all() -> [Act; 12] {
         [
             Act::Projects,
             Act::NewProject,
             Act::WriteNote,
             Act::Notes,
+            Act::Vault,
+            Act::Kanban,
             Act::Roster,
             Act::Digest,
             Act::Settings,
@@ -86,6 +90,10 @@ impl Act {
             Act::NewProject => "n",
             Act::WriteNote => "w",
             Act::Notes => "N",
+            Act::Vault => "V",
+            // The same key the board answers to under the prefix, so the menu teaches the
+            // shortcut rather than inventing a second one for the same place.
+            Act::Kanban => "T",
             Act::Roster => "o",
             Act::Digest => "D",
             Act::Settings => ".",
@@ -109,6 +117,11 @@ impl Act {
             Act::NewProject => "New project",
             Act::WriteNote => "Write a note",
             Act::Notes => "Browse notes",
+            Act::Vault => "Vault",
+            // "Kanban", not "Tasks": the *task board* is the one agents pull work from, and
+            // this is the other one. docs/kanban.md opens by separating them and the menu is
+            // not the place to put them back together.
+            Act::Kanban => "Kanban",
             Act::Roster => "Agent roster",
             Act::Digest => "Catch-up digest",
             Act::Settings => "Settings",
@@ -304,6 +317,30 @@ pub struct Hit {
     pub row: usize,
 }
 
+/// The block the wordmark occupies — its slot, plus the tagline and the blank under it.
+///
+/// `None` when the greeter fell back to the plain word, which is the shape it uses when
+/// there is no room to spare, and therefore no room for a passer-by either. Recomputed here
+/// rather than returned from [`draw`] so the client can ask "is there a stage" without
+/// drawing a frame; a test keeps the two in step.
+pub fn stage(area: TRect, rows_in: &[Row]) -> Option<TRect> {
+    if area.height < 6 || area.width < 30 {
+        return None;
+    }
+    let w = area.width.min(72);
+    let x = area.x + (area.width - w) / 2;
+    let shown = window(rows_in, area.height.saturating_sub(2), None);
+    let lines = shown.len() + menu_lines(rows_in);
+    let banner_room = area.height.saturating_sub(lines as u16 + 2);
+    if banner_room < 4 || logo::height(w, banner_room) < 2 {
+        return None;
+    }
+    let banner_h = logo::height(w, banner_room) + 2;
+    let painted = lines as u16 + banner_h.saturating_sub(1);
+    let y = area.y + area.height.saturating_sub(painted) / 2;
+    Some(TRect { x, y, width: w, height: banner_h })
+}
+
 /// Draw the whole screen. Returns where each row landed, for mouse resolution.
 pub fn draw(
     buf: &mut Buffer,
@@ -311,6 +348,9 @@ pub fn draw(
     theme: &Theme,
     rows_in: &[Row],
     sel: usize,
+    // Seconds into a crossing of the wordmark, or `None` when nothing is walking. Seconds
+    // rather than a column, so a resize is a re-render rather than a rescheduling.
+    walk: Option<f64>,
 ) -> Vec<Hit> {
     fill(buf, area, theme.ui.bg);
     let mut hits = Vec::new();
@@ -338,6 +378,7 @@ pub fn draw(
     // blank line — a menu long enough to matter makes an approximation here visible.
     let painted = lines as u16 + banner_h.saturating_sub(1);
     let mut y = area.y + area.height.saturating_sub(painted) / 2;
+    let banner_top = y;
     if banner_h > 0 {
         y += logo::draw(buf, x, y, w, banner_room, theme);
         put_line(
@@ -351,6 +392,17 @@ pub fn draw(
             )),
         );
         y += 2;
+        // In front of the letters rather than beside them: it is drawn after the wordmark
+        // and the tagline, over the top of both, and the whole block is repainted every
+        // frame — so what it walks over comes back on its own.
+        if let Some(at) = walk {
+            super::zombie::draw(
+                buf,
+                TRect { x, y: banner_top, width: w, height: banner_h },
+                theme,
+                at,
+            );
+        }
     }
 
     // The session listing, a row to a line, and the menu's heading. The menu itself is a
@@ -600,6 +652,104 @@ mod tests {
         assert!(scrolled.contains(&last), "cursor {last} is off screen: {scrolled:?}");
     }
 
+    /// Render the greeter and hand back the buffer, so two frames can be compared cell for
+    /// cell — symbol *and* style, which is what "the wordmark is untouched" has to mean.
+    fn render(w: u16, h: u16, walk: Option<f64>) -> Buffer {
+        let s = snap();
+        let rows = rows(&s, 0);
+        let area = TRect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        draw(&mut buf, area, &Theme::horde(), &rows, 0, walk);
+        buf
+    }
+
+    /// The load-bearing test for something that walks in *front* of the letters: it may
+    /// cover them while it is there, and it must leave nothing behind when it goes.
+    #[test]
+    fn the_wordmark_survives_a_zombie_walking_over_it() {
+        let (w, h) = (120, 40);
+        let before = render(w, h, None);
+        let during = render(w, h, Some(12.0));
+        assert_ne!(before, during, "nothing moved, so this test proves nothing");
+
+        // Everything it disturbs is inside the block the wordmark was given.
+        let s = snap();
+        let stage = stage(TRect::new(0, 0, w, h), &rows(&s, 0)).expect("a tall terminal has one");
+        for y in 0..h {
+            for x in 0..w {
+                if before[(x, y)] != during[(x, y)] {
+                    assert!(
+                        (stage.y..stage.y + stage.height).contains(&y)
+                            && (stage.x..stage.x + stage.width).contains(&x),
+                        "cell {x},{y} changed, outside the stage {stage:?}"
+                    );
+                }
+            }
+        }
+
+        // And once it has gone the greeter is the same picture it was, to the byte.
+        assert_eq!(before, render(w, h, None), "it left a mark behind");
+    }
+
+    /// The stage has to be where the banner actually is, or the passer-by walks through the
+    /// project list. Two copies of centring arithmetic agree only until one of them moves.
+    #[test]
+    fn the_stage_is_where_the_wordmark_landed() {
+        for (w, h) in [(120, 40), (100, 30)] {
+            let s = snap();
+            let rows = rows(&s, 0);
+            let stage = stage(TRect::new(0, 0, w, h), &rows).expect("{w}x{h} has a banner");
+            let buf = render(w, h, None);
+            let painted: Vec<u16> = (0..h)
+                .filter(|y| (0..w).any(|x| buf[(x, *y)].symbol() != " "))
+                .collect();
+            assert_eq!(
+                painted.first().copied(),
+                Some(stage.y + 1),
+                "{w}x{h}: the banner starts a row into its slot, under the pad row"
+            );
+            assert!(stage.height >= 6, "{w}x{h}: {stage:?} is too short to hold anybody");
+        }
+    }
+
+    /// A terminal with no room for a banner has no room for a passer-by either.
+    #[test]
+    fn a_greeter_with_no_wordmark_never_animates() {
+        let (w, h) = (80, 24);
+        let s = snap();
+        assert_eq!(stage(TRect::new(0, 0, w, h), &rows(&s, 0)), None, "no banner at {w}x{h}");
+        assert_eq!(render(w, h, Some(12.0)), render(w, h, None), "yet something was drawn");
+    }
+
+    /// Print the greeter mid-crossing, in colour.
+    ///
+    /// `cargo test the_greeter_prints -- --nocapture` is how the passer-by gets looked at in
+    /// its actual setting — over the letters, at the size the terminal really gives it —
+    /// without rebuilding horde and waiting up to a minute for a crossing.
+    #[test]
+    fn the_greeter_prints() {
+        for (w, h, at) in [(120u16, 40u16, 11.0), (100, 30, 13.0)] {
+            let buf = render(w, h, Some(at));
+            println!("\n  {w}x{h}, {at}s into a crossing");
+            for y in 0..h {
+                let mut line = String::new();
+                for x in 0..w {
+                    let st = buf[(x, y)].style();
+                    let esc = |c: Option<ratatui::style::Color>, base: u8| match c {
+                        Some(ratatui::style::Color::Rgb(r, g, b)) => {
+                            format!("\x1b[{base};2;{r};{g};{b}m")
+                        }
+                        _ => String::new(),
+                    };
+                    line.push_str(&esc(st.fg, 38));
+                    line.push_str(&esc(st.bg, 48));
+                    line.push_str(buf[(x, y)].symbol());
+                }
+                println!("  {line}\x1b[0m");
+            }
+        }
+    }
+
     /// Nothing scrolls while everything fits.
     #[test]
     fn a_tall_screen_shows_the_whole_listing() {
@@ -617,7 +767,7 @@ mod tests {
         let rows = rows(&s, 3 * 86_400_000);
         let area = TRect::new(0, 0, 100, 30);
         let mut buf = Buffer::empty(area);
-        draw(&mut buf, area, &Theme::horde(), &rows, 0);
+        draw(&mut buf, area, &Theme::horde(), &rows, 0, None);
         let text: String = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();

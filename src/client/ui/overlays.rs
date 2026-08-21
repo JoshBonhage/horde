@@ -18,7 +18,7 @@ use crate::proto::{AgentLine, AgentState, Choice, Delivery, Digest, NoticeLevel,
 use crate::theme::Theme;
 
 /// A bordered panel with a title, used by every overlay so they read as one family.
-fn panel(f: &mut Frame, area: TRect, title: &str, theme: &Theme) -> TRect {
+pub fn panel(f: &mut Frame, area: TRect, title: &str, theme: &Theme) -> TRect {
     fill(f.buffer_mut(), area, theme.ui.panel_bg);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -220,12 +220,14 @@ fn describe_action(name: &str, action: &Action) -> String {
         Action::Leader => "open the leader table".into(),
         Action::Dashboard => "the start screen".into(),
         Action::Notes => "this project's notes".into(),
+        Action::Vault => "the vault, with its tree".into(),
         Action::NoteNew => "write a new note".into(),
         Action::Files => "this project's files".into(),
         Action::Graph => "how the notes link up".into(),
         Action::SidebarFocus => "walk the sidebar with j/k".into(),
         Action::TogglePin => "pin this agent to the top of the sidebar".into(),
         Action::Roster => "every project and agent, full screen".into(),
+        Action::Kanban => "your own board — not the agents'".into(),
         Action::Approvals => "answer every agent waiting on you".into(),
         Action::CycleLens => "filter the agent list".into(),
         // The generic name-to-words fallback would render this as bare "digest", which does

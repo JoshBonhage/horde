@@ -364,8 +364,8 @@ mod tests {
         let mut e = eng("board", 1);
         assert!(prepare(&mut e, true).is_none(), "nothing has happened yet");
 
-        e.board.add("port the parser", "user", None).unwrap();
-        e.board.claim("worker0", None, None).unwrap();
+        e.board.add(crate::daemon::tasks::NewTask::new("port the parser", "user", None)).unwrap();
+        e.board.claim("worker0", None, Default::default()).unwrap();
         e.board.done("worker0", None, Some("done, 18 tests")).unwrap();
         let a = prepare(&mut e, true).expect("the fleet finishing is worth knowing");
         assert!(a.text.contains("1 task done"), "{}", a.text);

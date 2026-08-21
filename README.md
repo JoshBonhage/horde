@@ -213,6 +213,37 @@ itself, `shift`-drag takes it back.
 
 ---
 
+## Your own board, next to theirs
+
+`ctrl+b T` is a kanban — columns you name, cards with due dates, tags, descriptions and a
+comment thread. Drag a card with the mouse, or `H`/`L` it across; `v` swaps the columns for a
+flat list sorted by what is due next.
+
+It is deliberately **not** the task board agents pull work from. That board's rules are written
+for them — claiming is a compare-and-set, an open task stops being offered after a day — and
+none of them make sense for work you are keeping track of yourself.
+
+The two meet at one seam, and only when you ask. Arm a card and horde hands it to the agents as
+its due date approaches:
+
+```
+ #12  wire up the importer
+   due      2026-08-18 · in 2d
+   agents   hand over when due within 3d
+
+ COMMENTS  2
+   horde              handed to the agents as task #47
+   builder            done — chunked reader, tests green
+```
+
+The agent gets an ordinary task on its own board, scoped to the card's project. Its result comes
+home as a comment. **The card does not move** — deciding a thing is finished is the part you
+wanted a board for. Your own comments are signed `you@yourmachine`.
+
+`horde docs kanban` for the rest.
+
+---
+
 ## When nobody's watching
 
 Detach and horde keeps going. Arm it and horde starts *acting*.
@@ -587,6 +618,7 @@ glyph = "◈"
 [ui]
 sidebar_width = 24                          # 14–60
 animate = true                              # spinners for working agents
+zombie = true                               # something crosses the start screen now and then
 
 [triggers]
 unattended = false                          # master switch: no rule fires until this is on

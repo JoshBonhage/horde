@@ -10,6 +10,7 @@ pub mod digest;
 pub mod files;
 pub mod handoff;
 pub mod journal;
+pub mod kanban;
 pub mod layout;
 pub mod logfile;
 pub mod lsp;
@@ -91,6 +92,9 @@ pub struct Engine {
     pub session: Session,
     pub bus: bus::Bus,
     pub board: tasks::Board,
+    /// The personal board. Separate from `board` in every way that matters — see
+    /// [`kanban`] — and touching it only through the one seam that hands a card over.
+    pub kanban: kanban::Kanban,
     pub triggers: triggers::Store,
     pub journal: journal::Journal,
     /// Pane names as of the start of this tick. An exit event is emitted after the pane has
@@ -206,6 +210,10 @@ impl Engine {
         let mut s = self.session.snapshot(&cfg, &self.repos);
         s.tasks_open = self.board.open_count();
         s.tasks_claimed = self.board.claimed_count();
+        // Twelve hours ahead, which is "today" without any calendar arithmetic: a card due
+        // today is stored at today's local noon, so anything at or before now-plus-twelve is
+        // due today or already late, and tomorrow's noon is still out of reach.
+        s.cards_due = self.kanban.due_count(now_millis() + 12 * 3_600_000);
         s.triggers_armed = if self.cfg.unattended { self.triggers.armed_count() } else { 0 };
         s.recents = self.recent_projects();
         for space in s.spaces.iter_mut() {
@@ -477,6 +485,47 @@ impl Engine {
         Some(reply)
     }
 
+    /// The personal board, as of now.
+    ///
+    /// `space` is a *client-side* id, resolved to a project name here because that is what a
+    /// card holds — see [`kanban::Card::project`]. `None` means every project, which is a
+    /// board you are reading rather than a board you are working in.
+    pub fn kanban_answer(&self, space: Option<SpaceId>) -> crate::proto::KanbanReply {
+        let project = space.and_then(|s| self.session.space(s)).map(|s| s.name.clone());
+        crate::proto::KanbanReply {
+            cards: self.kanban.all().to_vec(),
+            columns: self.cfg.kanban_columns.clone(),
+            project,
+        }
+    }
+
+    /// Send the board to one client, after it asked or after it changed something.
+    fn send_kanban(&self, to: ClientId, space: Option<SpaceId>) {
+        let reply = self.kanban_answer(space);
+        if let Some(c) = self.clients.get(&to) {
+            let _ = c.out.send(ServerFrame::Kanban(Box::new(reply)));
+        }
+    }
+
+    /// The name that goes on a comment you wrote.
+    ///
+    /// `user@host`, because a board that will also carry agent-written comments needs the
+    /// human ones to be recognisably a person rather than another process called `user`.
+    /// Overridable, since a machine's real hostname is often uglier than what you would
+    /// choose to sign your own notes with.
+    pub fn local_user(&self) -> String {
+        if let Some(name) = &self.cfg.kanban_author {
+            return name.clone();
+        }
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "user".into());
+        match hostname() {
+            Some(h) => format!("{user}@{h}"),
+            None => user,
+        }
+    }
+
     /// How many files the browser will list before saying there are too many.
     const FILE_LIMIT: usize = 4_000;
 
@@ -621,10 +670,57 @@ impl Engine {
         events
     }
 
-    /// Tell one enlisted agent in `space` that its project has work waiting.
+    /// Hand over every card whose armed window has arrived.
+    ///
+    /// Run from the same slow sweep as [`Self::nudge_for_tasks`], because both are the same
+    /// question asked on a clock — is there something an agent should know about — and a
+    /// second timer would be a second thing to get wrong.
+    ///
+    /// Gated on `agents.board`, which is the promise that switch already makes: turning the
+    /// agents' board off has to turn off everything that puts work on it, or the setting is a
+    /// lie told in one place and honoured in another.
+    fn hand_over_due_cards(&mut self) {
+        if !self.cfg.board {
+            return;
+        }
+        for card in self.kanban.ready_to_hand_over(now_millis()) {
+            match hand_over(self, card) {
+                Ok(task) => log_line(&format!("kanban: card #{card} handed over as task #{task}")),
+                // Logged rather than surfaced: this fires on a timer with nobody necessarily
+                // watching, and a toast for something that will be retried on the next sweep
+                // is noise. The card's own thread is where the record belongs.
+                Err(e) => log_line(&format!("kanban: card #{card} could not be handed over: {e}")),
+            }
+        }
+    }
+
+    /// The roles of the agents enlisted for board work in one project.
+    ///
+    /// What decides whether role-tagged work can be taken by anybody here. Enlistment is part of
+    /// the question, not decoration: a reviewer sitting in the project who never ran
+    /// `horde task work` is not going to claim anything, so counting it would report a task as
+    /// covered when nothing will ever pick it up.
+    pub fn roles_enlisted_in(&self, space_name: &str) -> Vec<String> {
+        let Some(space) = self.session.spaces.iter().find(|s| s.name == space_name) else {
+            return Vec::new();
+        };
+        self.session
+            .panes
+            .values()
+            .filter(|p| p.space == space.id && p.board && p.exited.is_none())
+            .filter(|p| p.agent.is_some())
+            .filter_map(|p| p.role.clone())
+            .collect()
+    }
+
+    /// Tell one enlisted agent in `space` that its project has work waiting *for it*.
+    ///
+    /// This is horde's dispatcher, and it is deliberately not an agent. It knows which project a
+    /// task belongs to, which role may take it, who is enlisted, who is already holding
+    /// something, and who has been idle longest — and it decides in the daemon, where the answer
+    /// is the same every time and cannot be blocked at a permission prompt.
     fn nudge_one(&mut self, space: SpaceId, space_name: &str) -> Option<Event> {
-        let open = self.board.offered_to(space_name);
-        if open == 0 {
+        if self.board.offered_to(space_name) == 0 {
             return None;
         }
 
@@ -647,64 +743,87 @@ impl Engine {
         // Enlistment is the second half of the fix. Scope stops work crossing projects;
         // this stops it reaching an agent that never volunteered for any. An agent you opened
         // to think with, sitting idle in the same repository as a fleet, is not a worker.
-        let candidates: Vec<(PaneId, String, std::time::Instant)> = self
+        let candidates: Vec<Candidate> = self
             .session
             .panes
             .values()
             .filter(|p| p.space == space && p.board && p.exited.is_none())
-            .filter_map(|p| p.agent.as_ref().map(|a| (p.id, a)))
+            .filter_map(|p| p.agent.as_ref().map(|a| (p, a)))
             .filter(|(_, a)| eligible_state(a, &board_workers))
             .filter(|(_, a)| a.queued.is_empty())
             .filter(|(_, a)| !holding.contains(&a.name))
-            .map(|(id, a)| (id, a.name.clone(), a.since))
+            .map(|(p, a)| Candidate {
+                pane: p.id,
+                name: a.name.clone(),
+                role: p.role.clone(),
+                since: a.since,
+            })
             .collect();
 
-        // Agents told about the board that have not acted yet. They are about to consume
-        // tasks, so they count against the work available — otherwise "one per pass" simply
-        // wakes every idle agent over successive passes, which is the waste this is meant to
-        // avoid. Observed: one task, four idle agents, four nudges.
-        let already_told = self
-            .session
-            .panes
-            .values()
-            .filter(|p| p.space == space && p.board)
-            .filter_map(|p| p.agent.as_ref())
-            .filter(|a| eligible_state(a, &board_workers))
-            .filter(|a| a.nudged_since == Some(a.since))
-            .count();
+        // Whether an agent has been woken already and not yet acted. Such an agent is about to
+        // consume a task, so it counts against the work available — otherwise "one per pass"
+        // simply wakes every idle agent over successive passes, which is the waste this is meant
+        // to avoid. Observed: one task, four idle agents, four nudges.
+        let told = |p: &crate::daemon::pane::Pane| {
+            p.agent.as_ref().is_some_and(|a| a.nudged_since == Some(a.since))
+        };
 
-        // Never wake more agents than there is work for, but do wake several when there is:
-        // five tasks and three idle agents should end up with three agents working.
-        if open <= holding.len() + already_told {
-            return None;
-        }
+        // Accounted per role, because the work is. Five reviewer tasks are not five tasks for a
+        // builder, and one pool of numbers would either wake a builder for work it cannot claim
+        // or hold back a reviewer because somebody else is busy.
+        let engaged_like = |role: Option<&str>| -> usize {
+            self.session
+                .panes
+                .values()
+                .filter(|p| p.space == space && p.board && p.exited.is_none())
+                .filter(|p| p.role.as_deref() == role)
+                .filter(|p| {
+                    p.agent.as_ref().is_some_and(|a| holding.contains(&a.name))
+                        || (told(p) && p.agent.as_ref().is_some_and(|a| eligible_state(a, &board_workers)))
+                })
+                .count()
+        };
 
-        // Whoever has been idle longest is the most available, and picking by `since` rather
-        // than by pane id spreads successive tasks across the fleet.
-        let (pane, name, since) = candidates
-            .into_iter()
-            .filter(|(id, _, since)| {
-                self.session
-                    .panes
-                    .get(id)
-                    .and_then(|p| p.agent.as_ref())
-                    .is_some_and(|a| a.nudged_since != Some(*since))
-            })
-            .min_by_key(|(_, _, since)| *since)?;
+        // General hands first. An agent kept for anything is the cheapest one to spend on work
+        // that named nobody, and spending a specialist on it is how the one task only they could
+        // have taken ends up waiting for them.
+        let mut order = candidates;
+        order.sort_by_key(|c| (c.role.is_some(), c.since));
+
+        let chosen = order.into_iter().find(|c| {
+            // Not already woken and still waiting to act on it.
+            let fresh = self
+                .session
+                .panes
+                .get(&c.pane)
+                .and_then(|p| p.agent.as_ref())
+                .is_some_and(|a| a.nudged_since != Some(c.since));
+            let mine = self.board.offered_to_agent(space_name, c.role.as_deref());
+            fresh && mine > engaged_like(c.role.as_deref())
+        })?;
+        let Candidate { pane, name, role, since } = chosen;
+        let waiting = self.board.offered_to_agent(space_name, role.as_deref());
 
         // Marked before sending, so a failure cannot produce a nudge loop.
         if let Some(a) = self.session.panes.get_mut(&pane).and_then(|p| p.agent.as_mut()) {
             a.nudged_since = Some(since);
         }
 
+        // Says what it is being offered, not what the board holds. An agent told "9 tasks
+        // waiting" that then claims twice and gets nothing has been lied to, and the honest
+        // number is the one it can act on.
         let body = format!(
-            "{open} task{} waiting on the {space_name} board. Run `horde task claim` to take \
+            "{waiting} task{} on the {space_name} board {}. Run `horde task claim` to take \
              the next one, do it, then `horde task done --result \"<what happened>\"`. Repeat \
              while it keeps returning work.",
-            if open == 1 { "" } else { "s" }
+            if waiting == 1 { "" } else { "s" },
+            match &role {
+                Some(r) => format!("for {r}"),
+                None => "waiting".to_string(),
+            }
         );
         let Engine { bus, session, cfg, .. } = self;
-        match bus.send(session, cfg, None, &name, &body, false, false, None) {
+        match bus.send(session, cfg, bus::Outgoing::plain(None, &name, &body)) {
             Ok(m) => Some(Event::BusMessage(m)),
             Err(_) => None,
         }
@@ -887,6 +1006,7 @@ async fn engine_loop(
         session,
         bus: bus::Bus::new(crate::config::bus_log_path()),
         board: tasks::Board::new(crate::config::tasks_path()),
+        kanban: kanban::Kanban::new(crate::config::kanban_path()),
         triggers: triggers::Store::new(crate::config::triggers_path()),
         journal: journal::Journal::new(crate::config::journal_path()),
         pane_names: HashMap::new(),
@@ -1192,6 +1312,70 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
                 Err(e) => eng.notice(NoticeLevel::Error, format!("could not make a vault: {e}")),
             }
         }
+        // -- the kanban ------------------------------------------------------
+        //
+        // Every one of these answers with the whole board rather than with what it changed.
+        // The client holds one authoritative picture and replaces it, exactly as it does with
+        // `Snapshot`, so a card cannot end up drawn in a state it was never in. A board is a
+        // few hundred cards; a diff protocol would be a second source of truth to keep honest
+        // for no measurable gain.
+        //
+        // A failed write says so and re-sends the board unchanged, because the alternative —
+        // staying quiet — leaves the view showing the move it optimistically drew.
+        ClientFrame::Command(Cmd::KanbanQuery { space }) => eng.send_kanban(id, space),
+        ClientFrame::Command(Cmd::CardNew { space, column, title }) => {
+            let project = space.and_then(|s| eng.session.space(s)).map(|s| s.name.clone());
+            match eng.kanban.add(&title, &column, project.as_deref()) {
+                Ok(_) => eng.touch(),
+                Err(e) => eng.notice(NoticeLevel::Warn, format!("could not add the card: {e}")),
+            }
+            eng.send_kanban(id, space);
+        }
+        ClientFrame::Command(Cmd::CardEdit { id: card, patch }) => {
+            if let Err(e) = eng.kanban.edit(card, &patch) {
+                eng.notice(NoticeLevel::Warn, format!("could not change the card: {e}"));
+            }
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::CardMove { id: card, column, after }) => {
+            if let Err(e) = eng.kanban.place(card, &column, after) {
+                eng.notice(NoticeLevel::Warn, format!("could not move the card: {e}"));
+            }
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::CardComment { id: card, body }) => {
+            let by = eng.local_user();
+            if let Err(e) = eng.kanban.comment(card, &by, &body) {
+                eng.notice(NoticeLevel::Warn, format!("could not add the comment: {e}"));
+            }
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::CardArchive { id: card, archived }) => {
+            if let Err(e) = eng.kanban.archive(card, archived) {
+                eng.notice(NoticeLevel::Warn, format!("could not archive the card: {e}"));
+            }
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::CardHandOff { id: card }) => {
+            match hand_over(eng, card) {
+                Ok(task) => eng.notice(
+                    NoticeLevel::Info,
+                    format!("card #{card} is on the agents' board as task #{task}"),
+                ),
+                Err(e) => eng.notice(NoticeLevel::Warn, format!("{e}")),
+            }
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::ColumnRename { from, to }) => {
+            eng.kanban.rename_column(&from, &to);
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+
         // The project's own files. Answered to the asking client, like every other query.
         ClientFrame::Command(Cmd::FileQuery { space }) => {
             if let Some(reply) = eng.file_list(space) {
@@ -1485,7 +1669,17 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         | Cmd::DocChanged { .. }
         | Cmd::DocClosed { .. }
         | Cmd::Complete { .. }
-        | Cmd::Attach { .. } => {}
+        | Cmd::Attach { .. }
+        // Every kanban command answers with the board, so all of them need to know which
+        // client asked. Reaching here means one was routed through the broadcast path.
+        | Cmd::KanbanQuery { .. }
+        | Cmd::CardNew { .. }
+        | Cmd::CardEdit { .. }
+        | Cmd::CardMove { .. }
+        | Cmd::CardComment { .. }
+        | Cmd::CardArchive { .. }
+        | Cmd::CardHandOff { .. }
+        | Cmd::ColumnRename { .. } => {}
         Cmd::ApplyLayout { preset } => {
             if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
                 problems.push((NoticeLevel::Warn, e.to_string()));
@@ -1575,6 +1769,9 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         // Then, if anyone is free and the board is not empty, say so. A no-op while the board's
         // autonomous half is opt-in; see `agents.task_nudge` and `agents.board`.
         events.extend(eng.nudge_for_tasks());
+        // And hand over any card whose armed window has arrived. The same clock, because it
+        // is the same question — is there something an agent should be told about.
+        eng.hand_over_due_cards();
         let changed = !events.is_empty();
         for ev in events {
             eng.pending_events.push(ev);
@@ -1658,6 +1855,20 @@ fn tick(eng: &mut Engine, detect_due: bool) {
     }
 
     broadcast(eng);
+}
+
+/// One agent the nudge could wake, and everything the choice turns on.
+///
+/// Named rather than a tuple: the role made it a fourth field, and `(pane, name, role, since)`
+/// sorted on `.3` is a line that stays correct only until somebody inserts a field.
+struct Candidate {
+    pane: PaneId,
+    /// How the bus addresses it.
+    name: String,
+    /// What it is labelled as, which decides what it may be offered.
+    role: Option<String>,
+    /// When it entered its current state. Longest-idle is most available.
+    since: std::time::Instant,
 }
 
 /// Whether an agent's state means it is free to take board work.
@@ -1932,7 +2143,7 @@ fn nudge_handover(eng: &mut Engine) {
         let Engine { bus, session, .. } = eng;
         // Through the bus so it lands at the agent's prompt rather than mid-stream, and is
         // queued if it is busy — the same gating every other message gets.
-        if let Err(e) = bus.send(session, &cfg, None, &name, &body, false, false, None) {
+        if let Err(e) = bus.send(session, &cfg, bus::Outgoing::plain(None, &name, &body)) {
             log_line(&format!("{name}: could not send the handover instruction: {e}"));
         }
     }
@@ -1997,7 +2208,7 @@ fn advance_spent_models(eng: &mut Engine) {
         log_line(&format!("{name}: model spent, switching to {model}"));
         eng.journal.note(journal::Kind::Notified, &format!("{name} switched to {model}"));
         let Engine { bus, session, .. } = eng;
-        if let Err(e) = bus.send(session, &cfg, None, &name, &command, false, false, None) {
+        if let Err(e) = bus.send(session, &cfg, bus::Outgoing::plain(None, &name, &command)) {
             log_line(&format!("{name}: could not send the model switch: {e}"));
         }
     }
@@ -2412,6 +2623,79 @@ fn clock_string() -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
+/// This machine's short name, lowercased, with a trailing `.local` taken off.
+///
+/// mDNS hands out `Joshs-MacBook-Pro.local`, and the suffix is a protocol detail rather than
+/// part of what anyone calls the machine. Falls back to `$HOSTNAME` because a login shell has
+/// usually set it even where the syscall is unhelpful.
+fn hostname() -> Option<String> {
+    let mut buf = [0i8; 256];
+    // SAFETY: `gethostname` writes at most `len` bytes into the buffer we hand it, and the
+    // result is only read up to the first NUL.
+    let raw = unsafe {
+        if libc::gethostname(buf.as_mut_ptr(), buf.len()) != 0 {
+            None
+        } else {
+            let bytes: Vec<u8> =
+                buf.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+            String::from_utf8(bytes).ok()
+        }
+    };
+    let name = raw.or_else(|| std::env::var("HOSTNAME").ok())?;
+    let name = name.trim().trim_end_matches(".local").to_lowercase();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Put a card's work on the agents' board, and record on the card that it went.
+///
+/// The one seam between the two boards, and deliberately the only one. It runs in this
+/// direction only: a card becomes a task, and the task's result comes back as a comment. The
+/// agents never see a card, never move one between columns, and never learn that columns
+/// exist — which is what stops the personal board's rules from having to make sense to them.
+///
+/// A free function rather than a method because it writes to two stores that are otherwise
+/// strangers, and a method on either one would make it look like that store's business.
+///
+/// The order matters: the task goes on the board first, and only a task that really landed
+/// gets marked on the card. The other order would leave a card claiming it had been handed
+/// over to a task that does not exist, which is worse than doing it twice.
+fn hand_over(eng: &mut Engine, card: u64) -> Result<u64> {
+    if !eng.cfg.board {
+        return Err(anyhow!(
+            "the agents' board is off — set agents.board = true in config.toml to hand a card over"
+        ));
+    }
+    let c = eng.kanban.get(card).ok_or_else(|| anyhow!("no card #{card}"))?.clone();
+    if let Some(task) = c.handed {
+        return Err(anyhow!("card #{card} is already task #{task}"));
+    }
+    let project = c
+        .project
+        .clone()
+        .ok_or_else(|| anyhow!("card #{card} names no project, so no agent could be told where to work"))?;
+    // Title and description together: the title alone is a label written for a column two
+    // dozen cells wide, and an agent handed only that has to guess at everything the card
+    // actually says.
+    let text = match c.body.trim() {
+        "" => c.title.clone(),
+        body => format!("{}\n\n{body}", c.title),
+    };
+    // A card carries no role of its own — it is written in a column on your board, not addressed
+    // to anybody. So it inherits the one role the config already names: where `task_authors` is
+    // set, whoever may write work is also who receives it, and an armed card lands on their plate
+    // to be read and broken up rather than in a pool where the nearest idle agent starts editing
+    // from a title and a due date. With no such role configured it is general work, which is what
+    // every card has always been.
+    let lead = eng.cfg.task_authors.first().cloned();
+    let task = eng.board.add(tasks::NewTask {
+        role: lead.as_deref(),
+        ..tasks::NewTask::new(&text, "kanban", Some(&project))
+    })?;
+    eng.kanban.mark_handed(card, task.id)?;
+    eng.touch();
+    Ok(task.id)
+}
+
 pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2631,6 +2915,19 @@ mod tests {
         engine_with_shell(None)
     }
 
+    /// An engine whose one pane prints `words` and then stays open.
+    ///
+    /// The way to give a pane a line for horde to detect. `echo` looks like the obvious choice
+    /// and is a race: it exits immediately, and macOS discards a tty's pending output when the
+    /// last descriptor on the slave side closes, so under suite-level load the reader thread can
+    /// find a closed pty with nothing in it. The test then reports that the feature did not fire,
+    /// when the truth is the line never arrived to fire it — a failure that blames the code for
+    /// the test's own timing. See `tests/support/say.py`.
+    pub(super) fn engine_saying(words: &str) -> Engine {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/say.py");
+        engine_with_shell(Some(&format!("python3 {script} {words}")))
+    }
+
     /// An engine whose one pane runs `shell`, or the configured default when `None`.
     ///
     /// Worth the parameter: the default is the developer's own `$SHELL`, which prints a prompt
@@ -2656,6 +2953,7 @@ mod tests {
             session,
             bus: bus::Bus::new(test_path("bus.jsonl")),
             board: tasks::Board::new(test_path("tasks.jsonl")),
+            kanban: kanban::Kanban::new(test_path("kanban.jsonl")),
             triggers: triggers::Store::new(
                 test_path("triggers.jsonl"),
             ),
@@ -2753,6 +3051,235 @@ mod tests {
         );
     }
 
+    // -- the kanban over the wire ------------------------------------------
+    //
+    // The store has its own tests and so does the view. These are the bit in between: that a
+    // command arriving from a client reaches the store and that the board comes back — to the
+    // client that asked, and to nobody else.
+
+    /// An engine whose two boards are its own.
+    ///
+    /// `test_path` is unique per *process*, and tests run in parallel threads inside one — so
+    /// two tests that each replay `kanban.jsonl` would be reading each other's cards. Both
+    /// logs get a name of their own here, which is the same fix commit `bf2287a` applied to
+    /// the task board's own tests and for the same reason.
+    fn engine_with_boards(tag: &str) -> Engine {
+        let mut eng = engine();
+        let path = |what: &str| {
+            std::env::temp_dir()
+                .join(format!("horde-kb-{tag}-{}-{what}.jsonl", std::process::id()))
+        };
+        for what in ["kanban", "tasks"] {
+            let _ = std::fs::remove_file(path(what));
+        }
+        eng.kanban = kanban::Kanban::new(path("kanban"));
+        eng.board = tasks::Board::new(path("tasks"));
+        eng
+    }
+
+    /// Every reply the daemon sent this client, drained.
+    fn kanban_replies(
+        rx: &mut mpsc::UnboundedReceiver<ServerFrame>,
+    ) -> Vec<crate::proto::KanbanReply> {
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            if let ServerFrame::Kanban(r) = f {
+                out.push(*r);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_client_asking_for_the_board_gets_it_back() {
+        let mut eng = engine_with_boards("board-query");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+
+        handle_client_frame(&mut eng, 1, ClientFrame::Command(Cmd::KanbanQuery { space: None }));
+        let reply = kanban_replies(&mut rx).pop().expect("the board came back");
+        assert!(reply.cards.is_empty());
+        // The columns travel with it rather than being read from the client's own config, so
+        // a client attached from another machine still agrees about what the columns are.
+        assert_eq!(reply.columns, eng.cfg.kanban_columns);
+        kill_all(&mut eng);
+    }
+
+    /// Every command that changes a card answers with the whole board, so the client never
+    /// has to patch its own copy and cannot end up showing a state that was never true.
+    #[test]
+    fn every_card_command_answers_with_the_whole_board() {
+        let mut eng = engine_with_boards("card-cmds");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+        let send = |eng: &mut Engine, cmd: Cmd| handle_client_frame(eng, 1, ClientFrame::Command(cmd));
+
+        send(&mut eng, Cmd::CardNew { space: None, column: "Todo".into(), title: "write it".into() });
+        let after_new = kanban_replies(&mut rx).pop().expect("a reply");
+        assert_eq!(after_new.cards.len(), 1);
+        let id = after_new.cards[0].id;
+
+        send(
+            &mut eng,
+            Cmd::CardEdit {
+                id,
+                patch: crate::proto::CardPatch {
+                    body: Some("the long version".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(kanban_replies(&mut rx).pop().unwrap().cards[0].body, "the long version");
+
+        send(&mut eng, Cmd::CardComment { id, body: "parked".into() });
+        let commented = kanban_replies(&mut rx).pop().unwrap();
+        let last = commented.cards[0].comments.last().expect("the comment landed");
+        assert_eq!(last.body, "parked");
+        // The daemon stamps who said it. The client only ever sends the words, which is what
+        // stops a client claiming to be somebody else.
+        assert_eq!(last.by, eng.local_user());
+        assert!(last.by.contains('@') || last.by == "user", "a person, not a process: {}", last.by);
+
+        send(&mut eng, Cmd::CardMove { id, column: "Doing".into(), after: None });
+        assert_eq!(kanban_replies(&mut rx).pop().unwrap().cards[0].column, "Doing");
+
+        send(&mut eng, Cmd::CardArchive { id, archived: true });
+        assert!(kanban_replies(&mut rx).pop().unwrap().cards[0].archived);
+        kill_all(&mut eng);
+    }
+
+    /// A refused command still answers, or the view keeps showing the move it optimistically
+    /// drew. Staying quiet on failure is the one thing a board must not do.
+    #[test]
+    fn a_refused_card_command_still_sends_the_board_back() {
+        let mut eng = engine_with_boards("refused");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: None,
+                column: "Todo".into(),
+                title: "   ".into(),
+            }),
+        );
+        let reply = kanban_replies(&mut rx).pop().expect("it answered anyway");
+        assert!(reply.cards.is_empty(), "and refused the card");
+        kill_all(&mut eng);
+    }
+
+    /// The one seam between the two boards, driven from the client rather than the clock.
+    #[test]
+    fn handing_a_card_over_puts_a_real_task_on_the_agents_board() {
+        let mut eng = engine_with_boards("handoff");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+        let space = eng.session.spaces[0].id;
+        let name = eng.session.spaces[0].name.clone();
+
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: Some(space),
+                column: "Todo".into(),
+                title: "wire up the importer".into(),
+            }),
+        );
+        let id = kanban_replies(&mut rx).pop().unwrap().cards[0].id;
+        handle_client_frame(&mut eng, 1, ClientFrame::Command(Cmd::CardHandOff { id }));
+
+        let task = eng.board.all().last().expect("a task on the agents' board").clone();
+        assert_eq!(task.text, "wire up the importer");
+        assert_eq!(task.space.as_deref(), Some(name.as_str()), "scoped to the card's project");
+        assert_eq!(task.by, "kanban", "and says where it came from");
+
+        let card = kanban_replies(&mut rx).pop().unwrap().cards[0].clone();
+        assert_eq!(card.handed, Some(task.id));
+        assert!(card.comments.iter().any(|c| c.by == "horde"), "the card records that it went");
+
+        // Handing it over twice would put the same work on the board again.
+        handle_client_frame(&mut eng, 1, ClientFrame::Command(Cmd::CardHandOff { id }));
+        assert_eq!(eng.board.all().len(), 1, "once only");
+        kill_all(&mut eng);
+    }
+
+    /// An agent has to be told which tree to work in, which is the same failure `tasks.rs`
+    /// scoping exists to prevent — in the other direction.
+    #[test]
+    fn a_card_with_no_project_is_never_handed_over() {
+        let mut eng = engine_with_boards("no-project");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: None,
+                column: "Todo".into(),
+                title: "not about a repo".into(),
+            }),
+        );
+        let id = kanban_replies(&mut rx).pop().unwrap().cards[0].id;
+        assert!(hand_over(&mut eng, id).is_err());
+        assert!(eng.board.all().is_empty());
+        kill_all(&mut eng);
+    }
+
+    /// The switch that closes the agents' board has to close everything that puts work on it,
+    /// or it is a promise honoured in one place and broken in another.
+    #[test]
+    fn closing_the_agents_board_closes_the_bridge_too() {
+        let mut eng = engine_with_boards("board-off");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+        let space = eng.session.spaces[0].id;
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: Some(space),
+                column: "Todo".into(),
+                title: "work".into(),
+            }),
+        );
+        let id = kanban_replies(&mut rx).pop().unwrap().cards[0].id;
+
+        eng.cfg.board = false;
+        assert!(hand_over(&mut eng, id).is_err(), "the client-driven half refuses");
+        eng.hand_over_due_cards();
+        assert!(eng.board.all().is_empty(), "and so does the one on the clock");
+        kill_all(&mut eng);
+    }
+
+    /// Renaming a column carries its cards, which is what keeps an edit to the configured
+    /// list from orphaning work.
+    #[test]
+    fn renaming_a_column_over_the_wire_carries_its_cards() {
+        let mut eng = engine_with_boards("rename");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: None,
+                column: "Todo".into(),
+                title: "work".into(),
+            }),
+        );
+        let _ = kanban_replies(&mut rx);
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::ColumnRename { from: "Todo".into(), to: "Next".into() }),
+        );
+        assert_eq!(kanban_replies(&mut rx).pop().unwrap().cards[0].column, "Next");
+        kill_all(&mut eng);
+    }
+
     /// A configured variable has to reach the program, not merely be stored.
     ///
     /// This is how a provider key gets to an agent, and the failure mode if it does not arrive is
@@ -2760,27 +3287,13 @@ mod tests {
     /// its own UI. So the assertion goes all the way through a real PTY to a real child.
     #[test]
     fn configured_env_reaches_the_program_in_the_pane() {
-        // `printenv VAR` rather than `env`: one variable, one line. A bare `env` prints more
-        // than a pane has rows, and the answer scrolls off the top before anything can read it.
-        // Neither can use `sh -c '...'` — `build_command` splits on whitespace and does not
-        // honour quotes, so an argument containing spaces cannot be expressed here at all.
-        let mut eng = engine_with_shell(Some("printenv HORDE_ENV_TEST"));
+        // One variable, one line. A bare `env` prints more than a pane has rows and the answer
+        // scrolls off the top before anything can read it.
+        let mut eng = engine_saying("--env HORDE_ENV_TEST");
         let pane = *eng.session.panes.keys().next().unwrap();
-        let theme = eng.cfg.theme.clone();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut seen = String::new();
-        while std::time::Instant::now() < deadline && !seen.contains("sk-or-test") {
-            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
-            seen = eng.session.panes[&pane].visible_text().join("");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        // The value is printed alone, so the value is the whole assertion.
+        wait_for_text(&mut eng, pane, "sk-or-test");
         kill_all(&mut eng);
-        // `printenv VAR` prints the value alone, so the value is the whole assertion.
-        assert!(
-            seen.contains("sk-or-test"),
-            "the pane never saw the configured value; screen was {seen:?}"
-        );
     }
 
 
@@ -2831,7 +3344,7 @@ mod tests {
     /// everything horde could see.
     #[test]
     fn an_agent_that_died_without_handing_over_gets_a_successor() {
-        let mut eng = engine_with_shell(Some("echo reached your usage limit"));
+        let mut eng = engine_saying("reached your usage limit");
         let dead = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: Vec::new(),
@@ -2851,15 +3364,7 @@ mod tests {
         );
         give_agent_named(&mut eng.session, dead, "builder");
 
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&dead).unwrap().pump(&theme);
-            if eng.session.panes[&dead].visible_text().join("").contains("usage limit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, dead, "usage limit");
 
         let before = eng.session.panes.len();
         succeed_exhausted(&mut eng);
@@ -2895,7 +3400,7 @@ mod tests {
     /// answer is not a fourth.
     #[test]
     fn a_succession_chain_stops_at_its_limit() {
-        let mut eng = engine_with_shell(Some("echo reached your usage limit"));
+        let mut eng = engine_saying("reached your usage limit");
         let dead = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: Vec::new(),
@@ -2917,15 +3422,7 @@ mod tests {
         // Already at the end of a chain.
         eng.session.panes.get_mut(&dead).unwrap().succession_depth = 2;
 
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&dead).unwrap().pump(&theme);
-            if eng.session.panes[&dead].visible_text().join("").contains("usage limit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, dead, "usage limit");
 
         let before = eng.session.panes.len();
         succeed_exhausted(&mut eng);
@@ -2987,7 +3484,7 @@ mod tests {
     /// what to write, where, and the exact command to start its successor.
     #[test]
     fn an_agent_running_out_is_told_to_hand_over_while_it_still_can() {
-        let mut eng = engine_with_shell(Some("echo Approaching usage limit"));
+        let mut eng = engine_saying("Approaching usage limit");
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: vec!["Approaching usage limit".into()],
@@ -2998,15 +3495,7 @@ mod tests {
         };
         give_agent_named(&mut eng.session, pane, "builder");
 
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
-            if eng.session.panes[&pane].visible_text().join("").contains("Approaching") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, pane, "Approaching");
 
         nudge_handover(&mut eng);
         assert!(eng.session.panes[&pane].handover_told, "it should have been told");
@@ -3030,7 +3519,7 @@ mod tests {
     /// spend an agent's last turn telling it to run a command that cannot work.
     #[test]
     fn a_handover_warning_without_a_profile_does_nothing() {
-        let mut eng = engine_with_shell(Some("echo Approaching usage limit"));
+        let mut eng = engine_saying("Approaching usage limit");
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: vec!["Approaching usage limit".into()],
@@ -3053,7 +3542,7 @@ mod tests {
     #[test]
     fn an_exhausted_model_moves_the_agent_to_the_next_one() {
         // `echo` so the pane's screen carries OpenRouter's real refusal wording.
-        let mut eng = engine_with_shell(Some("echo Rate limit exceeded"));
+        let mut eng = engine_saying("Rate limit exceeded");
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.models.insert(
             "free".into(),
@@ -3068,16 +3557,7 @@ mod tests {
             Some(crate::daemon::pane::ModelRun { profile: "free".into(), index: 0, switched: None });
         give_agent_named(&mut eng.session, pane, "builder");
 
-        // Let the refusal reach the screen.
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
-            if eng.session.panes[&pane].visible_text().join("").contains("Rate limit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, pane, "Rate limit");
 
         advance_spent_models(&mut eng);
         let run = eng.session.panes[&pane].model.clone().expect("still on a profile");
@@ -3095,7 +3575,7 @@ mod tests {
     /// A profile with nowhere left to go stops rather than wrapping.
     #[test]
     fn a_spent_profile_stops_instead_of_starting_over() {
-        let mut eng = engine_with_shell(Some("echo Rate limit exceeded"));
+        let mut eng = engine_saying("Rate limit exceeded");
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.models.insert(
             "free".into(),
@@ -3110,15 +3590,7 @@ mod tests {
             Some(crate::daemon::pane::ModelRun { profile: "free".into(), index: 0, switched: None });
         give_agent_named(&mut eng.session, pane, "builder");
 
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
-            if eng.session.panes[&pane].visible_text().join("").contains("Rate limit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, pane, "Rate limit");
 
         advance_spent_models(&mut eng);
         // Still on the last model, not back at the start.
@@ -3151,6 +3623,32 @@ mod tests {
         for p in eng.session.panes.values_mut() {
             p.kill();
         }
+    }
+
+    /// Pump `pane` until its screen contains `needle`, and fail saying so if it never does.
+    ///
+    /// Every handover and model test needs the same thing first: a real process has to get far
+    /// enough to print the line the feature triggers on. Five of them spelled that out inline as
+    /// "loop until the deadline, then carry on regardless", which made two of them flaky and one
+    /// of them worse than flaky — the test that asserts *no* successor appears passed for the
+    /// wrong reason whenever the process was slow, because a screen that never showed the
+    /// message also produces no successor.
+    ///
+    /// So the wait asserts. The deadline is generous because the cost is asymmetric: too short
+    /// fails a good build, and too long only matters on a build that is already failing.
+    fn wait_for_text(eng: &mut Engine, pane: PaneId, needle: &str) {
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
+            if eng.session.panes[&pane].visible_text().join("").contains(needle) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let screen = eng.session.panes[&pane].visible_text().join("");
+        kill_all(eng);
+        panic!("the pane never printed {needle:?} — nothing was triggered. Screen was {screen:?}");
     }
 
     /// The bug this guards: agent state, names, and elapsed timers all reach the client
@@ -3315,7 +3813,7 @@ mod tests {
     /// Add work to the fixture's own project.
     fn add_task(eng: &mut Engine, text: &str) {
         let space = fixture_space(eng);
-        eng.board.add(text, "user", Some(&space)).unwrap();
+        eng.board.add(tasks::NewTask::new(text, "user", Some(&space))).unwrap();
     }
 
     fn nudge_bodies(events: &[Event]) -> Vec<(String, String)> {
@@ -3336,6 +3834,117 @@ mod tests {
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].0, "worker0");
         assert!(sent[0].1.contains("horde task claim"), "it must name the command: {sent:?}");
+        kill_all(&mut eng);
+    }
+
+    /// Give an enlisted agent a role, the way `spawn --role` does.
+    fn label(eng: &mut Engine, worker: &str, role: &str) {
+        let pane = *eng
+            .session
+            .panes
+            .iter()
+            .find(|(_, p)| p.agent.as_ref().is_some_and(|a| a.name == worker))
+            .map(|(id, _)| id)
+            .expect("that worker exists");
+        eng.session.set_pane_role(pane, role);
+    }
+
+    /// Add role-tagged work to the fixture's own project.
+    fn add_task_for(eng: &mut Engine, text: &str, role: &str) {
+        let space = fixture_space(eng);
+        eng.board
+            .add(tasks::NewTask {
+                role: Some(role),
+                ..tasks::NewTask::new(text, "pm", Some(&space))
+            })
+            .unwrap();
+    }
+
+    /// The dispatcher wakes the agent the work is *for*.
+    ///
+    /// Not the one that has been idle longest, which is the rule for general work and would here
+    /// mean a builder woken for a task it cannot claim: a turn spent finding out, and a reviewer
+    /// still sitting idle beside it.
+    #[test]
+    fn role_tagged_work_wakes_the_role_it_names() {
+        let mut eng = engine_with_idle_agents("role-nudge", 2);
+        label(&mut eng, "worker0", "builder");
+        label(&mut eng, "worker1", "reviewer");
+        add_task_for(&mut eng, "review the diff", "reviewer");
+
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "worker1", "the reviewer, not whoever was idle longest");
+        assert!(sent[0].1.contains("for reviewer"), "and it says whose work it is: {sent:?}");
+        kill_all(&mut eng);
+    }
+
+    /// Nobody is woken for work they could not claim if they tried.
+    ///
+    /// The failure this prevents is the expensive kind: a nudge costs the recipient a whole turn,
+    /// and a turn that ends in `horde task claim` printing nothing is a turn spent on nothing.
+    #[test]
+    fn an_agent_is_never_woken_for_work_its_role_cannot_take() {
+        let mut eng = engine_with_idle_agents("role-wrong", 1);
+        label(&mut eng, "worker0", "builder");
+        add_task_for(&mut eng, "review the diff", "reviewer");
+
+        for _ in 0..3 {
+            assert!(
+                nudge_bodies(&eng.nudge_for_tasks()).is_empty(),
+                "a builder must not be woken for a reviewer's task"
+            );
+        }
+        // And the work is visibly stuck rather than quietly waiting.
+        let space = fixture_space(&eng);
+        let present = eng.roles_enlisted_in(&space);
+        assert_eq!(present, ["builder"], "{present:?}");
+        assert_eq!(eng.board.stranded(&space, &present).len(), 1);
+        kill_all(&mut eng);
+    }
+
+    /// General work goes to a general hand before it goes to a specialist.
+    ///
+    /// Spending the reviewer on work that named nobody is how the one task only the reviewer
+    /// could have taken ends up waiting for the reviewer.
+    #[test]
+    fn general_work_prefers_an_unlabelled_agent_over_a_specialist() {
+        let mut eng = engine_with_idle_agents("role-general", 2);
+        // worker0 has been idle longest and is the specialist, so "longest idle" alone would
+        // pick it. The role is what makes worker1 the right answer.
+        label(&mut eng, "worker0", "reviewer");
+        add_task(&mut eng, "anything");
+
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "worker1", "the unlabelled one: {sent:?}");
+        kill_all(&mut eng);
+    }
+
+    /// Work is accounted per role, not in one pool.
+    ///
+    /// Two reviewer tasks and one reviewer means one nudge; the builder beside it is not woken to
+    /// make up the number, and is not held back either when its own work arrives.
+    #[test]
+    fn the_wake_cap_counts_each_roles_work_separately() {
+        let mut eng = engine_with_idle_agents("role-cap", 2);
+        label(&mut eng, "worker0", "reviewer");
+        label(&mut eng, "worker1", "builder");
+        add_task_for(&mut eng, "review one", "reviewer");
+        add_task_for(&mut eng, "review two", "reviewer");
+
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "two reviewer tasks, one reviewer: {sent:?}");
+        assert_eq!(sent[0].0, "worker0");
+        // The builder stays asleep however many reviewer tasks pile up.
+        add_task_for(&mut eng, "review three", "reviewer");
+        assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty(), "not the builder's work");
+
+        // Its own work still reaches it, unblocked by the reviewer's backlog.
+        add_task_for(&mut eng, "build one", "builder");
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "worker1");
         kill_all(&mut eng);
     }
 
@@ -3450,7 +4059,7 @@ mod tests {
     fn a_task_old_enough_to_be_forgotten_stops_being_offered() {
         let mut eng = engine_with_idle_agents("stale", 1);
         let space = fixture_space(&eng);
-        eng.board.add("from last week", "user", Some(&space)).unwrap();
+        eng.board.add(tasks::NewTask::new("from last week", "user", Some(&space))).unwrap();
         // Wind it back past the threshold.
         let id = eng.board.all()[0].id;
         eng.board.backdate_for_test(id, tasks::STALE_AFTER.as_millis() as u64 + 60_000);
@@ -3459,7 +4068,7 @@ mod tests {
         assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
         // Still on the board, still readable, still claimable by name. Stale is not deleted.
         assert_eq!(eng.board.open_count(), 1);
-        assert!(eng.board.claim("worker0", Some(id), Some(&space)).unwrap().is_some());
+        assert!(eng.board.claim("worker0", Some(id), tasks::Claimant { space: Some(&space), role: None }).unwrap().is_some());
         kill_all(&mut eng);
     }
 
@@ -3520,7 +4129,7 @@ mod tests {
         let mut eng = engine_with_idle_agents("done-worker", 1);
         add_task(&mut eng, "first");
         add_task(&mut eng, "second");
-        eng.board.claim("worker0", Some(1), None).unwrap();
+        eng.board.claim("worker0", Some(1), Default::default()).unwrap();
         eng.board.done("worker0", Some(1), Some("finished")).unwrap();
 
         // It finished unfocused, so detection calls that `done`.
@@ -3538,7 +4147,7 @@ mod tests {
         let mut eng = engine_with_idle_agents("holding", 1);
         add_task(&mut eng, "job one");
         add_task(&mut eng, "job two");
-        eng.board.claim("worker0", Some(1), None).unwrap();
+        eng.board.claim("worker0", Some(1), Default::default()).unwrap();
         assert!(
             nudge_bodies(&eng.nudge_for_tasks()).is_empty(),
             "it has work; a second task can wait for someone free"

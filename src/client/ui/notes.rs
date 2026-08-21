@@ -181,6 +181,125 @@ fn walk_level(
     }
 }
 
+/// The vault as a tree, beside a note rather than instead of one.
+///
+/// The same rows the browser lists, drawn narrow: no search field, no preview, no backlink
+/// counts. What it adds is the one thing the browser cannot — telling you where the note you
+/// are *in* sits among the others, which is the question you have while writing rather than
+/// while looking.
+///
+/// Returns `(y, path)` for every note it drew, so a click opens the note under the pointer.
+/// Folders are scenery here: the browser is where a vault is rearranged.
+pub fn draw_tree(
+    buf: &mut Buffer,
+    area: TRect,
+    theme: &Theme,
+    vault: Option<&VaultReply>,
+    rows_in: &[Row],
+    here: &str,
+    scroll: usize,
+) -> Vec<(u16, String)> {
+    let mut hits = Vec::new();
+    fill(buf, area, theme.ui.panel_bg);
+    if area.width < 12 || area.height < 3 {
+        return hits;
+    }
+    // A rule down the left, so the tree reads as beside the note rather than after it.
+    for y in area.y..area.y + area.height {
+        put_line(
+            buf,
+            area.x,
+            y,
+            1,
+            Line::from(Span::styled(
+                "│",
+                Style::default().fg(color(theme.ui.border)).bg(color(theme.ui.panel_bg)),
+            )),
+        );
+    }
+    let inner = TRect {
+        x: area.x + 2,
+        y: area.y,
+        width: area.width.saturating_sub(3),
+        height: area.height,
+    };
+
+    let n = vault.map(|v| v.notes.len()).unwrap_or(0);
+    put_line(
+        buf,
+        inner.x,
+        inner.y,
+        inner.width,
+        Line::from(Span::styled(
+            format!("VAULT  {n}"),
+            Style::default()
+                .fg(color(theme.ui.text_faint))
+                .bg(color(theme.ui.panel_bg))
+                .add_modifier(Modifier::BOLD),
+        )),
+    );
+
+    let room = (inner.height as usize).saturating_sub(2);
+    for (i, r) in rows_in.iter().skip(scroll).take(room).enumerate() {
+        let y = inner.y + 2 + i as u16;
+        let indent = "  ".repeat(r.depth.min(4));
+        if r.folder {
+            put_line(
+                buf,
+                inner.x,
+                y,
+                inner.width,
+                Line::from(Span::styled(
+                    format!("{indent}{}/", truncate(&r.title, inner.width as usize)),
+                    Style::default().fg(color(theme.ui.text_dim)).bg(color(theme.ui.panel_bg)),
+                )),
+            );
+            continue;
+        }
+        // The note being edited is marked, not just highlighted: a tree whose current row is
+        // only a background colour is unreadable the moment the terminal loses focus.
+        let current = r.path == here;
+        let (mark, fg) = match current {
+            true => ("▸ ", theme.ui.accent),
+            false => ("  ", theme.ui.text),
+        };
+        if current {
+            fill(buf, TRect { x: area.x + 1, y, width: area.width - 1, height: 1 }, theme.ui.selection);
+        }
+        let bg = if current { theme.ui.selection } else { theme.ui.panel_bg };
+        let room = (inner.width as usize).saturating_sub(indent.len() + 2);
+        put_line(
+            buf,
+            inner.x,
+            y,
+            inner.width,
+            Line::from(vec![
+                Span::styled(
+                    format!("{indent}{mark}"),
+                    Style::default().fg(color(theme.ui.accent)).bg(color(bg)),
+                ),
+                Span::styled(
+                    truncate(&r.title, room),
+                    Style::default().fg(color(fg)).bg(color(bg)),
+                ),
+            ]),
+        );
+        hits.push((y, r.path.clone()));
+    }
+    hits
+}
+
+/// How wide the tree is, and whether there is room for it at all.
+///
+/// `None` on a terminal too narrow to carry both, because a note squeezed into forty columns
+/// to make room for a list of its neighbours is the wrong thing to protect. The note is what
+/// you came for; the tree is context.
+pub fn tree_width(area: TRect) -> Option<u16> {
+    const TREE: u16 = 30;
+    const NOTE_FLOOR: u16 = 56;
+    (area.width >= TREE + NOTE_FLOOR).then_some(TREE)
+}
+
 /// Draw the project's files. Returns `(y, row index)` hits for the mouse.
 pub fn draw_files(
     buf: &mut Buffer,

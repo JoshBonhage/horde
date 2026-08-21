@@ -18,6 +18,9 @@ use std::process::Command;
 /// rather than only in the daemon so an accident is refused before it goes down a socket.
 pub const MAX_PASTE: usize = 8 * 1024 * 1024;
 
+
+
+
 /// The clipboard's contents as a PNG, if it holds a picture at all.
 ///
 /// `None` covers every ordinary case — text on the clipboard, nothing on it, no helper

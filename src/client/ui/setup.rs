@@ -1,12 +1,23 @@
 //! The setup walkthrough: what horde asks before you start using it.
 //!
-//! Shown once, on a session that has never been set up, and reachable afterwards from the
-//! settings page. It exists because the alternative is discovering the questions by hitting
-//! them — being told "no vault" the first time you try to write a note is not a prompt, it
-//! is a wall.
+//! Shown once, on a session that has never been set up, and reachable afterwards from
+//! Settings → Agents. It exists because the alternative is discovering the questions by
+//! hitting them — being told "no vault" the first time you try to write a note is not a
+//! prompt, it is a wall.
 //!
-//! Each step is one decision with a sensible default already chosen, so the whole thing can
-//! be finished by pressing enter four times and changed later.
+//! Three rules it holds itself to:
+//!
+//! - **Every step has an answer already chosen**, so the whole thing can be finished by
+//!   pressing enter. A walkthrough you cannot get through without deciding something is a
+//!   form, and nobody sets up a tool by filling in a form.
+//! - **It only asks what an answer can change.** A step that collects a preference nothing
+//!   reads is a walkthrough that lies politely. Which languages the editor highlights is a
+//!   property of how the binary was built, so it is reported in Settings → About instead of
+//!   being asked about here.
+//! - **Finishing writes through [`crate::client::settings::write`]**, the same
+//!   comment-preserving merge the settings page uses. It used to write the file itself and
+//!   skip a config that already existed, which meant running it a second time — from the
+//!   settings page it advertises — collected four answers and silently discarded them.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect as TRect;
@@ -14,6 +25,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::{color, fill, logo, put_line};
+use crate::client::settings::{self, Value};
 use crate::theme::Theme;
 
 /// One question in the walkthrough.
@@ -21,8 +33,8 @@ use crate::theme::Theme;
 pub enum Step {
     /// Where notes live.
     Vault,
-    /// Which languages the editor should know about.
-    Languages,
+    /// Whether an agent reports its own state, or horde guesses from the screen.
+    Hooks,
     /// Whether horde may act while nobody is attached.
     Unattended,
     /// What was chosen, and where to change it.
@@ -31,13 +43,13 @@ pub enum Step {
 
 impl Step {
     pub fn all() -> [Step; 4] {
-        [Step::Vault, Step::Languages, Step::Unattended, Step::Done]
+        [Step::Vault, Step::Hooks, Step::Unattended, Step::Done]
     }
 
     pub fn title(&self) -> &'static str {
         match self {
             Step::Vault => "Where your notes live",
-            Step::Languages => "What the editor should know",
+            Step::Hooks => "How horde reads your agents",
             Step::Unattended => "Whether horde acts on its own",
             Step::Done => "Ready",
         }
@@ -55,13 +67,17 @@ impl Step {
                 "notes of its own alongside its code, and those win when you",
                 "are in it.",
             ],
-            Step::Languages => &[
-                "The editor recognises a file by its extension and colours it",
-                "accordingly. These are the languages this build understands:",
+            Step::Hooks => &[
+                "horde shows what each agent is doing. Without help it reads",
+                "that off the screen, and a narrow pane can hide the marker —",
+                "a working agent then looks idle, and messages meant to wait",
+                "are delivered mid-thought.",
                 "",
-                // Filled in from the build itself below — asking you to choose
-                // would be a question nothing could act on, since grammars are
-                // compiled in rather than loaded.
+                "Claude Code can report its own state instead. This adds",
+                "horde's hooks to ~/.claude/settings.json — backed up first,",
+                "other tools' hooks untouched, undone by `horde integration",
+                "uninstall claude` — and installs the skill that teaches an",
+                "agent to use the bus.",
             ],
             Step::Unattended => &[
                 "horde can start and nudge agents while nobody is attached: on",
@@ -72,20 +88,27 @@ impl Step {
                 "is a switch you turn on rather than one you find already on.",
             ],
             Step::Done => &[
-                "That is everything horde needs to know.",
-                "",
-                "All of it lives in config.toml and changes whenever you like —",
-                "press `.` for settings, or edit the file directly. This",
-                "walkthrough is under settings too, if you want it again.",
+                "This is what horde is about to write:",
             ],
         }
     }
+}
+
+/// Whether Claude Code has ever run here.
+///
+/// Asked so the hooks step can default to skipping on a machine that does not have it: writing
+/// hooks for a tool you do not use is clutter in someone else's config file, and a wizard that
+/// does it because you pressed enter is a wizard you stop pressing enter through.
+pub fn claude_present() -> bool {
+    dirs::home_dir().map(|h| h.join(".claude").is_dir()).unwrap_or(false)
 }
 
 /// What the walkthrough has been told so far.
 #[derive(Debug, Clone)]
 pub struct Answers {
     pub vault: String,
+    /// Install the Claude Code hooks and the horde skill on finishing.
+    pub hooks: bool,
     pub unattended: bool,
     /// Which choice on the current step is highlighted.
     pub cursor: usize,
@@ -99,6 +122,7 @@ impl Default for Answers {
                 .join("notes")
                 .to_string_lossy()
                 .to_string(),
+            hooks: claude_present(),
             unattended: false,
             cursor: 0,
         }
@@ -106,18 +130,61 @@ impl Default for Answers {
 }
 
 impl Answers {
-    /// The config the walkthrough would write.
-    pub fn to_config(&self) -> String {
-        let langs = crate::client::syntax::available();
-        format!(
-            "# Written by horde's setup walkthrough. Yours to edit.\n\n\
-             [vault]\nhome = \"{}\"\n\n\
-             # Languages this build highlights: {}\n\
-             [triggers]\nunattended = {}\n",
-            self.vault,
-            if langs.is_empty() { "markdown only".to_string() } else { langs.join(", ") },
-            self.unattended,
-        )
+    /// The settings the walkthrough would write, as dotted keys.
+    ///
+    /// Keys rather than a block of TOML, because these go through the settings writer, which
+    /// merges into whatever is already there and keeps its comments and ordering. The hooks
+    /// answer is not here: it is not a setting, it is something to run.
+    pub fn writes(&self) -> Vec<(&'static str, Value)> {
+        vec![
+            ("vault.home", Value::Str(self.vault.clone())),
+            ("triggers.unattended", Value::Bool(self.unattended)),
+        ]
+    }
+
+    /// What the last step shows: the answers, in the order they were given.
+    pub fn summary(&self) -> Vec<String> {
+        vec![
+            format!("  notes         {}", self.vault),
+            format!(
+                "  claude code   {}",
+                if self.hooks {
+                    "install hooks and the horde skill"
+                } else if claude_present() {
+                    "leave it to screen detection"
+                } else {
+                    "not installed here — nothing to do"
+                }
+            ),
+            format!(
+                "  unattended    {}",
+                if self.unattended { "on — horde may act alone" } else { "off" }
+            ),
+        ]
+    }
+
+    /// Apply everything the walkthrough collected. Returns a line per thing that happened.
+    ///
+    /// Failures are returned rather than raised: three of four steps landing is worth saying,
+    /// and a wizard that reports nothing because its last action failed leaves you guessing
+    /// about the first three.
+    pub fn apply(&self) -> Vec<Result<String, String>> {
+        let mut out = Vec::new();
+        for (key, value) in self.writes() {
+            out.push(match settings::write(key, value) {
+                Ok(()) => Ok(format!("saved {key}")),
+                Err(e) => Err(format!("could not save {key}: {e:#}")),
+            });
+        }
+        if self.hooks {
+            // The reporting variant, because the printing one would put its four lines on top
+            // of the frame this is drawn in and ratatui would leave them there.
+            out.push(match crate::cli::integration::install_reporting("claude") {
+                Ok(_) => Ok("installed the Claude Code hooks and the horde skill".into()),
+                Err(e) => Err(format!("could not install the hooks: {e:#}")),
+            });
+        }
+        out
     }
 }
 
@@ -125,34 +192,69 @@ impl Answers {
 pub fn choices(step: Step, _a: &Answers) -> usize {
     match step {
         Step::Vault => 1,
-        Step::Languages => 0,
+        Step::Hooks => 2,
         Step::Unattended => 2,
         Step::Done => 0,
     }
 }
 
-/// The lines of the choice area, and which are selectable.
-pub fn choice_lines(step: Step, _a: &Answers) -> Vec<String> {
+/// The lines of the choice area.
+pub fn choice_lines(step: Step, a: &Answers) -> Vec<String> {
+    let radio = |on: bool| if on { "•" } else { " " };
     match step {
-        Step::Vault => vec![format!("  {}", _a.vault)],
-        Step::Languages => {
-            let langs = crate::client::syntax::available();
-            let mut out: Vec<String> = if langs.is_empty() {
-                vec!["  none — this build was made without language features".into()]
-            } else {
-                langs.chunks(3).map(|row| format!("  {}", row.join("   "))).collect()
-            };
+        Step::Vault => vec![format!("  {}", a.vault)],
+        Step::Hooks => vec![
+            format!("  ({}) install them — recommended", radio(a.hooks)),
+            format!(
+                "  ({}) {}",
+                radio(!a.hooks),
+                if claude_present() {
+                    "not now — read the screen instead"
+                } else {
+                    "not now — Claude Code is not on this machine"
+                }
+            ),
+        ],
+        Step::Unattended => vec![
+            format!("  ({}) leave it off", radio(!a.unattended)),
+            format!("  ({}) let horde act on its own", radio(a.unattended)),
+        ],
+        Step::Done => {
+            let mut out = a.summary();
             out.push(String::new());
-            out.push("  Grammars are compiled in, so this is a property of the".into());
-            out.push("  binary rather than a setting. A smaller build is".into());
-            out.push("  `--no-default-features`, plus the ones you want.".into());
+            out.push("  All of it lives in config.toml and changes whenever you".into());
+            out.push("  like — press `.` for settings, or edit the file directly.".into());
+            out.push("  This walkthrough is under Settings → Agents.".into());
             out
         }
-        Step::Unattended => vec![
-            format!("  ({}) leave it off", if _a.unattended { " " } else { "•" }),
-            format!("  ({}) let horde act on its own", if _a.unattended { "•" } else { " " }),
-        ],
-        Step::Done => Vec::new(),
+    }
+}
+
+/// Which choice the cursor should open on, so stepping back and forth does not change an answer.
+pub fn cursor_for(step: Step, a: &Answers) -> usize {
+    match step {
+        Step::Hooks => usize::from(!a.hooks),
+        Step::Unattended => usize::from(a.unattended),
+        _ => 0,
+    }
+}
+
+/// Move the answer to wherever the cursor is. On a radio step, moving *is* choosing — a second
+/// keystroke to confirm what the highlight already shows is a step that only exists to be missed.
+pub fn choose(step: Step, a: &mut Answers) {
+    match step {
+        Step::Hooks => a.hooks = a.cursor == 0,
+        Step::Unattended => a.unattended = a.cursor == 1,
+        _ => {}
+    }
+}
+
+/// The key hints for a step. Only keys the step actually has.
+pub fn hint(step: Step) -> &'static str {
+    match step {
+        Step::Vault => "type to change it   enter continue   esc skip setup",
+        Step::Hooks | Step::Unattended => "↑↓ choose   enter continue   esc skip setup",
+        Step::Done => "enter to finish",
     }
 }
 
@@ -207,8 +309,9 @@ pub fn draw(buf: &mut Buffer, area: TRect, theme: &Theme, step: Step, a: &Answer
     }
     y += 1;
 
+    let selectable = choices(step, a);
     for (i, line) in choice_lines(step, a).iter().enumerate() {
-        let selected = i == a.cursor;
+        let selected = i == a.cursor && i < selectable;
         if selected {
             fill(buf, TRect { x, y, width: w, height: 1 }, theme.ui.selection);
         }
@@ -227,19 +330,13 @@ pub fn draw(buf: &mut Buffer, area: TRect, theme: &Theme, step: Step, a: &Answer
         y += 1;
     }
 
-    let hint = match step {
-        Step::Vault => "type to change it   enter continue   esc skip setup",
-        Step::Languages => "space toggles   ↑↓ move   enter continue",
-        Step::Unattended => "↑↓ choose   enter continue",
-        Step::Done => "enter to finish",
-    };
     put_line(
         buf,
         x,
         area.y + area.height.saturating_sub(2),
         w,
         Line::from(Span::styled(
-            hint.to_string(),
+            hint(step).to_string(),
             Style::default().fg(color(theme.ui.text_faint)).bg(color(theme.ui.bg)),
         )),
     );
@@ -264,36 +361,85 @@ mod tests {
         }
     }
 
-    /// What it writes has to be config horde can actually read back.
+    /// The hints name keys the step has, and no others.
+    ///
+    /// The bug this pins: the dropped languages step offered "space toggles ↑↓ move" on a step
+    /// with nothing to toggle and nothing to move between. A hint that describes a key which
+    /// does nothing is worse than no hint — it reads as a broken program.
     #[test]
-    fn the_walkthrough_writes_config_that_parses() {
-        let mut a = Answers::default();
-        a.vault = "/tmp/my-notes".into();
-        a.unattended = true;
-        let text = a.to_config();
-        assert!(text.contains("home = \"/tmp/my-notes\""), "{text}");
-        assert!(text.contains("unattended = true"), "{text}");
+    fn a_step_only_offers_keys_it_has() {
+        for step in Step::all() {
+            let hint = hint(step);
+            if choices(step, &Answers::default()) < 2 {
+                assert!(!hint.contains("↑↓"), "{step:?} has nothing to move between: {hint}");
+            }
+            assert!(!hint.contains("space"), "{step:?}: no step toggles with space: {hint}");
+        }
+    }
 
-        let path = std::env::temp_dir().join(format!("horde-setup-{}.toml", std::process::id()));
-        std::fs::write(&path, &text).unwrap();
+    /// Moving the highlight is the whole gesture on a radio step, and coming back to a step
+    /// must show what you chose rather than resetting it.
+    #[test]
+    fn moving_the_highlight_is_choosing_and_the_choice_sticks() {
+        let mut a = Answers { hooks: false, unattended: false, ..Answers::default() };
+
+        a.cursor = 1;
+        choose(Step::Unattended, &mut a);
+        assert!(a.unattended, "the second option is on");
+        assert_eq!(cursor_for(Step::Unattended, &a), 1, "and returning opens on it");
+
+        a.cursor = 0;
+        choose(Step::Unattended, &mut a);
+        assert!(!a.unattended, "and back again");
+        assert_eq!(cursor_for(Step::Unattended, &a), 0);
+
+        a.cursor = 0;
+        choose(Step::Hooks, &mut a);
+        assert!(a.hooks, "install is the first option on the hooks step");
+        assert_eq!(cursor_for(Step::Hooks, &a), 0);
+    }
+
+    /// What it writes has to be config horde can actually read back — and it has to *merge*,
+    /// because the second time anyone runs this there is already a file.
+    #[test]
+    fn finishing_merges_into_a_config_that_already_exists() {
+        let dir = std::env::temp_dir().join(format!("horde-setup-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        // A config someone wrote by hand, comment and all.
+        std::fs::write(
+            &path,
+            "# mine, do not reformat\n[theme]\nname = \"gruvbox\"\n\n[vault]\nhome = \"/old/notes\"\n",
+        )
+        .unwrap();
+
+        let a = Answers { vault: "/tmp/my-notes".into(), unattended: true, ..Answers::default() };
+        for (key, value) in a.writes() {
+            settings::write_to(&path, key, value).expect("it writes");
+        }
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# mine, do not reformat"), "comments survive: {text}");
+        assert!(text.contains("gruvbox"), "and so does everything it was not asked about");
+        assert!(!text.contains("/old/notes"), "the answer replaced the old value: {text}");
+
         let (cfg, warnings) = crate::config::Config::load_from(&path);
         assert!(warnings.is_empty(), "it must parse cleanly: {warnings:?}");
         assert_eq!(cfg.vault_home, std::path::PathBuf::from("/tmp/my-notes"));
         assert!(cfg.unattended);
-        let _ = std::fs::remove_file(path);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The step reports rather than asks. Grammars are compiled in, so a question about
-    /// which to enable would be one the answer could not act on — and a walkthrough that
-    /// collects a preference nothing reads is a walkthrough that lies politely.
+    /// The last step reports the answers rather than promising something generic, so what is
+    /// about to happen is readable before it happens.
     #[test]
-    fn the_languages_step_reports_what_the_build_actually_has() {
-        let lines = choice_lines(Step::Languages, &Answers::default());
-        let text = lines.join(" ");
-        for lang in crate::client::syntax::available() {
-            assert!(text.contains(lang), "{lang} is missing from {text:?}");
-        }
-        assert!(text.contains("compiled in"), "and it says why it is not a setting");
-        assert_eq!(choices(Step::Languages, &Answers::default()), 0, "nothing to choose");
+    fn the_last_step_shows_what_was_chosen() {
+        let a = Answers { vault: "/n".into(), hooks: true, unattended: true, ..Answers::default() };
+        let text = choice_lines(Step::Done, &a).join("\n");
+        assert!(text.contains("/n"), "{text}");
+        assert!(text.contains("hooks"), "{text}");
+        assert!(text.contains("horde may act alone"), "{text}");
+        assert_eq!(choices(Step::Done, &a), 0, "and nothing left to choose");
     }
 }

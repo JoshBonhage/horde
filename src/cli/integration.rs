@@ -62,11 +62,50 @@ fn horde_binary() -> Result<String> {
 }
 
 /// True when a hook command belongs to horde.
+///
+/// This decides what install replaces and what uninstall deletes, in a file horde does not own,
+/// so it has to be exact. It used to accept any command containing `" hook "` — which is a hook
+/// *convention*, not horde's signature. `pre-commit hook run`, `husky hook`, or any other tool
+/// following the same convention was claimed by that, and uninstall would have removed it while
+/// printing that other tools were left alone.
+///
+/// So the first token has to be a program called `horde`, and `hook` has to be its subcommand.
+/// Quoting is handled because the installed command embeds an absolute path, and a home
+/// directory with a space in it would otherwise be unrecognisable to the uninstaller that wrote
+/// it.
 fn is_horde_command(cmd: &str) -> bool {
-    cmd.contains(" hook claude ") || cmd.contains(" hook ")
+    let (program, rest) = match cmd.trim().strip_prefix(['"', '\'']) {
+        // A quoted path: the program is everything up to the closing quote.
+        Some(quoted) => match quoted.find(['"', '\'']) {
+            Some(end) => (&quoted[..end], &quoted[end + 1..]),
+            None => return false,
+        },
+        None => match cmd.trim().split_once(char::is_whitespace) {
+            Some((p, rest)) => (p, rest),
+            None => return false,
+        },
+    };
+    let is_horde = std::path::Path::new(program)
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("horde"));
+    is_horde && rest.split_whitespace().next() == Some("hook")
 }
 
+/// Install the hooks and the skill, printing what happened.
 pub fn install(agent: &str) -> Result<()> {
+    for line in install_reporting(agent)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The same, returning what happened instead of printing it.
+///
+/// Two callers are inside the TUI — the settings page and the setup walkthrough — and a
+/// `println!` from there lands on top of the frame. ratatui paints only the cells that changed,
+/// so the stray line stays on screen until something happens to overwrite it. Printing is the
+/// CLI's job; this is the part that does the work.
+pub fn install_reporting(agent: &str) -> Result<Vec<String>> {
     if agent != "claude" {
         return Err(anyhow!(
             "only `claude` has a hook integration so far; other agents use screen detection"
@@ -140,17 +179,17 @@ pub fn install(agent: &str) -> Result<()> {
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("could not write {}", path.display()))?;
 
-    println!("installed {added} hooks into {}", path.display());
-    println!("existing hooks from other tools were left untouched");
-
+    let mut report = vec![
+        format!("installed {added} hooks into {}", path.display()),
+        "existing hooks from other tools were left untouched".to_string(),
+    ];
     match install_skill() {
-        Ok(p) => println!("installed the horde skill at {}", p.display()),
+        Ok(p) => report.push(format!("installed the horde skill at {}", p.display())),
         // The hooks are the important half; a missing skill is worth reporting, not fatal.
-        Err(e) => eprintln!("warning: could not install the skill: {e:#}"),
+        Err(e) => report.push(format!("warning: could not install the skill: {e:#}")),
     }
-
-    println!("restart any running Claude Code sessions for both to take effect");
-    Ok(())
+    report.push("restart any running Claude Code sessions for both to take effect".to_string());
+    Ok(report)
 }
 
 pub fn uninstall(agent: &str) -> Result<()> {
@@ -167,6 +206,12 @@ pub fn uninstall(agent: &str) -> Result<()> {
     };
     let mut settings: Value = serde_json::from_str(&text)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
+
+    // The same care install takes. Removing is still editing a file horde does not own, and
+    // "it only deleted things" is no comfort if it deleted the wrong ones.
+    let backup = path.with_extension("json.horde-backup");
+    std::fs::copy(&path, &backup)
+        .with_context(|| format!("could not back up to {}", backup.display()))?;
 
     let mut removed = 0;
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
@@ -193,8 +238,14 @@ pub fn uninstall(agent: &str) -> Result<()> {
         hooks.retain(|_, v| !v.as_array().map(|a| a.is_empty()).unwrap_or(false));
     }
 
-    std::fs::write(&path, serde_json::to_string_pretty(&settings)? + "\n")?;
+    // Temp file then rename, so an interrupted uninstall cannot leave a truncated settings.json
+    // — the same reason install does it this way.
+    let tmp = path.with_extension("json.horde-tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&settings)? + "\n")?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("could not write {}", path.display()))?;
     println!("removed {removed} horde hooks from {}", path.display());
+    println!("your previous settings are at {}", backup.display());
 
     if let Ok(p) = skill_path() {
         if p.exists() {
@@ -343,6 +394,37 @@ pub fn run_hook(agent: &str, event: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// What counts as horde's own hook, which is what install replaces and uninstall deletes.
+    ///
+    /// The bug this pins: the test used to be `contains(" hook ")`, which is the shape of half
+    /// the hook commands in the world. Any other tool whose hook read `<tool> hook <event>` was
+    /// claimed by horde and removed by `horde integration uninstall claude` — one line below a
+    /// promise that other tools were left untouched.
+    #[test]
+    fn only_hordes_own_hook_commands_are_claimed() {
+        for ours in [
+            "/Users/j/.local/bin/horde hook claude Stop",
+            "horde hook claude PreToolUse",
+            "\"/Users/j with space/bin/horde\" hook claude Stop",
+            "/opt/horde hook claude Notification",
+        ] {
+            assert!(is_horde_command(ours), "{ours} is ours");
+        }
+        for theirs in [
+            "pre-commit hook run --all",
+            "husky hook pre-push",
+            "/usr/local/bin/othertool hook claude Stop",
+            "npx some-linter hook",
+            "hordelike hook claude Stop",
+            // Names horde but does something else: not a hook entry of ours to remove.
+            "horde send reviewer \"done\"",
+            "",
+            "horde",
+        ] {
+            assert!(!is_horde_command(theirs), "{theirs} is not ours to touch");
+        }
+    }
+
     #[test]
     fn the_skill_is_present_and_teaches_the_commands_it_needs_to() {
         // A skill that omits a command an agent is told to run is worse than none.
@@ -385,6 +467,23 @@ mod tests {
         assert!(
             lower.contains("--worktree"),
             "the skill must teach worktrees before it teaches spawning a fleet"
+        );
+        // Giving work back. An agent that only knows `claim` and `done` holds a task it cannot
+        // finish until it exits, and a claimed task nobody is working looks handled.
+        assert!(
+            lower.contains("horde task release"),
+            "the skill must teach putting work back, not only taking and finishing it"
+        );
+        // Roles gate what a claim returns. An agent that does not know this reads an empty
+        // claim as an empty board, concludes there is nothing to do, and stops — while work
+        // for somebody else sits there and work for *it* may arrive a second later.
+        assert!(
+            lower.contains("--role"),
+            "the skill must teach that work can name the role that takes it"
+        );
+        assert!(
+            lower.contains("cannot change your own role"),
+            "the skill must say a role is not self-assigned, or an agent will try"
         );
         // Nothing may claim the pause is still on.
         assert!(!lower.contains("paused"), "the bus and the board are back on");

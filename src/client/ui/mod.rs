@@ -3,6 +3,7 @@
 pub mod bus_drawer;
 pub mod dashboard;
 pub mod graph_view;
+pub mod kanban;
 pub mod logo;
 pub mod markdown;
 pub mod notes;
@@ -10,18 +11,20 @@ pub mod overlays;
 pub mod pane_widget;
 pub mod sidebar;
 pub mod setup;
+pub mod sprite;
 pub mod statusbar;
+pub mod zombie;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect as TRect;
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use super::{App, Mode};
-use crate::proto::{AgentState, Rect, Rgb, Severity};
+use crate::proto::{AgentState, Rect, Rgb, Severity, Snapshot};
 use crate::theme::{mix, Theme};
 
 pub fn color(c: Rgb) -> Color {
@@ -185,6 +188,56 @@ pub fn wrap_text(s: &str, w: usize) -> Vec<String> {
     out
 }
 
+/// The editor's text column and how many rows of it there are, for a screen this size.
+///
+/// A column, not a wall — the same measure the reader uses. Shared with the key handler
+/// because scrolling has to agree with drawing about where a line wraps, and two copies of
+/// this arithmetic would agree only until one of them changed.
+pub fn editor_page(area: TRect) -> (u16, u16) {
+    (area.width.saturating_sub(6).min(96), area.height.saturating_sub(4))
+}
+
+/// Break an already-styled line into the rows it takes at `w` columns, keeping its styling.
+///
+/// The same wrap the editor's cursor is measured against ([`editor::wrap_breaks`]), applied
+/// to spans rather than to a string — so a rendered line and the cursor in it always agree
+/// about where the rows start.
+pub fn wrap_spans(line: &Line<'_>, w: usize) -> Vec<Line<'static>> {
+    let own = |line: &Line<'_>| -> Line<'static> {
+        Line::from(
+            line.spans
+                .iter()
+                .map(|s| Span::styled(s.content.to_string(), s.style))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().concat();
+    let breaks = crate::client::editor::wrap_breaks(&text, w);
+    if breaks.len() < 2 {
+        return vec![own(line)];
+    }
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new(); breaks.len()];
+    let mut at = 0usize; // char offset into the whole line
+    let mut row = 0usize;
+    for span in &line.spans {
+        let mut held = String::new();
+        for ch in span.content.chars() {
+            if row + 1 < breaks.len() && at == breaks[row + 1] {
+                if !held.is_empty() {
+                    rows[row].push(Span::styled(std::mem::take(&mut held), span.style));
+                }
+                row += 1;
+            }
+            held.push(ch);
+            at += 1;
+        }
+        if !held.is_empty() {
+            rows[row].push(Span::styled(held, span.style));
+        }
+    }
+    rows.into_iter().map(Line::from).collect()
+}
+
 /// Push every cell toward the background, so an overlay reads as being in front.
 pub fn dim_area(buf: &mut Buffer, area: TRect, theme: &Theme, amount: f32) {
     for y in area.y..area.y.saturating_add(area.height) {
@@ -216,6 +269,90 @@ pub fn centered(area: TRect, w: u16, h: u16) -> TRect {
         w,
         h,
     )
+}
+
+/// How the screen splits between a note and the vault's tree: `(note, tree)`.
+///
+/// One function because the renderer wraps the text to the note's width and the key handler
+/// pages and follows the cursor by it. Two copies of this arithmetic agree until the tree
+/// appears, and then the editor wraps at a column that is no longer where the text ends.
+pub fn editor_split(screen: TRect, tree: bool) -> (TRect, Option<TRect>) {
+    if !tree {
+        return (screen, None);
+    }
+    match notes::tree_width(screen) {
+        Some(w) => {
+            let mut note = screen;
+            note.width -= w;
+            let side = TRect { x: screen.x + note.width, y: screen.y, width: w, height: screen.height };
+            (note, Some(side))
+        }
+        None => (screen, None),
+    }
+}
+
+/// The board or the list, with its header — everything the kanban screen is except the hint
+/// row, the question and the status bar.
+///
+/// Extracted because a card opened from the list draws the list behind it, and a popup whose
+/// background is a second copy of the drawing code is a popup that stops matching what it is
+/// floating over. Returns the body area, which is what the rest of the screen is measured off.
+#[allow(clippy::too_many_arguments)]
+fn kanban_surface(
+    f: &mut Frame,
+    app: &mut App,
+    snap: &Snapshot,
+    theme: &Theme,
+    area: TRect,
+    view: kanban::View,
+    col: usize,
+    sel: usize,
+) -> TRect {
+    let project = (!app.kanban_all)
+        .then(|| snap.focused_space.and_then(|s| snap.spaces.iter().find(|x| x.id == s)))
+        .flatten()
+        .map(|s| s.name.clone());
+    let cols = kanban::columns(
+        app.kanban.as_ref(),
+        project.as_deref(),
+        app.kanban_archived,
+        &app.kanban_query,
+    );
+    let body = kanban::body_area(area, trect(snap.status));
+    let now = now_millis();
+    let due = cols
+        .iter()
+        .flat_map(|c| c.cards.iter())
+        .filter(|c| c.due.is_some_and(|d| kanban::days_until(d, now) <= 0))
+        .count();
+    kanban::draw_header(
+        f.buffer_mut(),
+        area,
+        theme,
+        project.as_deref(),
+        &app.kanban_query,
+        app.kanban_archived,
+        due,
+    );
+    match view {
+        kanban::View::Board => {
+            // Recorded so the mouse handler resolves a cell against the same area the
+            // renderer laid out — the layout itself it computes for free.
+            app.kanban_area = Some(body);
+            app.kanban_scroll.resize(cols.len().max(1), 0);
+            let lay = kanban::layout(&cols, body, &app.kanban_scroll, col);
+            let card = kanban::selected(&cols, col, sel);
+            kanban::draw(f.buffer_mut(), theme, &cols, &lay, col, card, app.card_drag.as_ref(), now);
+        }
+        kanban::View::List => {
+            app.kanban_area = Some(body);
+            let rows = kanban::list_rows(&cols, now);
+            let card = rows.get(sel).map(|(c, _)| c.id);
+            let lay = kanban::list_layout(body, rows.len(), sel);
+            kanban::draw_list(f.buffer_mut(), &lay, theme, &rows, card, now);
+        }
+    }
+    body
 }
 
 /// Draw one frame.
@@ -279,11 +416,105 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    if let Mode::Editor { ref path, scroll, vim: ref vim_mode, .. } = app.mode {
+    // Your own board, and one card of it.
+    //
+    // The board replaces the frame, for the reason the start screen does: arranging work is
+    // not something you are doing *to* a session you can still see. A card opened from the
+    // *list* is the other case — the list is a view you scan, and reading one row of it is a
+    // peek rather than a departure, so that card floats over the list it came from and the
+    // place you had keeps itself.
+    if let Mode::Kanban { view, col, sel } = app.mode {
+        let body = kanban_surface(f, app, &snap, &theme, area, view, col, sel);
+        // The question, where the keys would otherwise be — because while it is up, those
+        // keys are not what the keyboard is doing.
+        match app.kanban_ask.as_ref() {
+            Some(asking) => kanban::draw_ask(f.buffer_mut(), body, &theme, asking),
+            None => kanban::draw_hints(f.buffer_mut(), body, &theme, view),
+        }
+        statusbar::StatusBar {
+            snap: &snap,
+            theme: &theme,
+            mode: app.mode.clone(),
+            prefix: app.cfg.prefix.describe(),
+        }
+        .render(trect(snap.status), f.buffer_mut());
+        overlays::toasts(f, area, app);
+        return;
+    }
+
+    if let Mode::Card { id, focus } = app.mode {
+        // Whichever view it was opened from is still the view it belongs to. From the list it
+        // floats; from the board it takes the frame, as it always has.
+        let (back_view, back_col, back_sel) = app.kanban_back;
+        let popped = back_view == kanban::View::List;
+        let full = kanban::body_area(area, trect(snap.status));
+        let into = match popped {
+            true => {
+                kanban_surface(f, app, &snap, &theme, area, back_view, back_col, back_sel);
+                let rect = kanban::popup_area(full);
+                app.card_popup = Some(rect);
+                overlays::panel(f, rect, &format!("card #{id}"), &theme)
+            }
+            false => {
+                app.card_popup = None;
+                full
+            }
+        };
+        let card = app.kanban.as_ref().and_then(|k| k.cards.iter().find(|c| c.id == id));
+        if let Some(card) = card {
+            app.card_lines = kanban::draw_detail(
+                f.buffer_mut(),
+                into,
+                &theme,
+                card,
+                focus,
+                app.card_edit.as_ref(),
+                app.card_scroll,
+                now_millis(),
+            );
+        }
+        statusbar::StatusBar {
+            snap: &snap,
+            theme: &theme,
+            mode: app.mode.clone(),
+            prefix: app.cfg.prefix.describe(),
+        }
+        .render(trect(snap.status), f.buffer_mut());
+        overlays::toasts(f, area, app);
+        return;
+    }
+
+    if let Mode::Editor { ref path, scroll, vim: ref vim_mode, project } = app.mode {
         let vim_mode = vim_mode.clone();
         let theme2 = theme.clone();
         fill(f.buffer_mut(), area, theme2.ui.bg);
-        let col = area.width.saturating_sub(6).min(96);
+
+        // The vault's tree, when a note is being read inside the vault rather than on its own.
+        // Taken off the right before anything is measured, so the note's own column is centred
+        // in what is left rather than under the tree.
+        app.vault_tree_hits.clear();
+        let (area, side) = editor_split(area, app.vault_tree && !project);
+        {
+            if let Some(tree) = side {
+                let rows = notes::rows(app.vault_index.as_ref(), "");
+                // Follow the note being edited, so entering the vault at a note filed deep in
+                // it does not open on a tree scrolled to somebody else's folder.
+                let at = rows.iter().position(|r| r.path == *path).unwrap_or(0);
+                let room = (tree.height as usize).saturating_sub(2);
+                let scroll = (at + 1).saturating_sub(room);
+                app.vault_tree_hits = notes::draw_tree(
+                    f.buffer_mut(),
+                    tree,
+                    &theme2,
+                    app.vault_index.as_ref(),
+                    &rows,
+                    path,
+                    scroll,
+                );
+            }
+        }
+
+        let (col, rows) = editor_page(area);
         let x = area.x + (area.width.saturating_sub(col)) / 2;
         let dirty = app.buffer.as_ref().is_some_and(|b| b.dirty);
         // What a language server has said about this file, if one is watching it.
@@ -313,8 +544,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         put_line(f.buffer_mut(), x, area.y, col, Line::from(head));
 
+        // Where the cursor ends up on screen, filled in as the lines are laid out. The
+        // completion list needs it too, and after wrapping it is no longer something either
+        // of them can work out from the line number alone.
+        let mut cursor_at: Option<(u16, u16)> = None;
         if let Some(buf) = app.buffer.as_ref() {
-            let rows = area.height.saturating_sub(4);
             let top = area.y + 2;
             // Live preview: every line renders as it will read, except the one the cursor
             // is on, which shows its source. Hiding characters under a cursor would make the
@@ -338,8 +572,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                         .map(|lines| (path.clone(), rev, lines));
                 }
             }
-            for (i, line) in buf.lines.iter().skip(scroll).take(rows as usize).enumerate() {
-                let n = scroll + i;
+            // A long line is drawn down the page rather than off the side of it, so `used`
+            // counts screen rows and `n` counts lines in the file. They stopped being the
+            // same number the moment anything wrapped.
+            let mut used = 0u16;
+            for (n, line) in buf.lines.iter().enumerate().skip(scroll) {
+                if used >= rows {
+                    break;
+                }
                 let rendered = if markdownish && n != buf.line {
                     markdown::live_line(line, &theme2)
                 } else if let Some(hl) =
@@ -352,10 +592,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                         Style::default().fg(color(theme2.ui.text)).bg(color(theme2.ui.bg)),
                     ))
                 };
-                put_line(f.buffer_mut(), x, top + i as u16, col, rendered);
+                let first = used;
+                for row in wrap_spans(&rendered, col as usize) {
+                    if used >= rows {
+                        break;
+                    }
+                    put_line(f.buffer_mut(), x, top + used, col, row);
+                    used += 1;
+                }
+                // The cursor's own line is drawn from its source, so the wrap it was measured
+                // against is the wrap that was drawn.
+                if n == buf.line {
+                    let (r, c) = buf.wrapped_cursor(col as usize);
+                    if first + r as u16 <= rows.saturating_sub(1) {
+                        cursor_at =
+                            Some((x + (c as u16).min(col.saturating_sub(1)), top + first + r as u16));
+                    }
+                }
                 // The mark goes in the margin rather than under the text: a squiggle drawn
                 // into an already-styled line means splitting spans the highlighter just
-                // built, and the margin is where the eye looks for "which line" anyway.
+                // built, and the margin is where the eye looks for "which line" anyway. It
+                // marks the line's first row, which is where the line starts.
                 if let Some(worst) = diags
                     .iter()
                     .filter(|d| d.line as usize == n)
@@ -364,7 +621,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     put_line(
                         f.buffer_mut(),
                         x.saturating_sub(2),
-                        top + i as u16,
+                        top + first,
                         2,
                         Line::from(ratatui::text::Span::styled(
                             worst.severity.glyph().to_string(),
@@ -382,12 +639,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             // The cursor belongs to whichever line is being typed into. While the `:` line is
             // open that is the prompt, not the text — put it in both places and the one you
             // are actually editing is anybody's guess.
-            if vim_mode.prompt().is_none()
-                && buf.line >= scroll
-                && buf.line < scroll + rows as usize
-            {
-                let cx = x + (buf.col as u16).min(col.saturating_sub(1));
-                f.set_cursor_position((cx, top + (buf.line - scroll) as u16));
+            if vim_mode.prompt().is_none() {
+                if let Some(pos) = cursor_at {
+                    f.set_cursor_position(pos);
+                }
             }
         }
 
@@ -398,8 +653,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if let (Some(c), Some(buf)) = (app.completions.as_ref(), app.buffer.as_ref()) {
             let prefix = buf.text_from(c.from);
             let items = c.matching(&prefix);
-            if !items.is_empty() && buf.line >= scroll {
-                let cursor_row = area.y + 2 + (buf.line - scroll) as u16;
+            if let (false, Some((cursor_x, cursor_row))) = (items.is_empty(), cursor_at) {
                 let below = area.y + area.height.saturating_sub(2) - cursor_row.min(area.y + area.height);
                 // Below the line normally; above it when the line is near the bottom, so the
                 // list never covers the thing being completed.
@@ -416,7 +670,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     .max()
                     .unwrap_or(10);
                 let w = (widest as u16 + 3).min(col.saturating_sub(2)).max(12);
-                let lx = (x + buf.word_start() as u16).min(x + col.saturating_sub(w));
+                // Under the word being completed, which after wrapping is the cursor less
+                // what has been typed rather than a column counted from the start of a line.
+                let lx = cursor_x
+                    .saturating_sub(width(&prefix) as u16)
+                    .max(x)
+                    .min(x + col.saturating_sub(w));
                 let top_at = c.sel.saturating_sub(room.saturating_sub(1) as usize);
                 for (i, item) in items.iter().skip(top_at).take(room as usize).enumerate() {
                     let selected = top_at + i == c.sel;
@@ -489,8 +748,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                         ))
                     }
                     None => {
+                        // In the vault the two keys worth naming are the ones the vault adds:
+                        // a note to write and the tree to see the rest. A hint row that lists
+                        // `dd yy p` while the thing you cannot guess goes unmentioned is a
+                        // hint row spent on the parts vim already taught you.
                         let hint = if vim_mode.typing() {
                             "esc normal   ctrl+s save   ctrl+z undo   ctrl+r read"
+                        } else if side.is_some() {
+                            "i insert   ctrl+n new note   \\ tree   / search   :wq write and go"
                         } else if diags.is_empty() {
                             "i insert   : command   / search   dd yy p   u undo   :wq write and go"
                         } else {
@@ -685,9 +950,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     if let Mode::Notes { ref query, sel } = app.mode {
-        let rows = notes::rows(app.vault.as_ref(), query);
+        let rows = notes::rows(app.vault_index.as_ref(), query);
         app.notes_hits =
-            notes::draw(f.buffer_mut(), area, &theme, app.vault.as_ref(), &rows, query, sel);
+            notes::draw(f.buffer_mut(), area, &theme, app.vault_index.as_ref(), &rows, query, sel);
         statusbar::StatusBar {
             snap: &snap,
             theme: &theme,
@@ -701,7 +966,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     if let Mode::Dashboard { sel } = app.mode {
         let rows = dashboard::rows(&snap, now_millis());
-        app.dashboard_hits = dashboard::draw(f.buffer_mut(), area, &theme, &rows, sel);
+        // Where the wordmark landed, recorded for the loop: it is how the client knows
+        // whether there is a stage to walk across without drawing a frame to find out.
+        app.zombie_stage = dashboard::stage(area, &rows);
+        let walk = app.zombie.and_then(|w| w.phase().at());
+        app.dashboard_hits = dashboard::draw(f.buffer_mut(), area, &theme, &rows, sel, walk);
         statusbar::StatusBar {
             snap: &snap,
             theme: &theme,
@@ -811,6 +1080,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         | Mode::Reader { .. }
         | Mode::Editor { .. }
         | Mode::Setup { .. }
+        | Mode::Kanban { .. }
+        | Mode::Card { .. }
         | Mode::Files { .. } => {}
         // No dimming: which-key is a hint you read while still looking at your work, not a
         // panel that takes the screen. It also has to be legible the instant it appears.
@@ -831,6 +1102,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             overlays::picker(f, area, app);
         }
         Mode::Prompt { .. } => {
+            // Over the surface it was asked from, not over the panes. This match runs after
+            // the panes are drawn, so a prompt opened from a full-screen view used to dim
+            // that view away and replace it with the multiplexer — which reads as being
+            // thrown out of what you were doing in order to answer one question.
+            //
+            // The editor does not appear here: it asks with its own footer and never leaves.
+            if let Some(back) = app.prompt_back.clone() {
+                if let Mode::Notes { ref query, sel } = *back {
+                    let rows = notes::rows(app.vault_index.as_ref(), query);
+                    notes::draw(f.buffer_mut(), area, &theme, app.vault_index.as_ref(), &rows, query, sel);
+                }
+            }
             dim_area(f.buffer_mut(), area, &theme, 0.5);
             overlays::prompt(f, area, app);
         }
@@ -1019,6 +1302,7 @@ mod frame_tests {
             tabbar: Rect::new(0, 0, 146, 1),
             tasks_open: 2,
             tasks_claimed: 1,
+            cards_due: 0,
             triggers_armed: 0,
             recents: Vec::new(),
         };
@@ -1076,6 +1360,203 @@ mod frame_tests {
         assert!(out.contains("bus"));
     }
 
+    /// A card opened from the list floats over it: the list is still there behind, and the
+    /// description and the thread — the part you opened it for — are on it.
+    #[test]
+    fn a_card_opened_from_the_list_floats_over_it() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        let mut c = crate::proto::Card {
+            id: 12,
+            title: "wire up the importer".into(),
+            column: "Todo".into(),
+            pos: 0,
+            body: "Read the CSV in chunks so a 200MB file does not blow the heap.".into(),
+            due: Some(now_millis() + 2 * 86_400_000),
+            tags: vec!["api".into(), "p1".into()],
+            project: Some("horde".into()),
+            created: now_millis() - 2 * 86_400_000,
+            updated: 0,
+            archived: false,
+            comments: vec![crate::proto::Comment {
+                by: "josh@joshmacbook".into(),
+                at: now_millis(),
+                body: "parked until the schema lands".into(),
+            }],
+            assist: Some(2 * 86_400_000),
+            handed: None,
+        };
+        c.pos = 0;
+        app.kanban = Some(crate::proto::KanbanReply {
+            cards: vec![c, crate::proto::Card {
+                id: 21,
+                title: "someday: rewrite the parser".into(),
+                column: "Backlog".into(),
+                pos: 0,
+                body: String::new(),
+                due: None,
+                tags: Vec::new(),
+                project: None,
+                created: 0,
+                updated: 0,
+                archived: false,
+                comments: Vec::new(),
+                assist: None,
+                handed: None,
+            }],
+            columns: ["Backlog", "Todo", "Doing", "Done"].iter().map(|s| s.to_string()).collect(),
+            project: None,
+        });
+        app.kanban_all = true;
+        app.kanban_back = (kanban::View::List, 0, 0);
+        app.mode = Mode::Card { id: 12, focus: kanban::Field::Title };
+
+        let out = render(&mut app, 120, 32);
+        println!("\n{out}\n");
+        assert!(out.contains("card #12"), "the panel is titled: {out}");
+        assert!(out.contains("Read the CSV in chunks"), "the description is on it: {out}");
+        assert!(out.contains("parked until the schema lands"), "and the thread: {out}");
+        // The list is still there: the popup is inset, so the rows it does not cover show.
+        assert!(out.contains("#21"), "the list is still behind it: {out}");
+        assert!(out.contains("ID") && out.contains("PROJECT"), "header and all: {out}");
+        assert!(app.card_popup.is_some(), "and it recorded where it floated");
+    }
+
+    /// From the board it still takes the whole frame, which is the behaviour that was there.
+    #[test]
+    fn a_card_opened_from_the_board_takes_the_frame() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        app.kanban = Some(crate::proto::KanbanReply {
+            cards: vec![crate::proto::Card {
+                id: 3,
+                title: "fix the auth refresh".into(),
+                column: "Doing".into(),
+                pos: 0,
+                body: String::new(),
+                due: None,
+                tags: Vec::new(),
+                project: None,
+                created: 0,
+                updated: 0,
+                archived: false,
+                comments: Vec::new(),
+                assist: None,
+                handed: None,
+            }],
+            columns: ["Backlog", "Todo", "Doing", "Done"].iter().map(|s| s.to_string()).collect(),
+            project: None,
+        });
+        app.kanban_all = true;
+        app.kanban_back = (kanban::View::Board, 2, 0);
+        app.mode = Mode::Card { id: 3, focus: kanban::Field::Title };
+
+        let out = render(&mut app, 120, 32);
+        assert!(out.contains("fix the auth refresh"), "{out}");
+        assert!(!out.contains("card #3"), "no floating panel: {out}");
+        assert!(app.card_popup.is_none());
+    }
+
+    fn vaulting() -> (App, crate::proto::Snapshot) {
+        let (mut app, snap) = demo();
+        app.vault_index = Some(crate::proto::VaultReply {
+            root: "/Users/josh/notes".into(),
+            notes: vec![
+                note("Home.md", "Home"),
+                note("Daily/2026-08-20.md", "2026-08-20"),
+                note("Projects/horde.md", "horde"),
+                note("Projects/horde-desktop.md", "horde-desktop"),
+                note("Reading/obsidian.md", "obsidian sync"),
+            ],
+            body: None,
+            backlinks: Vec::new(),
+            graph: None,
+            space: 0,
+            tasks: Vec::new(),
+        });
+        app.buffer = Some(crate::client::editor::Buffer::new(
+            "# Home\n\nThe front page of the vault.\n\n- [[Projects/horde]]\n- [[Daily/2026-08-20]]\n",
+        ));
+        app.vault_tree = true;
+        app.mode = Mode::Editor {
+            path: "Home.md".into(),
+            scroll: 0,
+            project: false,
+            vim: crate::client::Vim::Normal,
+        };
+        (app, snap)
+    }
+
+    fn note(path: &str, title: &str) -> crate::proto::NoteLine {
+        crate::proto::NoteLine {
+            path: path.into(),
+            title: title.into(),
+            tags: Vec::new(),
+            backlinks: 0,
+            mtime: 0,
+        }
+    }
+
+    /// The vault: a note to read and write in, and where it sits among the others.
+    #[test]
+    fn the_vault_draws_a_note_with_the_tree_beside_it() {
+        let (mut app, snap) = vaulting();
+        app.snapshot = Some(snap);
+        let out = render(&mut app, 110, 24);
+        println!("\n{out}\n");
+        assert!(out.contains("The front page of the vault"), "the note is being read: {out}");
+        assert!(out.contains("VAULT  5"), "the tree says how many: {out}");
+        assert!(out.contains("Projects/"), "folders are on it: {out}");
+        assert!(out.contains("obsidian sync"), "and notes in them: {out}");
+        assert!(out.contains("▸ Home"), "with the one being edited marked: {out}");
+        assert!(!app.vault_tree_hits.is_empty(), "and every note it drew is clickable");
+    }
+
+    /// A note squeezed to forty columns so a list of its neighbours can fit is the wrong thing
+    /// to protect. The note is what you came for.
+    #[test]
+    fn a_narrow_terminal_keeps_the_note_and_drops_the_tree() {
+        let (mut app, snap) = vaulting();
+        app.snapshot = Some(snap);
+        let out = render(&mut app, 70, 24);
+        assert!(out.contains("The front page of the vault"), "{out}");
+        assert!(!out.contains("VAULT"), "no tree at this width: {out}");
+        assert!(app.vault_tree_hits.is_empty(), "and nothing to click");
+    }
+
+    /// The tree is a vault idea. A project file has its own tree at `F` and no reason to grow
+    /// a second one listing somebody's notes beside their source.
+    #[test]
+    fn a_project_file_never_grows_a_vault_tree() {
+        let (mut app, snap) = vaulting();
+        app.snapshot = Some(snap);
+        app.mode = Mode::Editor {
+            path: "src/main.rs".into(),
+            scroll: 0,
+            project: true,
+            vim: crate::client::Vim::Normal,
+        };
+        let out = render(&mut app, 110, 24);
+        assert!(!out.contains("VAULT"), "{out}");
+    }
+
+    /// Both halves of the split come from one function, so the column the text wraps at is the
+    /// column the text ends at.
+    #[test]
+    fn the_split_gives_the_tree_its_width_and_the_note_the_rest() {
+        let screen = TRect::new(0, 0, 110, 24);
+        let (note, side) = editor_split(screen, true);
+        let side = side.expect("there is room at 110");
+        assert_eq!(note.width + side.width, 110);
+        assert_eq!(side.x, note.width, "the tree is on the right, flush against the note");
+
+        let (note, side) = editor_split(screen, false);
+        assert_eq!((note.width, side), (110, None), "off means the whole screen");
+
+        let (note, side) = editor_split(TRect::new(0, 0, 70, 24), true);
+        assert_eq!((note.width, side), (70, None), "and too narrow means the same");
+    }
+
     #[test]
     fn help_overlay_renders() {
         let (mut app, snap) = demo();
@@ -1096,6 +1577,58 @@ mod frame_tests {
         assert!(out.contains("roster"), "{out}");
         assert!(out.contains("enter jumps"), "the footer hint must survive: {out}");
     }
+
+    /// A sentence longer than the column used to run off the side of the page and vanish:
+    /// there was nothing to see it in, and nothing to say it had happened. It goes down the
+    /// page instead, and the cursor goes with it — including when the cursor is sitting
+    /// exactly on the break, where the next character will land.
+    #[test]
+    fn a_long_line_wraps_down_the_page_instead_of_off_the_side_of_it() {
+        let (mut app, snap) = demo();
+        app.snapshot = Some(snap);
+        let text = "the quick brown fox jumps over the lazy dog and keeps on running \
+                    well past the end of any column a page could hold";
+        let mut b = crate::client::editor::Buffer::new(text);
+        b.end();
+        app.buffer = Some(b);
+        app.mode = crate::client::Mode::Editor {
+            path: "note.md".into(),
+            scroll: 0,
+            project: false,
+            vim: crate::client::editor::Vim::Insert,
+        };
+
+        let (w, h) = (60u16, 24u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let cursor = term.get_cursor_position().unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| {
+                        let s = buf.cell((x, y)).unwrap().symbol();
+                        if s.is_empty() { " " } else { s }
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        let page = rows.join("\n");
+        println!("\n{page}\n");
+
+        assert!(page.contains("the quick brown fox"), "the start of it: {page}");
+        assert!(page.contains("could hold"), "and the end of it too: {page}");
+        // Two rows of one line, not one row of a truncated one.
+        let start = rows.iter().position(|r| r.contains("the quick brown fox")).unwrap();
+        let end = rows.iter().position(|r| r.contains("could hold")).unwrap();
+        assert!(end > start, "the tail is below the head, not beside it");
+        // The cursor is where the next character goes: on the last row of the line, just
+        // past its last character.
+        assert_eq!(cursor.y as usize, end, "the cursor is on the row it is typing into");
+        let typed = rows[end].trim_end().chars().count();
+        assert_eq!(cursor.x as usize, typed, "and immediately after the text on it");
+    }
+
 
     /// The roster is a whole-frame view, so every landable line must record where it was
     /// drawn or the mouse could not reach any of them.
