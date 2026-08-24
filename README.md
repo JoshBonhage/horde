@@ -665,4 +665,18 @@ agent that inspects its environment will find it.
 
 ---
 
+## Prior art
+
+horde owes its premise to **[herdr](https://github.com/herdrdev/herdr)**: a terminal
+multiplexer that knows what the agent inside a pane is *doing*, rather than one that just
+holds its PTY. That idea and several that follow from it are theirs — per-agent lifecycle
+states, a CLI complete enough that agents drive it themselves, one git worktree per agent so
+a fleet in a single repo cannot overwrite itself.
+
+horde is a separate implementation and carries none of herdr's code, but it would not have
+this shape without herdr going first. It is Apache-2.0 and it is worth your time:
+**[herdr.dev](https://herdr.dev)**.
+
+---
+
 <sub>Built by <b>Josh Bonhage</b> · Rust + <a href="https://github.com/ratatui/ratatui">ratatui</a> · one binary, no runtime</sub>
