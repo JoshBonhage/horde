@@ -425,13 +425,16 @@ horde spawn --cmd "claude --model opus" --name parser \
 |---|---|
 | `--name` | how you address it in `horde send`. Always pass it |
 | `--role` | what it is for. Six panes called `claude-4` is not a team |
-| `--worktree` | its own git worktree and branch |
+| `--worktree` | its own git worktree and branch, beside the project |
 | `--board` | enlist it, so the queue reaches it |
 | `--task` | a first job, put on the board for it to claim |
 
-**Use `--worktree` whenever you start more than one agent in a repository.** Two agents editing
-one working tree is not a merge conflict you can resolve, it is one agent's work silently
-overwritten. See `horde docs worktrees`.
+**`--worktree` is opt-in, and agents should treat it that way.** It is the right answer when
+several agents will edit one repository — two of them editing one working tree is not a merge
+conflict you can resolve, it is one agent's work silently overwritten. But it also creates a
+directory on your disk and a branch in your repository, so an agent building a fleet is told to
+ask rather than to assume. Say "each in its own worktree" and it will. See
+`horde docs worktrees`.
 
 `agents.max_fleet` bounds how many panes agents may have open at once, six by default. It is a
 guard against a loop, not a budget to spend: hitting it is an error, and the answer is to tell

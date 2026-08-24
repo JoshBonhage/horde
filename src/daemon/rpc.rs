@@ -38,9 +38,16 @@ fn caller_space(eng: &Engine, req: &Request) -> Option<String> {
 
 /// Which directory worktree commands act on: the focused pane's, so `horde worktree list`
 /// answers about the project you are looking at rather than wherever the daemon started.
-fn worktree_origin(eng: &Engine) -> Result<std::path::PathBuf, Err_> {
-    eng.session
-        .focused_pane()
+/// The directory a worktree operation is about: the *caller's* project.
+///
+/// The calling pane when the request names one (`from`, which the CLI always sends from
+/// inside a pane), the focused pane only as the fallback for a human typing outside horde.
+/// The focused pane is whatever the human happens to be looking at, in any space — an agent
+/// orchestrating a fleet in project A must not have its worktrees rooted in project B
+/// because the human clicked over there mid-spawn.
+fn worktree_origin(eng: &Engine, req: &Request) -> Result<std::path::PathBuf, Err_> {
+    pane_arg(eng, req, "from")
+        .or_else(|| eng.session.focused_pane())
         .and_then(|p| eng.session.panes.get(&p))
         .map(|p| p.cwd.clone())
         .ok_or_else(|| failed("no pane to take a directory from"))
@@ -598,11 +605,14 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                         .map(|s| s.to_string())
                         .or_else(|| name.clone())
                         .ok_or_else(|| bad("--worktree needs a name, or give the agent one"))?;
-                    // From the pane the split comes off, so the worktree hangs off the project
-                    // you are actually in rather than wherever the daemon was started.
-                    let from = eng
-                        .session
-                        .focused_pane()
+                    // From the pane the split comes off — the caller's — so the worktree
+                    // hangs off the project the *asking agent* is in. The focused pane is
+                    // only the fallback for a human spawning from outside horde: focus
+                    // follows the human's eyes, and a lead agent building a fleet in one
+                    // project must not have a worker rooted in whichever project the human
+                    // happens to be looking at.
+                    let from = by_agent
+                        .or_else(|| eng.session.focused_pane())
                         .and_then(|p| eng.session.panes.get(&p))
                         .map(|p| p.cwd.clone())
                         .ok_or_else(|| failed("no pane to take a directory from"))?;
@@ -610,9 +620,11 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 }
             };
 
+            // Split beside the caller for the same reason: the new agent belongs to the
+            // caller's tab and space, not to wherever the human's focus sits right now.
             let id = eng
                 .session
-                .split_in(&cfg, None, dir, Some(&cmd), worktree.as_deref())
+                .split_in(&cfg, by_agent, dir, Some(&cmd), worktree.as_deref())
                 .map_err(|e| failed(e.to_string()))?;
             if let Some(p) = eng.session.panes.get_mut(&id) {
                 if let Some(n) = name.clone() {
@@ -699,7 +711,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             Ok(out)
         }
         "worktree.list" => {
-            let from = worktree_origin(eng)?;
+            let from = worktree_origin(eng, req)?;
             let found = super::repo::list_worktrees(&from).map_err(|e| failed(format!("{e:#}")))?;
             // Which pane is in each tree, so the listing answers "can I remove this" without
             // a second lookup. A worktree with nobody in it is the removable kind.
@@ -720,13 +732,17 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         }
         "worktree.remove" => {
             let name = str_arg(req, "name").ok_or_else(|| bad("name required"))?;
-            let from = worktree_origin(eng)?;
+            let from = worktree_origin(eng, req)?;
             // A live pane in the tree is the one refusal git cannot make for us: it would
             // happily delete the directory out from under a running agent.
-            let path = super::repo::worktree_path(
-                &super::repo::main_root(&from).ok_or_else(|| failed("not a git repository"))?,
-                name,
-            );
+            //
+            // Resolved from the listing rather than computed from the name: a tree an older
+            // horde nested inside the repository is not where the current scheme would put it,
+            // and guessing wrong here means checking an empty directory for occupants and
+            // deleting an occupied one.
+            let path = super::repo::worktree_for(&from, name)
+                .map_err(|e| failed(format!("{e:#}")))?
+                .path;
             if let Some(p) = eng.session.panes.values().find(|p| p.cwd == path) {
                 return Err(bad(format!(
                     "pane {} is still working in {name}; close it first",
@@ -1100,6 +1116,74 @@ pub fn command_names() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent's spawn is scoped to the agent, not to the human's eyes.
+    ///
+    /// The focused pane is whatever the human happens to be looking at, in any project. A
+    /// lead agent in project A building a fleet must get its worker beside itself and its
+    /// worktree rooted in A's repository — not in project B because the human clicked over
+    /// there mid-spawn. Before this, the worktree grew in B's repo when B was one, and the
+    /// spawn failed outright when B was not ("not in a git repository").
+    #[test]
+    fn a_fleet_spawn_lands_in_the_callers_project_not_the_focused_one() {
+        let mut eng = super::super::tests::engine_with_shell(Some("cat"));
+        let cfg = eng.cfg.clone();
+        let lead = *eng.session.panes.keys().next().unwrap();
+
+        // The lead agent's space is a real repository.
+        let repo = std::env::temp_dir().join(format!("horde-rpc-focus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(&repo).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "a").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        // macOS: /var is a symlink to /private/var, and git reports canonical paths.
+        let repo = repo.canonicalize().unwrap();
+        eng.session.panes.get_mut(&lead).unwrap().cwd = repo.clone();
+
+        // The human wanders off to a second space that is not a repository at all.
+        let elsewhere = std::env::temp_dir().join(format!("horde-rpc-focus-else-{}", std::process::id()));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        eng.session.create_space(&cfg, Some("elsewhere"), &elsewhere).unwrap();
+        assert_ne!(eng.session.focused_pane(), Some(lead), "the human's focus moved away");
+
+        // The lead spawns a worktree worker.
+        let resp = dispatch(&mut eng, Request {
+            id: String::new(),
+            method: "agent.spawn".into(),
+            params: json!({ "cmd": "cat", "name": "builder", "worktree": true, "from": lead }),
+        });
+        let v = resp.result.unwrap_or_else(|| panic!("spawn failed: {:?}", resp.error));
+
+        // The worktree belongs to the caller's repository. Asserted through git rather than by
+        // path shape, so it stays true of wherever the layout puts the directory.
+        let wt = std::path::PathBuf::from(v.get("worktree").and_then(|w| w.as_str()).expect("a worktree"));
+        assert_eq!(
+            super::super::repo::main_root(&wt),
+            Some(repo.clone()),
+            "worktree {wt:?} does not belong to the caller's repo {repo:?}"
+        );
+        // ...and the new pane sits in the caller's space, in that worktree.
+        let id = v.get("pane").and_then(|p| p.as_u64()).unwrap() as u32;
+        let (lead_space, new_space) =
+            (eng.session.panes[&lead].space, eng.session.panes[&id].space);
+        assert_eq!(new_space, lead_space, "the worker left the caller's project");
+        assert_eq!(eng.session.panes[&id].cwd, wt);
+
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        let _ = std::fs::remove_dir_all(&wt);
+    }
 
     /// The depth guard. An agent creating a rule is the interesting part of letting agents
     /// create rules; a *machine-started* agent creating one closes the loop with no human

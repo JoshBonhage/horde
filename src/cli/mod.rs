@@ -113,7 +113,7 @@ pub enum Command {
         /// Where to put it: right, down, left, up.
         #[arg(long, default_value = "right")]
         split: String,
-        /// Give this agent its own git worktree, so it cannot overwrite what its neighbours
+        /// Give this agent its own git worktree beside the project, so it cannot overwrite what its neighbours
         /// are editing. Takes a name; defaults to the agent's.
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         worktree: Option<String>,
@@ -725,7 +725,7 @@ pub fn run(cmd: Command) -> Result<()> {
         }
         Command::Worktree { cmd } => match cmd {
             WorktreeCmd::List => {
-                let v = call("worktree.list", json!({}))?;
+                let v = call("worktree.list", json!({ "from": self_pane() }))?;
                 let rows = v.as_array().cloned().unwrap_or_default();
                 if rows.is_empty() {
                     println!("no worktrees — `horde spawn --cmd claude --name x --worktree`");
@@ -742,11 +742,17 @@ pub fn run(cmd: Command) -> Result<()> {
                     } else {
                         ""
                     };
-                    println!("{:<16} {:<24}{held}{dirty}", s("name"), s("branch"));
+                    // The path last, the way `space list` puts the cwd last. Worth printing
+                    // now that it is not derivable from the name: the agent is `ads` and the
+                    // directory is `<project>-ads`, and a tree an older horde nested inside
+                    // the repository is somewhere else again.
+                    let line = format!("{:<14} {:<22}{held}{dirty}", s("name"), s("branch"));
+                    println!("{line:<48} {}", s("path"));
                 }
             }
             WorktreeCmd::Remove { name, force } => {
-                let v = call("worktree.remove", json!({ "name": name, "force": force }))?;
+                let v =
+                    call("worktree.remove", json!({ "name": name, "force": force, "from": self_pane() }))?;
                 println!("removed {}", v.get("removed").unwrap_or(&Value::Null));
                 println!("  branch horde/{name} kept — `git branch -D horde/{name}` to drop it");
             }

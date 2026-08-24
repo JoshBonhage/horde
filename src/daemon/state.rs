@@ -1111,7 +1111,7 @@ fn repo_info(repos: &super::repo::Cache, dir: &std::path::Path) -> Option<crate:
     repos.peek(dir).map(|r| crate::proto::RepoInfo {
         branch: r.branch.clone(),
         dirty: r.dirty,
-        worktree: super::repo::is_agent_worktree(dir),
+        worktree: super::repo::is_agent_worktree(dir, &r.branch),
     })
 }
 

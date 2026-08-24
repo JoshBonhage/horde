@@ -119,22 +119,25 @@ horde spawn --cmd claude --name builder  --worktree
 horde spawn --cmd claude --name reviewer --worktree
 ```
 
-Each lands in `<repo>/.horde/worktrees/<name>` on its own `horde/<name>` branch, and starts
+Each lands beside the project as `<project>-<name>` on its own `horde/<name>` branch, and starts
 there. Both can run the full test suite and rewrite the same file, and neither can touch what
 the other is holding.
 
-Two details, both checked rather than assumed. horde writes `.horde/` to **`.git/info/exclude`**,
-which is per-clone and untracked, so nothing the repository owns is modified — without it the
-first agent to run `git add -A` in the main tree commits a mess. And the **leading dot** is what
-keeps the worktrees out of every agent's search results; `horde-worktrees/` would return one hit
-per worktree per match.
+**Beside the project, not inside it.** A worktree nested in the repository has to be hidden
+from `git status`, sits inside the blast radius of `git clean -ffdx`, and is a directory agents
+can wander into while searching their own project. A sibling has none of those problems — it is
+not in the repository — and it is the layout you can actually see in your editor's file list.
+
+**Which trees are horde's is the branch, not the path.** Everything horde makes is on
+`horde/<name>`, so a worktree you made yourself is never listed and never removable, wherever
+you put it and whatever you named the folder.
 
 Worktrees survive a closed pane, deliberately: nothing an agent produced should be lost by
 closing a window. `horde worktree list` shows them and who is in each, `horde worktree remove`
 is the only thing that deletes one, and it refuses while a pane is still in it or while the
 tree has uncommitted work.
 
-Full reasoning, including what `git clean` can still do to them: `horde docs worktrees`.
+Full reasoning: `horde docs worktrees`.
 
 </details>
 

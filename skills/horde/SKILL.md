@@ -98,16 +98,22 @@ horde spawn --cmd "claude --model opus" --name parser \
 |---|---|
 | `--name` | how you address it in `horde send`. Always pass it |
 | `--role` | what it is *for*: reviewer, builder, docs. Makes a fleet readable |
-| `--worktree` | its own git worktree and branch, so it cannot overwrite its neighbours |
+| `--worktree` | its own git worktree and branch beside the project. Only when asked |
 | `--board` | enlist it for board work in this project |
 | `--task` | a first job, put on the board for it to claim |
 | `--cmd` | the whole command, so the model goes here: `"claude --model opus"` |
 | `--profile` | start on a named model list from config instead of `--cmd` — see below |
 | `--brief` | its first instruction, delivered once it is up. Works with the board closed |
 
-**Use `--worktree` whenever you start more than one agent in the same repository.** Without
-it they share one working tree, and two agents editing the same file is not a merge conflict
-you can resolve — it is one agent's work silently overwritten.
+**`--worktree` only when your human asks for it.** It is the right answer when several agents
+will edit the same repository — without it they share one working tree, and two agents editing
+the same file is not a merge conflict you can resolve, it is one agent's work silently
+overwritten. But it is also a directory on their disk and a branch in their repository, and
+neither is yours to create uninvited. If you think a fleet needs isolating, say so and let them
+decide.
+
+When you are asked for one, the worktree lands *beside* the project — an agent named `ads` on
+`~/dev/WCP` works in `~/dev/WCP-ads`, on branch `horde/ads`.
 
 There is a cap on how many panes agents may have open at once (`agents.max_fleet`, six by
 default). Hitting it is an error that says so. Do not work around it; tell your human.
