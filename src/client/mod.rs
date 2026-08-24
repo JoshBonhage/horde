@@ -3,6 +3,7 @@
 //! All geometry and session state comes from the daemon, so the client is free to die and
 //! come back without disturbing a single running process.
 
+pub mod glyphs;
 pub mod input;
 pub mod menu;
 pub mod roster;
@@ -118,6 +119,16 @@ pub struct App {
     pub roster_hits: Vec<(u16, u16, u16, Focus)>,
     /// Set once the version mismatch warning has been shown, so it appears only once.
     pub warned_version: bool,
+    /// Discard what ratatui believes is on screen before the next draw.
+    ///
+    /// The client only sends the host the cells that changed since its last frame, which is
+    /// right for as long as ratatui's record of the screen is a faithful one. A host resize, or
+    /// a layout that changed shape under it, can leave that record describing a screen that no
+    /// longer exists — and a diffing renderer never recovers on its own, because every frame
+    /// after agrees with a record that is already wrong. Stale glyphs sit there until something
+    /// happens to overwrite that exact cell. `/clear` was the manual way out; this is the
+    /// automatic one.
+    pub needs_clear: bool,
     /// Screen row to menu-item index, recorded during render for mouse hit-testing.
     pub menu_hits: Vec<(u16, usize)>,
     /// Rect the menu occupies, so clicks outside it can dismiss it.
@@ -152,6 +163,7 @@ impl App {
             sidebar: roster::SidebarState::default(),
             roster_hits: Vec::new(),
             warned_version: false,
+            needs_clear: false,
             menu_hits: Vec::new(),
             menu_rect: crate::proto::Rect::default(),
             settings_cat_hits: Vec::new(),
@@ -315,7 +327,13 @@ pub async fn attach(cfg: Config, warnings: Vec<String>) -> Result<()> {
         app.toast(NoticeLevel::Warn, w);
     }
 
-    let mut term = setup_terminal()?;
+    let (mut term, glyph_notes) = setup_terminal()?;
+    // Surfaced rather than silent: a terminal whose glyph widths differ from the tables is the
+    // difference between a pane that lines up and one that spills over its own border, and it
+    // is worth being able to see which answer horde got.
+    for n in glyph_notes {
+        app.toast(NoticeLevel::Info, n);
+    }
     let result = run_loop(&mut term, &mut app, out_tx.clone(), in_rx).await;
     restore_terminal(&mut term)?;
 
@@ -328,10 +346,15 @@ pub async fn attach(cfg: Config, warnings: Vec<String>) -> Result<()> {
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-fn setup_terminal() -> Result<Term> {
+fn setup_terminal() -> Result<(Term, Vec<String>)> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+
+    // Before the input thread exists. The terminal answers a cursor query as ordinary input,
+    // and whoever reads stdin first gets it — start the reader and the reply is swallowed as a
+    // keystroke instead.
+    let notes = glyphs::measure(&mut stdout);
 
     // A panic with the terminal in raw mode leaves an unusable shell, so restore first and
     // let the default hook print afterwards.
@@ -345,7 +368,7 @@ fn setup_terminal() -> Result<Term> {
         default_hook(info);
     }));
 
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    Ok((Terminal::new(CrosstermBackend::new(stdout))?, notes))
 }
 
 fn restore_terminal(term: &mut Term) -> Result<()> {
@@ -396,6 +419,22 @@ async fn run_loop(
 
     loop {
         if needs_draw {
+            // Throw away ratatui's record of the screen so the next frame is written in full.
+            //
+            // `Terminal::clear` is the obvious call and must not be used: it snapshots the
+            // cursor first, and asking a terminal where its cursor is means writing `ESC [ 6 n`
+            // and reading the answer back as input. By this point horde's own input thread owns
+            // stdin and takes the reply, so the query times out after two seconds and returns
+            // an error — which propagated out of the draw loop and closed the whole client.
+            // Closing a pane changes the layout's shape, so `ctrl+b x` did it every time.
+            //
+            // `resize` to the size it already is reaches the same reset — clear the viewport,
+            // reset the back buffer — and on a fullscreen viewport it has nothing to restore,
+            // so it never asks.
+            if std::mem::take(&mut app.needs_clear) {
+                let size = term.size()?;
+                term.resize(size.into())?;
+            }
             term.draw(|f| ui::draw(f, app))?;
             needs_draw = false;
         }
@@ -453,6 +492,25 @@ async fn run_loop(
     }
 }
 
+/// Whether two snapshots draw their lines in different places.
+///
+/// Contents are ignored on purpose — text changing every frame is the normal case and costs
+/// nothing to redraw. This is only about where the *edges* are, which is what gets left behind.
+fn shape_changed(old: &Snapshot, new: &Snapshot) -> bool {
+    if (old.tabbar, old.sidebar, old.bus, old.status)
+        != (new.tabbar, new.sidebar, new.bus, new.status)
+    {
+        return true;
+    }
+    if old.panes.len() != new.panes.len() {
+        return true;
+    }
+    old.panes
+        .iter()
+        .zip(new.panes.iter())
+        .any(|(a, b)| a.id != b.id || a.cell != b.cell || a.content != b.content)
+}
+
 /// Apply one server frame. Returns a reason string when the session must end.
 fn apply_frame(app: &mut App, frame: ServerFrame) -> Option<String> {
     match frame {
@@ -482,6 +540,14 @@ fn apply_frame(app: &mut App, frame: ServerFrame) -> Option<String> {
                         snap.daemon_version
                     ),
                 );
+            }
+            // A layout that changed shape leaves the old one's borders and panel edges on
+            // the host in cells the new one never writes to. Every rect is compared, not just
+            // the pane count: a pane closing, the bus opening, a tab with a different split
+            // coming forward — they all move the lines, and any line left behind stays until
+            // something happens to overwrite that exact cell.
+            if app.snapshot.as_ref().is_some_and(|old| shape_changed(old, &snap)) {
+                app.needs_clear = true;
             }
             // Forget caches for panes that no longer exist.
             let live: Vec<PaneId> = snap.panes.iter().map(|p| p.id).collect();
@@ -547,6 +613,10 @@ fn handle_event(
         Event::Key(k) => handle_key(app, k, out),
         Event::Resize(cols, rows) => {
             let _ = out.send(ClientFrame::Resize { cols, rows });
+            // A resize is the moment the host screen and ratatui's record of it are most
+            // likely to have parted company: the terminal reflows or truncates on its own
+            // terms, and nothing tells the renderer which cells survived.
+            app.needs_clear = true;
             Ok(())
         }
         Event::Paste(text) => {
@@ -1337,6 +1407,13 @@ fn run_action(
 ) -> Result<()> {
     match action {
         Action::Cmd(cmd) => {
+            // The redraw command is the escape hatch for a screen that has gone wrong, and
+            // half of what can be wrong is on this side of the socket. Making the daemon
+            // repaint the panes while the client keeps diffing against its own stale record
+            // fixes half the screen and leaves the other half exactly as it was.
+            if cmd == Cmd::Redraw {
+                app.needs_clear = true;
+            }
             let _ = out.send(ClientFrame::Command(cmd));
         }
         Action::Detach => {

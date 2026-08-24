@@ -102,10 +102,9 @@ impl Selection {
 /// counted by display width, since one wide glyph covers two columns and a combining mark covers
 /// none. Getting that wrong shifts every selection right of a CJK character or an emoji.
 fn columns(row: &Row) -> impl Iterator<Item = (u16, char)> + '_ {
-    use unicode_width::UnicodeWidthChar;
     let mut col: u16 = 0;
     row.runs.iter().flat_map(|r| r.text.chars()).map(move |ch| {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        let w = crate::client::glyphs::width(ch) as u16;
         if w == 0 {
             // Belongs to the cell before it, so it travels with that cell's column.
             return (col.saturating_sub(1), ch);

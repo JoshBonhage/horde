@@ -13,7 +13,6 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
 
 use super::{App, Mode};
 use crate::proto::{AgentState, Rect, Rgb};
@@ -25,7 +24,7 @@ pub fn color(c: Rgb) -> Color {
 
 /// Display columns a string occupies, which is not its character count once a glyph is wide.
 pub fn width(s: &str) -> usize {
-    s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+    s.chars().map(|c| crate::client::glyphs::width(c)).sum()
 }
 
 /// The glyph and colour an agent state is drawn with.
@@ -75,7 +74,7 @@ pub fn put_line(buf: &mut Buffer, x: u16, y: u16, w: u16, line: Line<'_>) {
     let end = x.saturating_add(w);
     for span in line.spans {
         for ch in span.content.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let cw = crate::client::glyphs::width(ch);
             if cw == 0 {
                 continue;
             }
@@ -103,7 +102,7 @@ pub fn truncate(s: &str, w: usize) -> String {
     if w == 0 {
         return String::new();
     }
-    let width: usize = s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+    let width: usize = s.chars().map(|c| crate::client::glyphs::width(c)).sum();
     if width <= w {
         return s.to_string();
     }
@@ -113,7 +112,7 @@ pub fn truncate(s: &str, w: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
     for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let cw = crate::client::glyphs::width(ch);
         if used + cw > w - 1 {
             break;
         }
@@ -135,7 +134,7 @@ pub fn wrap_text(s: &str, w: usize) -> Vec<String> {
         let mut line = String::new();
         let mut used = 0usize;
         for word in para.split_whitespace() {
-            let ww: usize = word.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+            let ww: usize = word.chars().map(|c| crate::client::glyphs::width(c)).sum();
             if ww > w {
                 if !line.is_empty() {
                     out.push(std::mem::take(&mut line));
@@ -145,7 +144,7 @@ pub fn wrap_text(s: &str, w: usize) -> Vec<String> {
                 let mut chunk = String::new();
                 let mut cused = 0;
                 for ch in word.chars() {
-                    let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    let cw = crate::client::glyphs::width(ch);
                     if cused + cw > w {
                         out.push(std::mem::take(&mut chunk));
                         cused = 0;
@@ -235,7 +234,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let focused = snap.focused_pane == Some(pane.id);
         let zoomed = snap.view.zoom == Some(pane.id);
 
-        if app.cfg.pane_titles {
+        // Whether a frame is drawn is read off the geometry the daemon sent, not off the
+        // client's own `pane_titles`. Both processes load the same config file, but they load
+        // it separately and can disagree — a reload one of them rejected, a setting changed in
+        // one and not yet the other. When they do, the daemon hands over a content rect that is
+        // the whole cell while the client still draws a border, and since the content is
+        // painted after the frame the terminal goes straight over the border it is meant to sit
+        // inside. Asking the rects removes the disagreement: the ring exists exactly when the
+        // daemon reserved one.
+        let framed = pane.content != pane.cell;
+        if framed {
             // The space's colour is resolved here rather than inside the widget: a pane knows
             // which space it is in, but only the snapshot knows that space's slot.
             let accent = snap
@@ -244,7 +252,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .find(|s| s.id == pane.space)
                 .map(|s| theme.space_accent(s.accent))
                 .unwrap_or(theme.ui.border);
-            let block = pane_widget::pane_frame(
+            pane_widget::draw_frame(
                 pane,
                 focused,
                 zoomed,
@@ -253,8 +261,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 app.cfg.animate,
                 accent,
                 &app.cfg.roles,
+                trect(pane.cell),
+                f.buffer_mut(),
             );
-            block.render(trect(pane.cell), f.buffer_mut());
         }
 
         let empty: Vec<crate::proto::Row> = Vec::new();
@@ -404,7 +413,7 @@ mod tests {
         for w in 4..40 {
             for line in wrap_text(text, w) {
                 let width: usize =
-                    line.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+                    line.chars().map(|c| crate::client::glyphs::width(c)).sum();
                 assert!(width <= w, "width {w}: {line:?}");
             }
         }
@@ -563,6 +572,86 @@ mod frame_tests {
         }).collect::<Vec<_>>().join("\n")
     }
 
+    /// A layout that moved its edges has to force a full repaint.
+    ///
+    /// The client sends the host only the cells that changed since its last frame. When the
+    /// lines move — a pane closes, the bus opens, a tab with a different split comes forward —
+    /// the old borders sit in cells the new layout never writes to, and stay there until
+    /// something happens to overwrite that exact cell. That is the debris below a pane that
+    /// only a redraw clears.
+    #[test]
+    fn a_layout_that_moved_its_edges_is_recognised_as_a_new_shape() {
+        let (_app, base) = demo();
+
+        let same = base.clone();
+        assert!(!crate::client::shape_changed(&base, &same), "an identical layout needs no repaint");
+
+        // Text changing is the normal case and must not cost a full repaint.
+        let mut renamed = base.clone();
+        renamed.panes[0].title = "something else".into();
+        assert!(!crate::client::shape_changed(&base, &renamed), "a title is not a shape");
+
+        let mut moved = base.clone();
+        moved.panes[0].cell.w -= 1;
+        assert!(crate::client::shape_changed(&base, &moved), "a pane that changed width moved its border");
+
+        let mut panel = base.clone();
+        panel.bus = crate::proto::Rect::new(0, 0, 0, 0);
+        assert!(crate::client::shape_changed(&base, &panel), "the bus closing moved an edge");
+
+        let mut fewer = base.clone();
+        fewer.panes.pop();
+        assert!(crate::client::shape_changed(&base, &fewer), "a pane closing left its border behind");
+    }
+
+    /// The boundary between the terminal and the chrome around it has to fall exactly on the
+    /// rule, and the only way to get that is a rule that sits on a cell boundary.
+    ///
+    /// A `─` is drawn through the middle of its cell, so half a row of that cell's background
+    /// lands on the wrong side of the line whichever colour it is given: paint the frame in the
+    /// terminal's colour and the terminal runs half a row past its border, paint it in the
+    /// chrome colour and the chrome reaches half a row inside it. Reported first as the
+    /// terminal bleeding out, then — with the colour swapped — as the chrome bleeding in. The
+    /// one-eighth blocks are flush with the edge of their cell, so with the frame painted in
+    /// the terminal's colour the error is not smaller, it is zero.
+    #[test]
+    fn the_rule_around_a_pane_sits_on_the_cell_boundary() {
+        let (mut app, snap) = demo();
+        let theme = app.cfg.theme.clone();
+        let pane = snap.panes[0].clone();
+        app.rows.insert(pane.id, vec![row("x"); pane.content.h as usize]);
+        app.snapshot = Some(snap);
+
+        let mut term = Terminal::new(TestBackend::new(146, 39)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let terminal = color(theme.bg);
+        let bottom = pane.cell.y + pane.cell.h - 1;
+        let right = pane.cell.x + pane.cell.w - 1;
+
+        // Every frame cell carries the terminal's own background, so there is no colour
+        // boundary anywhere inside the rule for the eye to catch.
+        for x in pane.cell.x..=right {
+            for y in [pane.cell.y, bottom] {
+                assert_eq!(
+                    buf.cell((x, y)).unwrap().style().bg,
+                    Some(terminal),
+                    "frame cell ({x},{y}) is not the terminal's colour"
+                );
+            }
+        }
+
+        // And the rules are the edge-flush glyphs, not the mid-cell box-drawing ones. Checked
+        // away from the corners and the title, which the rule legitimately breaks for.
+        let mid_x = pane.cell.x + pane.cell.w / 2;
+        let mid_y = pane.cell.y + pane.cell.h / 2;
+        assert_eq!(buf.cell((mid_x, pane.cell.y)).unwrap().symbol(), "▔", "top rule");
+        assert_eq!(buf.cell((mid_x, bottom)).unwrap().symbol(), "▁", "bottom rule");
+        assert_eq!(buf.cell((pane.cell.x, mid_y)).unwrap().symbol(), "▏", "left rule");
+        assert_eq!(buf.cell((right, mid_y)).unwrap().symbol(), "▕", "right rule");
+    }
+
     #[test]
     fn full_frame_renders() {
         let (mut app, snap) = demo();
@@ -574,6 +663,37 @@ mod frame_tests {
         assert!(out.contains("builder"));
         assert!(out.contains("needs you"));
         assert!(out.contains("bus"));
+    }
+
+    /// The frame and the content rect have to come from the same answer.
+    ///
+    /// The client and the daemon load the same config file but load it separately, and they
+    /// can disagree — one of them rejected a reload, or a setting changed in one and not the
+    /// other. When the daemon insets a pane's content to leave room for a border and the client
+    /// has decided not to draw one, nothing paints that ring: the page shows through it, a
+    /// one-cell frame of container colour around every pane, heaviest to notice along the
+    /// bottom edge. Reading the answer off the rects means the ring is drawn exactly when the
+    /// daemon reserved one.
+    #[test]
+    fn a_pane_whose_content_was_inset_is_framed_whatever_the_client_config_says() {
+        let (mut app, mut snap) = demo();
+        // The daemon reserved the ring; this client's own config says no titles.
+        app.cfg.pane_titles = false;
+        let cell = snap.panes[0].cell;
+        snap.panes[0].content = cell.inset(1);
+        let id = snap.panes[0].id;
+        app.rows.insert(id, vec![row(&"#".repeat(cell.w as usize)); cell.h as usize]);
+        app.snapshot = Some(snap);
+
+        let out = render(&mut app, 146, 39);
+        let lines: Vec<&str> = out.lines().collect();
+        let top = lines[cell.y as usize].chars().nth(cell.x as usize).unwrap_or(' ');
+        let bottom = lines[(cell.y + cell.h - 1) as usize]
+            .chars()
+            .nth(cell.x as usize)
+            .unwrap_or(' ');
+        assert_eq!(top, '▔', "no rule was drawn over the row the daemon reserved for one");
+        assert_eq!(bottom, '▁', "the bottom of the ring is bare container");
     }
 
     #[test]

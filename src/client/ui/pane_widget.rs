@@ -4,8 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect as TRect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Widget};
-use unicode_width::UnicodeWidthChar;
+use ratatui::widgets::Widget;
 
 use super::{color, rstyle};
 use crate::proto::{attrs, AgentState, PaneInfo, Rgb, Row};
@@ -67,7 +66,7 @@ impl PaneView<'_> {
             for run in &row.runs {
                 let style = rstyle(run.fg, run.bg, run.attrs);
                 for ch in run.text.chars() {
-                    let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    let w = crate::client::glyphs::width(ch);
 
                     // Zero-width marks (combining accents, variation selectors, skin-tone
                     // modifiers) belong to the cell before them, not a cell of their own.
@@ -133,7 +132,7 @@ fn role_look(role: &str, roles: &[crate::config::Role], theme: &Theme) -> (Strin
 /// The title lives in the top border rather than on its own row, which buys back a line of
 /// terminal for every pane on screen.
 #[allow(clippy::too_many_arguments)]
-pub fn pane_frame(
+fn pane_frame(
     pane: &PaneInfo,
     focused: bool,
     zoomed: bool,
@@ -142,7 +141,7 @@ pub fn pane_frame(
     animate: bool,
     accent: Rgb,
     roles: &[crate::config::Role],
-) -> Block<'static> {
+) -> (Vec<Span<'static>>, Rgb) {
     // The focused pane keeps the one unmistakable border; project identity is what the
     // *others* now carry. Tinting the focused one too would make "which pane has the
     // keyboard" a question of hue, which is the one thing this border exists to answer.
@@ -230,11 +229,83 @@ pub fn pane_frame(
 
     spans.push(Span::styled(" ", Style::default().fg(color(border_color))));
 
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(color(border_color)).bg(color(theme.ui.bg)))
-        .title(Line::from(spans))
+    (spans, border_color)
+}
+
+// The frame is drawn with the one-eighth block elements rather than the box-drawing set,
+// because those are the only rules that land on a cell *boundary*.
+//
+// A `─` is drawn through the middle of its cell. The cell is one row tall — 37 screen pixels
+// on a retina display — and the rule is two of them, so whichever background that cell is
+// given, half a row of it sits on the wrong side of the line: paint the frame in the
+// terminal's colour and the terminal appears to run half a row past its own border; paint it
+// in the chrome colour and the chrome appears to reach half a row inside. It is the same half
+// cell either way, which is why no choice of colour ever settled it.
+//
+// `▔ ▁ ▏ ▕` sit flush against the edge of their cell. Painting the frame cell in the
+// terminal's colour then puts the boundary between terminal and chrome exactly on the rule,
+// because the rule *is* the cell edge. The error is not reduced, it is zero.
+//
+// The cost is square corners: rounded ones only exist in the box-drawing set, which is
+// mid-cell by construction. A corner that is a pixel blunter is worth an edge that is exact.
+const RULE_TOP: &str = "▔";
+const RULE_BOTTOM: &str = "▁";
+const RULE_LEFT: &str = "▏";
+const RULE_RIGHT: &str = "▕";
+
+/// Paint a pane's frame and its title into `area`.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_frame(
+    pane: &PaneInfo,
+    focused: bool,
+    zoomed: bool,
+    theme: &Theme,
+    tick: usize,
+    animate: bool,
+    accent: Rgb,
+    roles: &[crate::config::Role],
+    area: TRect,
+    buf: &mut Buffer,
+) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let (spans, border_color) =
+        pane_frame(pane, focused, zoomed, theme, tick, animate, accent, roles);
+
+    // The whole cell in the terminal's colour first: the frame belongs to the pane, and the
+    // rules are drawn on top of it at the outer edge.
+    let style = Style::default().fg(color(border_color)).bg(color(theme.bg));
+    super::fill(buf, area, theme.bg);
+
+    let (x0, y0) = (area.x, area.y);
+    let (x1, y1) = (area.x + area.width - 1, area.y + area.height - 1);
+    for x in x0..=x1 {
+        if let Some(c) = buf.cell_mut((x, y0)) {
+            c.set_symbol(RULE_TOP);
+            c.set_style(style);
+        }
+        if let Some(c) = buf.cell_mut((x, y1)) {
+            c.set_symbol(RULE_BOTTOM);
+            c.set_style(style);
+        }
+    }
+    // The sides stop short of the rows the top and bottom rules already span, so the corners
+    // are owned by one rule rather than fought over by two.
+    for y in (y0 + 1)..y1 {
+        if let Some(c) = buf.cell_mut((x0, y)) {
+            c.set_symbol(RULE_LEFT);
+            c.set_style(style);
+        }
+        if let Some(c) = buf.cell_mut((x1, y)) {
+            c.set_symbol(RULE_RIGHT);
+            c.set_style(style);
+        }
+    }
+
+    // The title sits in the top row, notched into the rule the way it always has.
+    let inset = 2u16.min(area.width);
+    super::put_line(buf, x0 + inset, y0, area.width.saturating_sub(inset), Line::from(spans));
 }
 
 /// `45s`, `2m18s`, `1h04m`.
