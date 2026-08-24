@@ -141,6 +141,16 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             eng.session.view.sidebar_width = cfg.sidebar_width;
             eng.session.view.bus_width = cfg.bus_width;
             eng.session.relayout(&cfg);
+            // Colours are resolved into the mirror when a row is built, so a pane already on
+            // screen is holding rows painted in the old palette and nothing about them has
+            // changed — the client is sent nothing and the terminal keeps the previous theme
+            // until whatever is running happens to redraw. Rebuilding every row against the
+            // new theme is what makes a theme change visible without a `clear`.
+            let theme = cfg.theme.clone();
+            for p in eng.session.panes.values_mut() {
+                p.set_theme(&theme);
+                p.request_full_repaint();
+            }
             eng.touch();
             let mut all = warnings;
             all.extend(eng.agents.warnings.clone());

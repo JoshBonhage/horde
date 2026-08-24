@@ -262,6 +262,7 @@ impl Session {
             cfg.scrollback,
             &crate::config::socket_path(),
             &cfg.env,
+            &cfg.theme,
         )?;
         self.panes.insert(id, pane);
         Ok(id)
@@ -690,10 +691,17 @@ impl Session {
         self.relayout(cfg);
     }
 
-    pub fn set_client_size(&mut self, cfg: &Config, cols: u16, rows: u16) {
-        self.client_cols = cols.max(20);
-        self.client_rows = rows.max(6);
+    /// Returns whether the size actually moved, so a caller can skip the repaint that a
+    /// resize costs. Sizes are clamped, so two different reports can mean the same size.
+    pub fn set_client_size(&mut self, cfg: &Config, cols: u16, rows: u16) -> bool {
+        let (cols, rows) = (cols.max(20), rows.max(6));
+        if (cols, rows) == (self.client_cols, self.client_rows) {
+            return false;
+        }
+        self.client_cols = cols;
+        self.client_rows = rows;
         self.relayout(cfg);
+        true
     }
 
     /// Apply a named preset to the focused tab, spawning or closing panes to match.
@@ -789,23 +797,30 @@ impl Session {
         c.panes = Rect::new(left, top, right.saturating_sub(left), body_h);
         self.chrome = c;
 
-        // Push geometry into the panes of the focused tab, and resize the PTYs.
-        let Some(tab_id) = self.focused_tab() else { return };
+        // Push geometry into the panes and resize the PTYs.
+        //
+        // Every tab, not just the focused one. A background tab's panes are off screen but
+        // their programs are still running and still drawing, and they draw for the size the
+        // tty says they have. Size only the focused tab and a tab that was in the background
+        // across a window resize comes forward believing it is still the old shape — the agent
+        // painted into a corner of a pane that has since grown, with no `SIGWINCH` owed to it
+        // to say otherwise. Sizing them all keeps every tty honest at the cost of a resize call
+        // that returns early whenever nothing moved.
         let area = c.panes;
         let zoom = self.view.zoom;
+        let focused = self.focused_tab();
 
-        let assignments: Vec<(PaneId, Rect)> = match zoom {
-            Some(z) if self.tab(tab_id).is_some_and(|t| t.layout.contains(z)) => {
-                vec![(z, area)]
+        let mut assignments: Vec<(PaneId, Rect)> = Vec::new();
+        for tab in &self.tabs {
+            // Zoom is a property of the view, so it only ever applies to the tab on screen.
+            if Some(tab.id) == focused && zoom.is_some_and(|z| tab.layout.contains(z)) {
+                assignments.push((zoom.unwrap(), area));
+                continue;
             }
-            _ => self
-                .tab(tab_id)
-                .map(|t| {
-                    let geo = t.layout.geometry(area);
-                    geo.order.into_iter().filter_map(|p| geo.panes.get(&p).map(|r| (p, *r))).collect()
-                })
-                .unwrap_or_default(),
-        };
+            let geo = tab.layout.geometry(area);
+            assignments
+                .extend(geo.order.into_iter().filter_map(|p| geo.panes.get(&p).map(|r| (p, *r))));
+        }
 
         for (pane, cell) in assignments {
             let content = if cfg.pane_titles { cell.inset(1) } else { cell };
@@ -1242,6 +1257,54 @@ mod tests {
                 );
             }
         }
+        kill_all(&mut s);
+    }
+
+    /// A tab you are not looking at still has programs running in it, and a program only
+    /// learns its shape from the tty. Sizing only the focused tab leaves a background tab's
+    /// panes on whatever size they had when they were last on screen, so switching back shows
+    /// an agent painted into the top-left corner of a pane that has since grown — with no
+    /// `SIGWINCH` owed to it that would ever put it right.
+    #[test]
+    fn panes_in_a_tab_you_are_not_looking_at_are_sized_too() {
+        let (cfg, mut s) = session();
+        s.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        s.set_client_size(&cfg, 200, 60);
+
+        let space = s.focused_space.unwrap();
+        let background = s.focused_tab().unwrap();
+        let hidden: Vec<PaneId> = s.tab(background).unwrap().layout.panes();
+        // A second tab takes focus, leaving the first one off screen.
+        s.create_tab(&cfg, space, Some("front")).unwrap();
+        assert_ne!(s.focused_tab(), Some(background), "the new tab should be the focused one");
+
+        // Now the window changes size while that tab is in the background.
+        s.set_client_size(&cfg, 100, 30);
+        let want = s
+            .visible_rects(&cfg)
+            .first()
+            .map(|(_, _, content)| (content.w, content.h))
+            .expect("the focused tab has a pane");
+        for id in hidden {
+            let p = &s.panes[&id];
+            assert_eq!((p.cols, p.rows), want, "background pane {id} kept a stale pty size");
+        }
+        kill_all(&mut s);
+    }
+
+    /// The same size reported twice is not a change. Callers repaint every pane when it is, so
+    /// a resize that moved nothing would cost a full redraw of the session for nothing — and a
+    /// window edge being dragged reports dozens of times a second.
+    #[test]
+    fn setting_the_size_it_already_has_reports_no_change() {
+        let (cfg, mut s) = session();
+        s.create_space(&cfg, Some("t"), &std::env::temp_dir()).unwrap();
+        assert!(s.set_client_size(&cfg, 200, 60), "a new size is a change");
+        assert!(!s.set_client_size(&cfg, 200, 60), "the same size is not");
+        // Sizes are clamped, so two different reports can still mean the same size.
+        assert!(s.set_client_size(&cfg, 2, 1), "a window below the floor lands on the floor");
+        assert!(!s.set_client_size(&cfg, 5, 3), "and a smaller one is the same floor again");
+        assert!(s.set_client_size(&cfg, 80, 24), "a real change still lands");
         kill_all(&mut s);
     }
 

@@ -299,7 +299,7 @@ mod tests {
         let mut e = eng("attached", 1);
         set_state(&mut e, 0, AgentState::Blocked, 90);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        e.clients.insert(1, super::super::Client { out: tx, needs_full: Vec::new() });
+        e.clients.insert(1, super::super::Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
         assert!(prepare(&mut e, true).is_none(), "the toast already said this");
     }
 

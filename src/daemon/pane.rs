@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -25,7 +26,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use super::pty::{self, ChildHandle, Master, Reader};
 
-use crate::proto::{attrs, CursorPos, PaneId, Row, Run, SpaceId, TabId};
+use crate::proto::{attrs, CursorPos, PaneId, Rgb, Row, Run, SpaceId, TabId};
 use crate::theme::Theme;
 
 /// Minimum PTY geometry. A zero-size PTY makes programs misbehave, so panes clamp here
@@ -74,9 +75,67 @@ pub enum PaneSignal {
     Wakeup,
 }
 
+/// Named colours alacritty numbers above the 256-entry palette.
+///
+/// A program asking the terminal what colour it is uses these, not a palette index: OSC 10 is
+/// the foreground, OSC 11 the background, OSC 12 the cursor.
+const NAMED_FOREGROUND: usize = 256;
+const NAMED_BACKGROUND: usize = 257;
+const NAMED_CURSOR: usize = 258;
+
+/// What a program is told when it asks the terminal about itself.
+///
+/// Shared with the emulator's event proxy, which answers those questions on the reader thread
+/// and so cannot reach into the engine for the answer. Updated in place when the theme changes
+/// or the pane is resized, because the answers have to be current: a program asks once, at
+/// startup, and paints for the rest of its life on what it was told.
+#[derive(Debug)]
+pub struct PaneFacts {
+    theme: std::sync::RwLock<Theme>,
+    cols: std::sync::atomic::AtomicU16,
+    rows: std::sync::atomic::AtomicU16,
+}
+
+impl PaneFacts {
+    fn new(theme: &Theme, cols: u16, rows: u16) -> Self {
+        Self {
+            theme: std::sync::RwLock::new(theme.clone()),
+            cols: std::sync::atomic::AtomicU16::new(cols),
+            rows: std::sync::atomic::AtomicU16::new(rows),
+        }
+    }
+
+    fn set_theme(&self, theme: &Theme) {
+        if let Ok(mut t) = self.theme.write() {
+            *t = theme.clone();
+        }
+    }
+
+    fn set_size(&self, cols: u16, rows: u16) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.cols.store(cols, Relaxed);
+        self.rows.store(rows, Relaxed);
+    }
+
+    /// The colour a program is asking about, by alacritty's numbering.
+    fn color(&self, index: usize) -> Rgb {
+        let Ok(theme) = self.theme.read() else { return Rgb::new(0, 0, 0) };
+        match index {
+            NAMED_FOREGROUND => theme.fg,
+            NAMED_BACKGROUND => theme.bg,
+            NAMED_CURSOR => theme.cursor,
+            // Everything else in the named range is a variation on the foreground; the palette
+            // is the only part that indexes cleanly.
+            0..=255 => theme.indexed(index as u8),
+            _ => theme.fg,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct EventProxy {
     tx: UnboundedSender<PaneSignal>,
+    facts: Arc<PaneFacts>,
 }
 
 impl EventListener for EventProxy {
@@ -89,9 +148,15 @@ impl EventListener for EventProxy {
             TermEvent::ClipboardStore(..) => PaneSignal::ClipboardStore,
             // These carry a formatter that turns our answer into the right escape
             // sequence; run it and send the bytes straight back to the PTY.
+            //
+            // The answer has to be the *live* theme, and the named colours have to be told
+            // apart from the palette. Answering from a hardcoded palette meant a program was
+            // told horde's own colours whatever theme was configured; clamping the index into
+            // the palette meant a program asking for the background (257) was handed entry
+            // 255, a near-white — so a TUI that asks before it paints decided the terminal was
+            // light and filled its panels with dark boxes on a dark background.
             TermEvent::ColorRequest(index, fmt) => {
-                let theme = Theme::horde();
-                let rgb = theme.indexed(index.min(255) as u8);
+                let rgb = self.facts.color(index);
                 let reply = fmt(alacritty_terminal::vte::ansi::Rgb {
                     r: rgb.r,
                     g: rgb.g,
@@ -100,11 +165,15 @@ impl EventListener for EventProxy {
                 PaneSignal::Write(reply.into_bytes())
             }
             TermEvent::TextAreaSizeRequest(fmt) => {
-                // Pixel dimensions are a guess; nothing in a TUI depends on them being
-                // exact, but a missing reply would hang the caller.
+                // Cell pixel dimensions are still a guess — horde has no way to know what the
+                // host terminal uses — but the cell *count* is known exactly, and a program
+                // sizing itself off this reply should get the pane it actually has.
+                use std::sync::atomic::Ordering::Relaxed;
+                let (cols, rows) =
+                    (self.facts.cols.load(Relaxed), self.facts.rows.load(Relaxed));
                 let reply = fmt(alacritty_terminal::event::WindowSize {
-                    num_lines: 24,
-                    num_cols: 80,
+                    num_lines: rows,
+                    num_cols: cols,
                     cell_width: 8,
                     cell_height: 16,
                 });
@@ -211,6 +280,10 @@ pub struct Pane {
     /// paste inserts a literal newline instead of submitting. Writing the text, then the CR
     /// a beat later, makes the CR read as a keypress.
     deferred: Vec<(Instant, Vec<u8>)>,
+    /// What this pane answers when the program inside asks about the terminal.
+    ///
+    /// Shared with the emulator's event proxy, which runs on the reader thread.
+    facts: Arc<PaneFacts>,
     /// Bytes accepted for this pane but not yet taken by the tty.
     ///
     /// The master is non-blocking, so a write takes what fits and reports the rest. Holding the
@@ -246,6 +319,7 @@ impl Pane {
         scrollback: usize,
         socket: &Path,
         env: &std::collections::HashMap<String, String>,
+        theme: &Theme,
     ) -> Result<Pane> {
         let cols = cols.max(MIN_COLS);
         let rows = rows.max(MIN_ROWS);
@@ -300,7 +374,8 @@ impl Pane {
         let (signal_tx, signal_rx) = unbounded_channel::<PaneSignal>();
         let config = TermConfig { scrolling_history: scrollback, ..Default::default() };
         let size = TermSize { cols: cols as usize, rows: rows as usize };
-        let term = Term::new(config, &size, EventProxy { tx: signal_tx });
+        let facts = Arc::new(PaneFacts::new(theme, cols, rows));
+        let term = Term::new(config, &size, EventProxy { tx: signal_tx, facts: facts.clone() });
 
         Ok(Pane {
             id,
@@ -334,6 +409,7 @@ impl Pane {
             model: None,
             last_sent_cursor: None,
             full_repaint: true,
+            facts,
             deferred: Vec::new(),
             outbound: Vec::new(),
         })
@@ -711,7 +787,8 @@ impl Pane {
         let (signal_tx, signal_rx) = unbounded_channel::<PaneSignal>();
         let config = TermConfig { scrolling_history: scrollback, ..Default::default() };
         let size = TermSize { cols: saved.cols as usize, rows: saved.rows as usize };
-        let term = Term::new(config, &size, EventProxy { tx: signal_tx });
+        let facts = Arc::new(PaneFacts::new(theme, saved.cols, saved.rows));
+        let term = Term::new(config, &size, EventProxy { tx: signal_tx, facts: facts.clone() });
 
         let mut pane = Pane {
             id,
@@ -765,6 +842,7 @@ impl Pane {
             model: None,
             last_sent_cursor: None,
             full_repaint: true,
+            facts,
             deferred: Vec::new(),
             outbound: Vec::new(),
         };
@@ -829,6 +907,9 @@ impl Pane {
         }
         self.cols = cols;
         self.rows = rows;
+        // Before the SIGWINCH: a program that answers the signal by asking how big it now is
+        // must not be told the size it had a moment ago.
+        self.facts.set_size(cols, rows);
         self.master.resize(cols, rows)?;
         self.term.resize(TermSize { cols: cols as usize, rows: rows as usize });
         self.mirror.clear();
@@ -858,6 +939,16 @@ impl Pane {
         }
         self.resize(cols, rows)?;
         Ok(())
+    }
+
+    /// Point this pane's terminal answers at a new theme.
+    ///
+    /// Rebuilding the mirror recolours what horde drew, but a program that asked the terminal
+    /// for its colours and painted with the answer is holding the old palette in its own
+    /// output. Nothing repaints that but the program, and it will only ask again if it is told
+    /// there is a reason to.
+    pub fn set_theme(&mut self, theme: &Theme) {
+        self.facts.set_theme(theme);
     }
 
     pub fn request_full_repaint(&mut self) {
@@ -933,6 +1024,59 @@ pub fn default_shell() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A program that asks the terminal what colour it is has to be told the truth.
+    ///
+    /// Two things were wrong at once. The answer came from a hardcoded `Theme::horde()`, so the
+    /// configured theme never reached the program. And the index was clamped into the palette,
+    /// which put the *named* colours — foreground 256, background 257, cursor 258 — on entry
+    /// 255, a near-white. A TUI that asks before it paints was told the terminal was light and
+    /// filled its panels with dark boxes on a dark background: the black rectangles that no
+    /// amount of repainting fixes, because horde is not the one drawing them.
+    #[test]
+    fn a_program_asking_what_colour_the_terminal_is_gets_the_configured_theme() {
+        let gruvbox = Theme::by_name("gruvbox").expect("a palette to configure");
+        let facts = PaneFacts::new(&gruvbox, 146, 47);
+
+        assert_eq!(facts.color(NAMED_BACKGROUND), gruvbox.bg, "background query");
+        assert_eq!(facts.color(NAMED_FOREGROUND), gruvbox.fg, "foreground query");
+        assert_eq!(facts.color(NAMED_CURSOR), gruvbox.cursor, "cursor query");
+        assert_eq!(facts.color(1), gruvbox.ansi[1], "the palette still indexes normally");
+        assert_ne!(
+            facts.color(NAMED_BACKGROUND),
+            gruvbox.indexed(255),
+            "the background was answered with a palette entry"
+        );
+
+        // And it follows a theme change, so a pane opened after one is not still on the old
+        // palette while everything horde draws has moved.
+        let catppuccin = Theme::by_name("catppuccin").unwrap();
+        facts.set_theme(&catppuccin);
+        assert_eq!(facts.color(NAMED_BACKGROUND), catppuccin.bg);
+    }
+
+    /// The named colours are the emulator's numbering, not horde's. If the crate ever
+    /// renumbers them, answering a background query with the foreground is a silent wrong
+    /// answer that no other test would notice.
+    #[test]
+    fn the_named_colour_numbers_match_the_emulator() {
+        use alacritty_terminal::vte::ansi::NamedColor;
+        assert_eq!(NamedColor::Foreground as usize, NAMED_FOREGROUND);
+        assert_eq!(NamedColor::Background as usize, NAMED_BACKGROUND);
+        assert_eq!(NamedColor::Cursor as usize, NAMED_CURSOR);
+    }
+
+    /// A program that answers `SIGWINCH` by asking how big it is must not be told the size it
+    /// had before the resize.
+    #[test]
+    fn the_size_a_pane_reports_follows_the_resize() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let facts = PaneFacts::new(&Theme::horde(), 80, 24);
+        facts.set_size(146, 47);
+        assert_eq!((facts.cols.load(Relaxed), facts.rows.load(Relaxed)), (146, 47));
+    }
+
     /// Whatever this resolves to has to be something the OS can actually exec.
     ///
     /// Asserted against the filesystem rather than against a literal, because the bug this
@@ -949,3 +1093,4 @@ mod tests {
         );
     }
 }
+

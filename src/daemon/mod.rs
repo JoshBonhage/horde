@@ -75,6 +75,14 @@ struct Client {
     out: mpsc::UnboundedSender<ServerFrame>,
     /// Panes this client has not received a full grid for yet.
     needs_full: Vec<PaneId>,
+    /// The window size this client last reported.
+    ///
+    /// Held per client because the session has one size and there can be several windows.
+    /// Without it the last window to speak wins for good: attach a small one beside a large
+    /// one, close the small one, and the large one is left drawing full-size rects around
+    /// panes whose ttys are still the small window's shape.
+    cols: u16,
+    rows: u16,
 }
 
 pub struct Engine {
@@ -649,9 +657,8 @@ fn handle_msg(eng: &mut Engine, msg: DaemonMsg) -> bool {
         }
         DaemonMsg::Attach { id, cols, rows, out } => {
             let panes: Vec<PaneId> = eng.session.panes.keys().copied().collect();
-            eng.clients.insert(id, Client { out, needs_full: panes });
-            let cfg = eng.cfg.clone();
-            eng.session.set_client_size(&cfg, cols, rows);
+            eng.clients.insert(id, Client { out, needs_full: panes, cols, rows });
+            resync_client_size(eng);
             eng.dirty_shape = true;
 
             // Coming back to five panes of scrollback tells you nothing. Say what changed,
@@ -664,37 +671,64 @@ fn handle_msg(eng: &mut Engine, msg: DaemonMsg) -> bool {
         }
         DaemonMsg::Detached { id } => {
             eng.clients.remove(&id);
+            resync_client_size(eng);
         }
         DaemonMsg::Frame { id, frame } => handle_client_frame(eng, id, frame),
     }
     false
 }
 
-fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
+/// Re-derive the session size from the windows still attached, and make them all repaint.
+///
+/// The size is the smallest attached window rather than the most recent one to speak. Two
+/// windows share one set of ttys, so anything wider or taller than the narrowest of them is
+/// content that window can only see part of. Recomputed on attach and detach as well as on a
+/// resize, because closing the small window is the moment the large one is allowed to grow
+/// back and nothing else would ever tell the daemon so.
+fn resync_client_size(eng: &mut Engine) {
+    let Some((cols, rows)) = eng
+        .clients
+        .values()
+        .map(|c| (c.cols, c.rows))
+        .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1)))
+    else {
+        // Nothing is watching. Keep the last size so a reattach comes back to its layout.
+        return;
+    };
+    // Applied immediately so the layout tracks the drag, but remembered as pending so the tick
+    // can settle it afterwards. Dragging a window edge delivers dozens of sizes a second, and a
+    // program that repaints for each of them is repainting for a size already out of date.
     let cfg = eng.cfg.clone();
+    if !eng.session.set_client_size(&cfg, cols, rows) {
+        return;
+    }
+    eng.resize_settling = Some(std::time::Instant::now());
+    // Every pane moved, so nothing any client has cached is still valid.
+    let panes: Vec<PaneId> = eng.session.panes.keys().copied().collect();
+    for p in &panes {
+        if let Some(pane) = eng.session.panes.get_mut(p) {
+            pane.request_full_repaint();
+        }
+    }
+    for c in eng.clients.values_mut() {
+        c.needs_full = panes.clone();
+    }
+    eng.dirty_shape = true;
+}
+
+fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
     match frame {
         ClientFrame::Ping => {}
         ClientFrame::Detach => {
             eng.clients.remove(&id);
+            resync_client_size(eng);
         }
         ClientFrame::Resize { cols, rows } => {
-            // Applied immediately so the layout tracks the drag, but remembered as pending so
-            // the tick can settle it afterwards. Dragging a window edge delivers dozens of
-            // sizes a second, and a program that repaints for each of them is repainting for a
-            // size that is already out of date.
-            eng.session.set_client_size(&cfg, cols, rows);
-            eng.resize_settling = Some(std::time::Instant::now());
-            // Every pane moved, so nothing the client has cached is still valid.
-            let panes: Vec<PaneId> = eng.session.panes.keys().copied().collect();
-            for p in &panes {
-                if let Some(pane) = eng.session.panes.get_mut(p) {
-                    pane.request_full_repaint();
-                }
-            }
             if let Some(c) = eng.clients.get_mut(&id) {
-                c.needs_full = panes;
+                c.cols = cols;
+                c.rows = rows;
             }
-            eng.dirty_shape = true;
+            resync_client_size(eng);
         }
         ClientFrame::Input { pane, bytes } => {
             if let Some(p) = eng.session.panes.get_mut(&pane) {
@@ -766,12 +800,15 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         Cmd::NextTab => {
             eng.session.cycle_tab(1);
+            eng.session.relayout(&cfg);
         }
         Cmd::PrevTab => {
             eng.session.cycle_tab(-1);
+            eng.session.relayout(&cfg);
         }
         Cmd::GotoTab(i) => {
             eng.session.goto_tab(i);
+            eng.session.relayout(&cfg);
         }
         Cmd::CloseTab => {
             if let Some(t) = eng.session.focused_tab() {
@@ -794,12 +831,15 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         Cmd::FocusSpace(id) => {
             eng.session.focus_space(id);
+            eng.session.relayout(&cfg);
         }
         Cmd::NextSpace => {
             eng.session.cycle_space(1);
+            eng.session.relayout(&cfg);
         }
         Cmd::PrevSpace => {
             eng.session.cycle_space(-1);
+            eng.session.relayout(&cfg);
         }
         Cmd::ToggleSidebar => eng.session.toggle_sidebar(&cfg),
         Cmd::ToggleBus => eng.session.toggle_bus(&cfg),
@@ -866,6 +906,9 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         Cmd::FocusTab(id) => {
             eng.session.focus_tab(id);
+            // Which space is focused decides whether a tab bar takes a row, and zoom only
+            // applies to the tab on screen — so what changed here is geometry, not just focus.
+            eng.session.relayout(&cfg);
             seen = eng.session.focused_pane();
         }
         Cmd::NewTabIn(space) => {
@@ -1728,6 +1771,76 @@ mod tests {
         last
     }
 
+    /// A theme change has to reach what is already on screen.
+    ///
+    /// Colours are resolved into the mirror when a row is built, so every row a pane is already
+    /// holding is painted in the old palette. Nothing about the emulator grid changed, so no row
+    /// is rebuilt, nothing is marked dirty, and the client is told nothing — the chrome recolours
+    /// around a terminal that keeps the previous theme until whatever is running happens to
+    /// redraw. Reported as "the terminal only picks up the new theme after I `/clear`".
+    #[test]
+    fn switching_theme_recolours_what_is_already_on_screen() {
+        let mut eng = engine_with_shell(Some("cat"));
+        let pane = *eng.session.panes.keys().next().unwrap();
+        assert!(type_into(&mut eng, pane, b"a", 1), "the pty never echoed the keystroke");
+        let before = eng.session.panes[&pane].row(0).cloned().expect("row 0 exists");
+
+        // Swap to a palette that resolves the default foreground differently.
+        let other = crate::theme::Theme::by_name("gruvbox").expect("a second palette to switch to");
+        assert_ne!(other.fg, eng.cfg.theme.fg, "the two themes have to actually differ");
+        eng.cfg.theme = other.clone();
+
+        // Asking for the repaint is what carries the new palette onto rows the program has
+        // already drawn and has no reason to draw again.
+        eng.session.panes.get_mut(&pane).unwrap().request_full_repaint();
+        eng.session.panes.get_mut(&pane).unwrap().pump(&other);
+        let after = eng.session.panes[&pane].row(0).cloned().expect("row 0 exists");
+        assert_eq!(after.runs[0].text, before.runs[0].text, "the text should be untouched");
+        assert_ne!(after.runs[0].fg, before.runs[0].fg, "row 0 is still in the old palette");
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    /// Two windows share one set of ttys, so the size has to be the smallest of them — and the
+    /// moment the small one closes is the moment the large one is allowed to grow back. Nothing
+    /// else tells the daemon: a client only reports a size when its own size changes, and the
+    /// window that stayed open never changed. Left uncorrected, the large window draws full-size
+    /// pane rects around ttys still shaped for the window that went away, which on screen is an
+    /// agent shrunk into the top-left corner of its pane.
+    #[test]
+    fn closing_the_smaller_window_hands_the_larger_one_its_size_back() {
+        let mut eng = engine_with_shell(Some("cat"));
+        let pane = *eng.session.panes.keys().next().unwrap();
+
+        let (big, _big_rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: big, needs_full: Vec::new(), cols: 200, rows: 60 });
+        resync_client_size(&mut eng);
+        let (wide, tall) = (eng.session.panes[&pane].cols, eng.session.panes[&pane].rows);
+
+        // A second, smaller window opens. It wins while it is there: anything wider than it is
+        // content it can only see part of.
+        let (small, _small_rx) = mpsc::unbounded_channel();
+        eng.clients.insert(2, Client { out: small, needs_full: Vec::new(), cols: 80, rows: 24 });
+        resync_client_size(&mut eng);
+        assert!(
+            eng.session.panes[&pane].cols < wide,
+            "the smaller window has to win while it is open"
+        );
+
+        // And it gives the size back on the way out.
+        eng.clients.remove(&2);
+        resync_client_size(&mut eng);
+        assert_eq!(
+            (eng.session.panes[&pane].cols, eng.session.panes[&pane].rows),
+            (wide, tall),
+            "the pty is still shaped for the window that closed"
+        );
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
     /// Typing a space has to move the cursor on screen.
     ///
     /// A space landing on an already-blank cell changes no text, so the rebuilt row is identical
@@ -1741,7 +1854,7 @@ mod tests {
         let mut eng = engine_with_shell(Some("cat"));
         let pane = *eng.session.panes.keys().next().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new() });
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
         eng.session.focus_pane(pane);
 
         // A visible character first: this part already works, and it gets the client a cursor
