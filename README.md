@@ -1,11 +1,6 @@
-```
-██╗  ██╗ ██████╗ ██████╗ ██████╗ ███████╗
-██║  ██║██╔═══██╗██╔══██╗██╔══██╗██╔════╝
-███████║██║   ██║██████╔╝██║  ██║█████╗
-██╔══██║██║   ██║██╔══██╗██║  ██║██╔══╝
-██║  ██║╚██████╔╝██║  ██║██████╔╝███████╗
-╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝
-```
+<div align="center">
+
+<img src="assets/logo.png" alt="horde" width="420">
 
 **An agent-aware terminal multiplexer.** A background daemon owns every PTY, so your coding
 agents keep working when you close the terminal — and horde knows which ones need you.
@@ -16,6 +11,8 @@ agents keep working when you close the terminal — and horde knows which ones n
 ![Binary](https://img.shields.io/badge/one%20binary-no%20runtime-086c69?style=for-the-badge&labelColor=1a3b3b)
 
 **[Quick start](#quick-start)** · **[Concepts](docs/concepts.md)** · **[Keys](docs/keys.md)** · **[Agents](docs/agents.md)** · **[Worktrees](docs/worktrees.md)** · **[Socket API](docs/socket-api.md)** · **[Config](docs/configuration.md)** · **[Unattended](docs/unattended.md)** · **[Orchestration](docs/orchestration.md)**
+
+</div>
 
 ---
 
