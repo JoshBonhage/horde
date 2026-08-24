@@ -1,17 +1,21 @@
-<div align="center">
+```
+██╗  ██╗ ██████╗ ██████╗ ██████╗ ███████╗
+██║  ██║██╔═══██╗██╔══██╗██╔══██╗██╔════╝
+███████║██║   ██║██████╔╝██║  ██║█████╗
+██╔══██║██║   ██║██╔══██╗██║  ██║██╔══╝
+██║  ██║╚██████╔╝██║  ██║██████╔╝███████╗
+╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═════╝ ╚══════╝
+```
 
-<img src="assets/banner.svg" alt="horde — a terminal multiplexer for coding agents" width="100%">
-
-<br>
+**An agent-aware terminal multiplexer.** A background daemon owns every PTY, so your coding
+agents keep working when you close the terminal — and horde knows which ones need you.
 
 ![Rust](https://img.shields.io/badge/Rust-1.88+-2ea986?style=for-the-badge&labelColor=1a3b3b)
 ![Platform](https://img.shields.io/badge/macOS%20%C2%B7%20Linux-086c69?style=for-the-badge&labelColor=1a3b3b)
-![Tests](https://img.shields.io/badge/535%20tests-passing-2ea986?style=for-the-badge&labelColor=1a3b3b)
+![Tests](https://img.shields.io/badge/584%20tests-passing-2ea986?style=for-the-badge&labelColor=1a3b3b)
 ![Binary](https://img.shields.io/badge/one%20binary-no%20runtime-086c69?style=for-the-badge&labelColor=1a3b3b)
 
-**[Concepts](docs/concepts.md)** · **[Keys](docs/keys.md)** · **[Agents](docs/agents.md)** · **[Socket API](docs/socket-api.md)** · **[Config](docs/configuration.md)** · **[Unattended](docs/unattended.md)** · **[Orchestration](docs/orchestration.md)**
-
-</div>
+**[Quick start](#quick-start)** · **[Concepts](docs/concepts.md)** · **[Keys](docs/keys.md)** · **[Agents](docs/agents.md)** · **[Worktrees](docs/worktrees.md)** · **[Socket API](docs/socket-api.md)** · **[Config](docs/configuration.md)** · **[Unattended](docs/unattended.md)** · **[Orchestration](docs/orchestration.md)**
 
 ---
 
@@ -24,8 +28,7 @@ remembering to go and look.
 tmux can't help. It doesn't know the difference between an agent that's thinking and one that's
 been waiting twenty minutes for you to approve a file write.
 
-horde does. A background daemon owns every PTY, so your agents keep working when you close the
-terminal. It knows which ones need you. And when you're not there at all, it can act on its own.
+horde does. And when you're not there at all, it can act on its own.
 
 <div align="center">
 <br>
@@ -33,8 +36,6 @@ terminal. It knows which ones need you. And when you're not there at all, it can
 <br>
 <em>Four projects, one agent each. The sidebar groups them, so which agent belongs to which repo is something you see rather than work out.</em>
 </div>
-
----
 
 <table>
 <tr><td width="50%" valign="top">
@@ -59,6 +60,58 @@ terminal. It knows which ones need you. And when you're not there at all, it can
 
 </td></tr>
 </table>
+
+---
+
+## Quick start
+
+```sh
+cargo build --release
+rm -f ~/.local/bin/horde && cp target/release/horde ~/.local/bin/
+codesign --force --sign - ~/.local/bin/horde        # macOS
+horde                                               # start the daemon, then attach
+horde integration install claude                    # let agents report their own state
+```
+
+Two lines there are not ceremony, and both cost a debugging session to learn.
+
+**`rm -f` before `cp`** — copying *onto* the file a running daemon was launched from writes
+into the same inode and changes the executable underneath a live process. Unlinking first gives
+the new binary its own inode and leaves the running one alone.
+
+**`codesign` after** — on macOS, replacing the binary at a path a running process was launched
+from poisons the kernel's code-signature cache **for that path**. Every later launch then dies
+with `SIGKILL` and no output at all, including `horde --version`, while the same bytes run fine
+from anywhere else. It looks exactly like a broken daemon and isn't. Re-signing clears it.
+
+`ctrl+b d` detaches and your agents keep running. `ctrl+b ?` lists every key.
+
+Upgrading a live session hands every PTY to the new binary over a socket, same pids
+throughout — but `horde upgrade` re-executes whichever binary is at the path the daemon was
+started from, so **install first, upgrade second**. The other way round upgrades the daemon to
+the build it is already running.
+
+```sh
+cargo build --release
+rm -f ~/.local/bin/horde && cp target/release/horde ~/.local/bin/
+codesign --force --sign - ~/.local/bin/horde
+horde upgrade
+```
+
+<details>
+<summary><b>Everyday commands</b></summary>
+
+<br>
+
+```sh
+horde status          # what the daemon thinks is going on
+horde roster          # every agent: name, state, how long, and why
+horde digest          # what happened while you were away
+horde worktree list   # every tree horde made, and who is in each
+horde stop            # stop the daemon and everything it owns
+```
+
+</details>
 
 ---
 
@@ -115,29 +168,37 @@ Two agents editing the same file on the same branch is not a merge conflict you 
 resolve. It is one agent's work silently overwritten, usually found an hour later.
 
 ```sh
-horde spawn --cmd claude --name builder  --worktree
-horde spawn --cmd claude --name reviewer --worktree
+horde spawn --cmd claude --name ads --worktree
+horde spawn --cmd claude --name ops --worktree
 ```
 
-Each lands beside the project as `<project>-<name>` on its own `horde/<name>` branch, and starts
-there. Both can run the full test suite and rewrite the same file, and neither can touch what
-the other is holding.
+Each lands **beside** the project, on its own branch:
 
-**Beside the project, not inside it.** A worktree nested in the repository has to be hidden
-from `git status`, sits inside the blast radius of `git clean -ffdx`, and is a directory agents
-can wander into while searching their own project. A sibling has none of those problems — it is
-not in the repository — and it is the layout you can actually see in your editor's file list.
+```
+~/dev/WCP        main          you
+~/dev/WCP-ads    horde/ads     ads
+~/dev/WCP-ops    horde/ops     ops
+```
+
+Beside rather than inside, which is the opposite of where this started. A worktree nested in
+the repository has to be hidden from `git status`, sits inside the blast radius of
+`git clean -ffdx`, and is a directory agents can wander into while searching their own project.
+A sibling has none of those problems, and it is the layout you can actually see in your
+editor's file list.
 
 **Which trees are horde's is the branch, not the path.** Everything horde makes is on
-`horde/<name>`, so a worktree you made yourself is never listed and never removable, wherever
-you put it and whatever you named the folder.
+`horde/<name>`, so a worktree you made yourself is never listed and never removable — wherever
+you put it and whatever you named the folder. That is also what keeps trees an older horde
+nested inside the repository working: same prefix, still listed, still removable by name.
+
+It is **opt-in**, and agents are told to keep it that way. A worktree is a directory on your
+disk and a branch in your repository, and neither is an agent's to create uninvited.
 
 Worktrees survive a closed pane, deliberately: nothing an agent produced should be lost by
-closing a window. `horde worktree list` shows them and who is in each, `horde worktree remove`
-is the only thing that deletes one, and it refuses while a pane is still in it or while the
-tree has uncommitted work.
+closing a window. `horde worktree remove` is the only thing that deletes one, and it refuses
+while a pane is still in it or while the tree has uncommitted work.
 
-Full reasoning: `horde docs worktrees`.
+Full reasoning: **[docs/worktrees.md](docs/worktrees.md)**.
 
 </details>
 
@@ -421,43 +482,6 @@ Two consequences worth knowing:
   over a Unix socket. Same pids throughout.
 
 <details>
-<summary><b>Install</b></summary>
-
-<br>
-
-```sh
-cargo build --release
-
-# Replace, never overwrite: `cp` onto a binary the running daemon is executing corrupts it
-# mid-run, and macOS then kills it with SIGKILL on every exec.
-rm -f ~/.local/bin/horde && cp target/release/horde ~/.local/bin/
-horde upgrade                          # hand the live panes to the new binary
-```
-
-`horde upgrade` re-executes whichever binary you invoke, so install first and upgrade second.
-The other way round upgrades the daemon to the build it's already running.
-
-</details>
-
-<details>
-<summary><b>Use</b></summary>
-
-<br>
-
-```sh
-horde                 # start the daemon if needed, then attach
-horde status          # what the daemon thinks is going on
-horde roster          # every agent: name, state, how long, and why
-horde digest          # what happened while you were away
-horde upgrade         # swap in a rebuilt binary, keeping every agent alive
-horde stop            # stop the daemon and everything it owns
-```
-
-`ctrl+b d` detaches. Your agents keep running.
-
-</details>
-
-<details>
 <summary><b>Keys</b></summary>
 
 <br>
@@ -599,6 +623,9 @@ max_spawned = 2                             # agents horde may run that it start
 `ctrl+b .` opens a settings page for the same values. Writing goes through `toml_edit`, so
 comments and formatting in a hand-edited file survive.
 
+A section horde doesn't recognise is dropped with a warning rather than invalidating the file,
+so sharing the config with another tool is safe.
+
 Full reference: **[docs/configuration.md](docs/configuration.md)**.
 
 </details>
@@ -619,6 +646,9 @@ Full reference: **[docs/configuration.md](docs/configuration.md)**.
   a session the way a machine restart would — the layout comes back, the agents do not.
 - The socket path has to stay under ~100 bytes — an OS limit on `AF_UNIX`. Set `HORDE_SOCKET`
   if your config directory is deep.
+- Glyph widths in the private-use area (Nerd Font icons) are **measured** by asking the
+  terminal at startup, because no table agrees with every host. A terminal that doesn't answer
+  a cursor query costs two seconds at launch and falls back to the Unicode tables.
 - Not implemented: dragging pane borders to resize (use `H J K L`).
 
 ---
@@ -638,9 +668,4 @@ agent that inspects its environment will find it.
 
 ---
 
-<div align="center">
-<br>
-<img src="assets/taw.svg" alt="The Amazon Whisperer" width="240">
-<br><br>
-<sub>Built at <b>The Amazon Whisperer</b> · Rust + <a href="https://github.com/ratatui/ratatui">ratatui</a> · one binary, no runtime</sub>
-</div>
+<sub>Built by <b>Josh Bonhage</b> · Rust + <a href="https://github.com/ratatui/ratatui">ratatui</a> · one binary, no runtime</sub>
