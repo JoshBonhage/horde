@@ -68,6 +68,28 @@ pub fn log_path() -> PathBuf {
 // Raw TOML shape
 // ---------------------------------------------------------------------------
 
+/// Top-level tables and keys horde knows about.
+///
+/// Kept as a list rather than derived, because it is used to *drop* what horde does not
+/// understand before the strict parse ever sees it — see [`prune_unknown_sections`]. Adding a
+/// field to `RawConfig` without adding it here means that field is silently discarded, so the
+/// two are checked against each other in the tests.
+const KNOWN_SECTIONS: &[&str] = &[
+    "prefix",
+    "scrollback",
+    "shell",
+    "theme",
+    "ui",
+    "keys",
+    "agents",
+    "notifications",
+    "triggers",
+    "roles",
+    "handover",
+    "env",
+    "models",
+];
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -458,6 +480,22 @@ impl Default for Config {
     }
 }
 
+/// Drop top-level tables horde does not know about, naming each one.
+///
+/// horde's config file is shared with tools that keep their own sections in it, and a section
+/// belonging to someone else is not a mistake worth throwing the file away over.
+fn prune_unknown_sections(table: toml::Table, warnings: &mut Vec<String>) -> toml::Table {
+    let mut kept = toml::Table::new();
+    for (key, value) in table {
+        if KNOWN_SECTIONS.contains(&key.as_str()) {
+            kept.insert(key, value);
+        } else {
+            warnings.push(format!("ignoring unknown section [{key}] — the rest of the config still applies"));
+        }
+    }
+    kept
+}
+
 impl Config {
     pub fn load() -> (Config, Vec<String>) {
         Self::load_from(&config_dir().join("config.toml"))
@@ -478,7 +516,21 @@ impl Config {
             }
         };
 
-        let raw: RawConfig = match toml::from_str(&text) {
+        // Unknown top-level tables are dropped before the strict parse rather than allowed to
+        // fail it. One `[kanban]` horde has never heard of used to invalidate the whole file,
+        // and the fallback is *every default* — a config where nothing you wrote applies and
+        // the only sign is one line in the log. That is how a theme change silently does
+        // nothing. Dropped with a warning, so a genuine typo is still reported.
+        let table: toml::Table = match toml::from_str(&text) {
+            Ok(t) => t,
+            Err(e) => {
+                warnings.push(format!("config.toml is not valid TOML, using defaults: {e}"));
+                return (cfg, warnings);
+            }
+        };
+        let table = prune_unknown_sections(table, &mut warnings);
+
+        let raw: RawConfig = match table.try_into() {
             Ok(r) => r,
             Err(e) => {
                 warnings.push(format!("config.toml is invalid, using defaults: {e}"));
@@ -1377,6 +1429,60 @@ bogus_action = "prefix+q"
 
     /// The documented example is the first config most people copy, and `deny_unknown_fields`
     /// means one stale key there costs the reader their *entire* config, not just that line.
+    /// A section belonging to something else must not cost you the rest of your config.
+    ///
+    /// horde's config file is shared with tools that keep their own tables in it. A single
+    /// `[kanban]` used to fail the strict parse, and the fallback is *every default* — so the
+    /// theme you just picked silently reverts and the only trace is one line in the log.
+    #[test]
+    fn an_unknown_section_is_dropped_and_the_rest_of_the_config_still_applies() {
+        let p = write_tmp(
+            "foreign-section",
+            "scrollback = 4242\n\n[theme]\nname = \"gruvbox\"\n\n\
+             [kanban]\ncolumns = [\"Backlog\", \"Doing\"]\n\n\
+             [vault]\nhome = \"~/Documents/Vault 1\"\n",
+        );
+
+        let (cfg, warnings) = Config::load_from(&p);
+        assert_eq!(cfg.theme.name, "gruvbox", "the theme was thrown away with the stranger");
+        assert_eq!(cfg.scrollback, 4242, "and so was everything else in the file");
+        assert!(
+            warnings.iter().any(|w| w.contains("[kanban]")),
+            "the section was dropped in silence: {warnings:?}"
+        );
+        assert!(warnings.iter().any(|w| w.contains("[vault]")), "{warnings:?}");
+    }
+
+    /// `KNOWN_SECTIONS` decides what survives to the strict parse, so a field added to
+    /// `RawConfig` and not to the list would be dropped before serde ever sees it — the same
+    /// silent discard, just one level down. serde already knows the real answer: it lists every
+    /// field it expects when it rejects one it does not. This asks it.
+    #[test]
+    fn the_known_section_list_matches_what_the_parser_actually_accepts() {
+        let err = toml::from_str::<RawConfig>("this_is_not_a_section = 1")
+            .expect_err("an unknown key has to be rejected for this test to mean anything")
+            .to_string();
+        let expected: Vec<&str> = err
+            .split("expected one of")
+            .nth(1)
+            .expect("serde names the fields it expects")
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        assert!(!expected.is_empty(), "could not read the field list out of: {err}");
+        for field in &expected {
+            assert!(
+                KNOWN_SECTIONS.contains(field),
+                "`{field}` is a real config section but is not in KNOWN_SECTIONS, \
+                 so it is dropped before the parser sees it"
+            );
+        }
+        for known in KNOWN_SECTIONS {
+            assert!(expected.contains(known), "KNOWN_SECTIONS lists `{known}`, which is not a field");
+        }
+    }
+
     /// Adding a second `[theme]` table while writing these docs is how this test came to exist.
     #[test]
     fn the_documented_example_config_parses_without_warnings() {
@@ -1418,3 +1524,4 @@ mod path_tests {
         assert!(socket_path().as_os_str().len() < 100, "{:?}", socket_path());
     }
 }
+

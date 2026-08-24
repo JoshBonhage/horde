@@ -144,6 +144,12 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             eng.touch();
             let mut all = warnings;
             all.extend(eng.agents.warnings.clone());
+            // Raised as notices, not just returned. A reload is usually triggered from the
+            // settings screen, which does not read this reply — so a config horde could not
+            // use went unmentioned, and the only symptom was a setting that did nothing.
+            for w in &all {
+                eng.notice(crate::proto::NoticeLevel::Warn, format!("config: {w}"));
+            }
             Ok(json!({ "reloaded": true, "warnings": all }))
         }
         "server.status" => Ok(json!({
