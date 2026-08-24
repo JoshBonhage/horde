@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="horde" width="420">
+<img src="assets/logo.png" alt="horde" width="520">
 
 **An agent-aware terminal multiplexer.** A background daemon owns every PTY, so your coding
 agents keep working when you close the terminal — and horde knows which ones need you.
