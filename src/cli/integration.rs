@@ -134,9 +134,14 @@ pub fn install(agent: &str) -> Result<()> {
     }
 
     let text = serde_json::to_string_pretty(&settings)?;
+    // A machine that has never run Claude Code has no ~/.claude yet — and being installed
+    // before the agent is exactly what a new horde user does first.
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     // Write via a temp file then rename, so an interrupted write cannot corrupt settings.
     let tmp = path.with_extension("json.horde-tmp");
-    std::fs::write(&tmp, text + "\n")?;
+    std::fs::write(&tmp, text + "\n").with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("could not write {}", path.display()))?;
 
