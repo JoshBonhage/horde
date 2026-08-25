@@ -41,8 +41,13 @@ fn undecorate(line: &str) -> &str {
 /// A numbered choice: `❯ 1. Yes`, `2) No`, `  3. Yes, and don't ask again`.
 fn as_option(line: &str) -> Option<Choice> {
     let s = undecorate(line);
-    // The selection marker is not part of the label, and which one is selected is the
-    // agent's business rather than something to show in a list you pick from by number.
+    // The selection marker is not part of the label, and which one is selected is not shown
+    // in a list you pick from by number. It is still *recorded*: answering on your behalf
+    // means pressing what the agent chose for itself, and that is the only signal of it.
+    //
+    // `*` is not a selection marker here. Agents use it as a bullet, and reading a bullet as
+    // a recommendation would make every option in some menus look chosen.
+    let marked = s.starts_with(['❯', '>', '›', '»']);
     let s = s.trim_start_matches(['❯', '>', '›', '»', '*']).trim_start();
     let (num, rest) = s.split_once(['.', ')'])?;
     let key = num.trim();
@@ -53,7 +58,11 @@ fn as_option(line: &str) -> Option<Choice> {
     if label.is_empty() {
         return None;
     }
-    Some(Choice { key: key.to_string(), label: label.chars().take(60).collect() })
+    Some(Choice {
+        key: key.to_string(),
+        label: label.chars().take(60).collect(),
+        recommended: marked,
+    })
 }
 
 /// Does this line read as the question the options answer?
@@ -146,9 +155,11 @@ fn yes_no(tail: &[String]) -> Option<Question> {
     let text = undecorate(hit).chars().take(MAX_TEXT).collect::<String>();
     Some(Question {
         text,
+        // Neither is marked: a `(y/n)` prompt has no selection to read, so there is nothing
+        // for an approval rule to defer to and it will not answer one.
         options: vec![
-            Choice { key: "y".into(), label: "yes".into() },
-            Choice { key: "n".into(), label: "no".into() },
+            Choice { key: "y".into(), label: "yes".into(), recommended: false },
+            Choice { key: "n".into(), label: "no".into(), recommended: false },
         ],
     })
 }

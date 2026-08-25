@@ -4,6 +4,7 @@
 //! avoids holding a mutex across awaits, and makes the tick loop the only place panes are
 //! pumped — so pane damage is consumed exactly once per frame.
 
+pub mod approvals;
 pub mod agents;
 pub mod bus;
 pub mod digest;
@@ -91,6 +92,9 @@ pub struct Engine {
     pub bus: bus::Bus,
     pub board: tasks::Board,
     pub triggers: triggers::Store,
+    /// What each blocked pane was last seen asking, so a prompt can be required to hold still
+    /// before it is answered. See [`approvals`].
+    pub approvals: approvals::Seen,
     pub journal: journal::Journal,
     /// Pane names as of the start of this tick. An exit event is emitted after the pane has
     /// already been removed, so the name has to have been captured before that.
@@ -480,6 +484,7 @@ async fn engine_loop(
         bus: bus::Bus::new(crate::config::bus_log_path()),
         board: tasks::Board::new(crate::config::tasks_path()),
         triggers: triggers::Store::new(crate::config::triggers_path()),
+        approvals: approvals::Seen::default(),
         journal: journal::Journal::new(crate::config::journal_path()),
         pane_names: HashMap::new(),
         started: now_millis(),
@@ -1052,6 +1057,16 @@ fn tick(eng: &mut Engine, detect_due: bool) {
             }
         }
         eng.dirty_shape = true;
+    }
+
+    // Only on a detection pass: the state and the screen it reads were both refreshed by one,
+    // and answering off a stale snapshot is answering a question that may already be gone.
+    if detect_due {
+        let answered = approvals::consider(eng);
+        if !answered.is_empty() {
+            eng.pending_events.extend(answered);
+            eng.dirty_shape = true;
+        }
     }
 
     // Before the notifier, so a firing is something this pass can already tell you about.
@@ -1718,6 +1733,7 @@ mod tests {
             triggers: triggers::Store::new(
                 test_path("triggers.jsonl"),
             ),
+            approvals: approvals::Seen::default(),
             journal: journal::Journal::new(test_path("journal.jsonl")),
             pane_names: HashMap::new(),
             started: now_millis(),
@@ -1836,6 +1852,109 @@ mod tests {
             (wide, tall),
             "the pty is still shaped for the window that closed"
         );
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    /// The whole feature, end to end through the engine: a blocked agent showing a prompt a
+    /// rule permits gets the key the agent itself highlighted, and only on the second pass.
+    ///
+    /// Driven through `approvals::consider` with a real pane and a real screen rather than
+    /// against the matcher, because the parts that can be wrong here are the ones between the
+    /// two — reading the pane, requiring it to hold still, and writing to the tty.
+    #[test]
+    fn an_armed_rule_presses_what_the_agent_recommended_once_the_prompt_holds_still() {
+        // `cat` echoes what is written, so the pty's own echo is the proof the key was sent.
+        let mut eng = engine_with_shell(Some("cat"));
+        // Its own journal. The hourly ceiling is counted off `Fired` entries, and the shared
+        // test journal already holds the trigger suite's — which would spend this budget before
+        // the test starts and make it pass alone but fail in the suite.
+        let jp = test_path("approvals-journal.jsonl");
+        let _ = std::fs::remove_file(&jp);
+        eng.journal = journal::Journal::new(jp);
+        eng.cfg.unattended = true;
+        eng.cfg.approvals = vec![crate::config::Approval {
+            space: None,
+            role: None,
+            matches: "do you want to make this edit".into(),
+            allow: vec!["yes".into()],
+        }];
+        let pane = *eng.session.panes.keys().next().unwrap();
+
+        // A blocked agent, showing a menu with the first option highlighted.
+        let screen = "Do you want to make this edit to src/mux.rs?\n\
+                      ❯ 1. Yes\n\
+                      2. Yes, and don't ask again\n\
+                      3. No, and tell Claude what to do differently\n";
+        // Waiting on the text rather than on the cursor: this screen ends in a newline, so
+        // `type_into`'s column-zero condition is already true before the pty has echoed a byte,
+        // and under a loaded test run it returns before there is anything to read.
+        eng.session.panes.get_mut(&pane).unwrap().write_input(screen.as_bytes()).unwrap();
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut showing = false;
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
+            let seen = eng.session.panes[&pane].detection_snapshot(40).join("\n");
+            if seen.contains("3. No, and tell Claude") {
+                showing = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(showing, "the pty never echoed the prompt");
+        let p = eng.session.panes.get_mut(&pane).unwrap();
+        p.agent = Some(state::AgentRuntime {
+            kind: "claude".into(),
+            name: "builder".into(),
+            class: Default::default(),
+            state: crate::proto::AgentState::Blocked,
+            since: std::time::Instant::now(),
+            authority: "screen".into(),
+            reason: "test".into(),
+            seen: true,
+            session_id: None,
+            queued: Vec::new(),
+            question: None,
+            activity: Default::default(),
+            touched: Default::default(),
+            nudged_since: None,
+            alerted_since: None,
+        });
+
+        // First pass only remembers: a screen still being drawn is how the wrong menu gets read.
+        assert!(approvals::consider(&mut eng).is_empty(), "nothing on the first sighting");
+        // Second pass, same prompt: now it answers.
+        let events = approvals::consider(&mut eng);
+        assert_eq!(events.len(), 1, "the steady prompt should have been answered");
+
+        // The key pressed was the recommended one, not merely the first that was allowed.
+        assert!(
+            eng.journal
+                .since(0)
+                .any(|e| e.kind == journal::Kind::Fired && e.subject.contains("answered builder: 1")),
+            "the answer is journalled as something horde decided"
+        );
+        for p in eng.session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
+    /// Disarmed, the same setup answers nothing — and does not bank the sighting either, so
+    /// arming horde does not immediately answer a prompt that has been sitting there.
+    #[test]
+    fn nothing_is_answered_while_horde_is_not_armed() {
+        let mut eng = engine_with_shell(Some("cat"));
+        eng.cfg.unattended = false;
+        eng.cfg.approvals = vec![crate::config::Approval {
+            space: None,
+            role: None,
+            matches: "proceed".into(),
+            allow: vec!["yes".into()],
+        }];
+        assert!(approvals::consider(&mut eng).is_empty());
+        assert!(approvals::consider(&mut eng).is_empty(), "and still nothing on a second pass");
         for p in eng.session.panes.values_mut() {
             p.kill();
         }

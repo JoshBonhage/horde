@@ -249,6 +249,27 @@ pub struct Choice {
     /// The key that picks it: a digit for a menu, `y`/`n` for a plain prompt.
     pub key: String,
     pub label: String,
+    /// The agent had this one selected — the `❯` in its own menu.
+    ///
+    /// Deliberately not shown in the approval queue, where you are picking by number and the
+    /// agent's preference is noise. It is here for [`approvals`](crate::daemon::approvals),
+    /// which answers by pressing what the agent already chose rather than by deciding for it.
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+impl Choice {
+    /// The keys that pick this option.
+    ///
+    /// A digit is the whole answer — a menu acts on the keypress. A word (`y`/`n`) is typed
+    /// into a line the agent is reading, so it needs the return that submits it.
+    pub fn answer_bytes(&self) -> Vec<u8> {
+        let mut b = self.key.as_bytes().to_vec();
+        if !self.key.chars().all(|c| c.is_ascii_digit()) {
+            b.push(b'\r');
+        }
+        b
+    }
 }
 
 /// What kind of thing horde recognised in a pane.

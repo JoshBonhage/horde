@@ -778,7 +778,7 @@ fn handle_key(
                     if let (Some(item), Some(choice)) = (items.get(sel), choice) {
                         let _ = out.send(ClientFrame::Input {
                             pane: item.pane,
-                            bytes: crate::client::ui::overlays::answer_bytes(choice),
+                            bytes: choice.answer_bytes(),
                         });
                         app.toast(
                             NoticeLevel::Info,

@@ -247,3 +247,59 @@ its own cap and its own provenance tracking first.
 That would turn a local unix-socket tool into an authenticated network service. The cheap honest
 version needs no horde code: make your notify script a two-way bot that shells out to
 `horde task add`, and the trust boundary stays in code you wrote.
+
+## Answering permission prompts
+
+An agent that stops to ask permission is stopped until someone presses a key. Overnight, that
+is the night — and on a plan where prompts are frequent, most of it.
+
+An approval rule presses **the option the agent already highlighted** — the `❯` in its own
+menu — for prompts you named:
+
+```toml
+[[approvals]]
+space   = "horde"
+role    = "builder"
+matches = "do you want to make this edit"
+answer  = "recommended"
+allow   = ["yes"]
+```
+
+horde never decides *for* the agent here. It takes the choice the agent made for itself, which
+is what you are doing when you press return on a highlighted default.
+
+**Where the agent has its own flag, use the flag.** Claude Code's
+`--dangerously-skip-permissions` is blunter, but the agent knows which operation it is about to
+run and horde is reading a screen. This exists for the agents that offer nothing equivalent —
+and for when you want it scoped to one project or one role rather than turned on for everything.
+
+### `allow` is the guard
+
+It matches the label **exactly**. Claude offers "Yes, and don't ask again" beside "Yes", and
+pressing that one on your behalf permanently widens what the agent may do without asking —
+a different decision from approving one edit. `allow = ["yes"]` permits only `Yes`.
+
+This was nearly wrong: a substring match reads `"yes"` as permitting
+`"yes, and don't ask again"`, because it is a prefix of it. A test caught it.
+
+### The rest of the guards
+
+None are configurable, because each one is about certainty rather than preference:
+
+| Guard | Why |
+|---|---|
+| Off unless `triggers.unattended` | Same switch as everything else that acts unwatched |
+| Only prompts a rule names | There is no "everything except" form. The prompt nobody thought of is exactly the one worth reading |
+| Stable across two detection passes | A screen still being drawn is the likeliest way to read the wrong menu |
+| Exactly one option marked | Two marks means the parse is wrong, and the safe reading of a bad parse is to leave it alone |
+| 8 an hour, across every rule | A rule matching far more than expected should stop and say so, not do it fifty times |
+| Never for an agent horde started | Otherwise an agent can both ask and answer, and the loop closes with no human in it |
+
+Every answer is journalled and appears in `horde digest` under what horde decided, naming the
+question, the key pressed, and the rule that allowed it.
+
+### What it will not answer
+
+A plain `(y/n)` prompt with no numbered menu. There is no selection marker on one, so there is
+no recommendation to defer to — horde would be choosing rather than deferring, which is the
+line this feature does not cross.

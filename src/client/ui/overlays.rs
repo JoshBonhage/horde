@@ -14,7 +14,7 @@ use crate::client::settings::{self, Kind};
 use crate::client::{App, Mode, PickKind};
 use crate::config::{Action, Trigger};
 use crate::proto::Snapshot;
-use crate::proto::{AgentLine, AgentState, Choice, Delivery, Digest, NoticeLevel, PaneId, Question, Rgb};
+use crate::proto::{AgentLine, AgentState, Delivery, Digest, NoticeLevel, PaneId, Question, Rgb};
 use crate::theme::Theme;
 
 /// A bordered panel with a title, used by every overlay so they read as one family.
@@ -854,6 +854,7 @@ pub struct Item {
 
 #[cfg(test)]
 mod tests {
+    use crate::proto::Choice;
     use super::*;
     use crate::config::Keymap;
     use crate::proto::TaskLine;
@@ -883,7 +884,7 @@ mod tests {
             text: text.into(),
             options: keys
                 .iter()
-                .map(|k| Choice { key: (*k).into(), label: format!("option {k}") })
+                .map(|k| Choice { key: (*k).into(), label: format!("option {k}"), recommended: false })
                 .collect(),
         }
     }
@@ -927,8 +928,10 @@ mod tests {
     /// answer to a `(y/n)` prompt, read as a line, and needs the Enter that submits it.
     #[test]
     fn a_menu_digit_is_sent_bare_and_a_yes_no_answer_is_submitted() {
-        assert_eq!(answer_bytes(&Choice { key: "2".into(), label: "No".into() }), b"2".to_vec());
-        assert_eq!(answer_bytes(&Choice { key: "y".into(), label: "yes".into() }), b"y\r".to_vec());
+        let no = Choice { key: "2".into(), label: "No".into(), recommended: false };
+        assert_eq!(no.answer_bytes(), b"2".to_vec());
+        let yes = Choice { key: "y".into(), label: "yes".into(), recommended: false };
+        assert_eq!(yes.answer_bytes(), b"y\r".to_vec());
     }
 
     #[test]
@@ -1377,13 +1380,7 @@ pub fn pending(snap: &Snapshot) -> Vec<Pending> {
 ///
 /// Deliberately raw input rather than a bus message: this is you answering, not an agent
 /// talking to another agent, and the bus would rightly refuse to type at a blocked pane.
-pub fn answer_bytes(choice: &Choice) -> Vec<u8> {
-    let mut b = choice.key.as_bytes().to_vec();
-    if !choice.key.chars().all(|c| c.is_ascii_digit()) {
-        b.push(b'\r');
-    }
-    b
-}
+
 
 /// Every pending question in one place, answerable without leaving it.
 pub fn approvals(f: &mut Frame, area: TRect, app: &mut App) {

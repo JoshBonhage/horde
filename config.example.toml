@@ -52,6 +52,41 @@ detection_lines = 40
 unattended = false
 
 # ---------------------------------------------------------------------------
+# Approvals
+# ---------------------------------------------------------------------------
+
+# Standing answers to permission prompts, so an agent left running overnight is not stopped
+# until morning on a question you would always have answered the same way.
+#
+# horde presses the option the agent *already highlighted* — the `❯` in its own menu. It never
+# decides for the agent; it takes the agent's own default, which is what you do when you press
+# return on a highlighted option. Nothing here does anything unless `triggers.unattended` is on.
+#
+# Where an agent has its own flag for this, prefer the flag: Claude Code's
+# `--dangerously-skip-permissions` is blunter but the agent knows what it is about to run,
+# whereas horde is reading a screen. This is for the agents that have no such flag, and for
+# when you want it scoped rather than blanket.
+#
+# Commented out: this is the one feature where the default has to be "nothing".
+
+# [[approvals]]
+# space   = "horde"                            # this project only; omit for every project
+# role    = "builder"                          # this role only; omit for every role
+# matches = "do you want to make this edit"    # required — the prompts this answers
+# answer  = "recommended"                      # the only mode: press what the agent chose
+# allow   = ["yes"]                            # required — labels that may be pressed
+
+# `allow` is the line that matters, and it matches the label *exactly*. Claude offers
+# "Yes, and don't ask again" alongside "Yes"; pressing that one on your behalf permanently
+# widens what the agent may do without asking, which is a different decision from approving one
+# edit. Listing "yes" permits only "Yes". If you truly want the other, write it out in full.
+#
+# Guards, none of them configurable: the prompt must hold still across two detection passes,
+# exactly one option may be marked (two means the screen was misread), at most 8 answers an
+# hour, never for an agent horde started itself, and every answer is journalled and shown in
+# `horde digest` under what horde decided.
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 

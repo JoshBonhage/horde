@@ -88,6 +88,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "handover",
     "env",
     "models",
+    "approvals",
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -116,6 +117,8 @@ struct RawConfig {
     env: HashMap<String, String>,
     #[serde(default)]
     models: HashMap<String, RawModelProfile>,
+    #[serde(default)]
+    approvals: Vec<RawApproval>,
 }
 
 /// The `[handover]` block.
@@ -203,6 +206,17 @@ struct RawNotifications {
     command: Option<String>,
 }
 
+/// One `[[approvals]]` block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApproval {
+    space: Option<String>,
+    role: Option<String>,
+    matches: Option<String>,
+    answer: Option<String>,
+    allow: Option<Vec<String>>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawTriggers {
@@ -213,6 +227,31 @@ struct RawTriggers {
 // ---------------------------------------------------------------------------
 // Resolved config
 // ---------------------------------------------------------------------------
+
+/// A standing answer to a permission prompt.
+///
+/// Scoping is deliberately restrictive: a rule answers only prompts it names, in the places it
+/// names. There is no "everything except" form, because the failure mode of an exclusion list
+/// is a prompt nobody thought of being answered by default, and that is precisely the prompt
+/// worth reading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approval {
+    /// Project this applies in. `None` is every project.
+    pub space: Option<String>,
+    /// Role this applies to. `None` is every role.
+    pub role: Option<String>,
+    /// Case-insensitive substring the question must contain. Required: a rule that matches
+    /// every question is the blanket approval this deliberately is not.
+    pub matches: String,
+    /// Labels that may be answered. The agent's own recommendation is pressed, but only when
+    /// its label is *exactly* one of these, ignoring case and surrounding space.
+    ///
+    /// This is the line that stops "Yes, and don't ask again" being pressed on your behalf and
+    /// permanently widening what the agent may do without asking again — which is also why the
+    /// match is exact rather than a substring: `"yes"` is a prefix of that answer, so a loose
+    /// match would permit the very thing being guarded against.
+    pub allow: Vec<String>,
+}
 
 /// A named list of models to work through, and the command that runs one.
 ///
@@ -373,6 +412,9 @@ pub struct Config {
     pub env: HashMap<String, String>,
     /// Named model rotations, keyed by profile name. See `ModelProfile`.
     pub models: HashMap<String, ModelProfile>,
+    /// Standing answers for permission prompts. Empty by default, and inert without
+    /// `triggers.unattended` — see [`crate::daemon::approvals`].
+    pub approvals: Vec<Approval>,
     /// Telling an agent to hand over before it runs out. See `Handover`.
     pub handover: Handover,
     pub notify: Notify,
@@ -471,6 +513,7 @@ impl Default for Config {
             max_spawned: 2,
             env: HashMap::new(),
             models: HashMap::new(),
+            approvals: Vec::new(),
             handover: Handover::default(),
             notify: Notify::Horde,
             notify_command: None,
@@ -699,6 +742,46 @@ impl Config {
         cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
         cfg.max_fleet = raw.agents.max_fleet.unwrap_or(cfg.max_fleet);
         cfg.board = raw.agents.board.unwrap_or(cfg.board);
+
+        // Approvals. Every field that decides *whether* a prompt is answered is required, and a
+        // rule missing one is dropped with a reason rather than widened to a default — the
+        // defaults that would make sense here ("any question", "any answer") are exactly the
+        // ones nobody should get by leaving a line out.
+        for (i, a) in raw.approvals.iter().enumerate() {
+            let at = |what: &str| format!("[[approvals]] #{}: {what} — rule ignored", i + 1);
+            let Some(matches) = a.matches.as_deref().map(str::trim).filter(|m| !m.is_empty())
+            else {
+                warnings.push(at("no `matches`, which would answer every question"));
+                continue;
+            };
+            match a.answer.as_deref().unwrap_or("recommended") {
+                "recommended" => {}
+                other => {
+                    warnings.push(at(&format!(
+                        "answer = {other:?} is not understood; only \"recommended\" is"
+                    )));
+                    continue;
+                }
+            }
+            let allow: Vec<String> = a
+                .allow
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if allow.is_empty() {
+                warnings.push(at("no `allow`, so any recommended answer would be pressed"));
+                continue;
+            }
+            cfg.approvals.push(Approval {
+                space: a.space.clone().filter(|s| !s.trim().is_empty()),
+                role: a.role.as_deref().and_then(normalise_role),
+                matches: matches.to_lowercase(),
+                allow,
+            });
+        }
         cfg.unattended = raw.triggers.unattended.unwrap_or(cfg.unattended);
         // Clamped rather than trusted: this bounds how many full-permission agents can run
         // unwatched, and a typo'd 200 should not be taken at face value.
