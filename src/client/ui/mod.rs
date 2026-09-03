@@ -399,6 +399,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             );
         }
         statusbar::StatusBar {
+            carrying: app.carrying.clone(),
             snap: &snap,
             theme: &theme,
             mode: app.mode.clone(),
@@ -431,6 +432,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             None => kanban::draw_hints(f.buffer_mut(), body, &theme, view),
         }
         statusbar::StatusBar {
+            carrying: app.carrying.clone(),
             snap: &snap,
             theme: &theme,
             mode: app.mode.clone(),
@@ -473,6 +475,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             );
         }
         statusbar::StatusBar {
+            carrying: app.carrying.clone(),
             snap: &snap,
             theme: &theme,
             mode: app.mode.clone(),
@@ -772,6 +775,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             }
         }
         statusbar::StatusBar {
+            carrying: app.carrying.clone(),
             snap: &snap,
             theme: &theme,
             mode: app.mode.clone(),
@@ -923,6 +927,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             )),
         );
         statusbar::StatusBar {
+            carrying: app.carrying.clone(),
             snap: &snap,
             theme: &theme,
             mode: app.mode.clone(),
@@ -938,6 +943,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         app.notes_hits =
             notes::draw_files(f.buffer_mut(), area, &theme, app.files.as_ref(), &rows, query, sel);
         statusbar::StatusBar {
+            carrying: app.carrying.clone(),
             snap: &snap,
             theme: &theme,
             mode: app.mode.clone(),
@@ -953,6 +959,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         app.notes_hits =
             notes::draw(f.buffer_mut(), area, &theme, app.vault_index.as_ref(), &rows, query, sel);
         statusbar::StatusBar {
+            carrying: app.carrying.clone(),
             snap: &snap,
             theme: &theme,
             mode: app.mode.clone(),
@@ -971,6 +978,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let walk = app.zombie.and_then(|w| w.phase().at());
         app.dashboard_hits = dashboard::draw(f.buffer_mut(), area, &theme, &rows, sel, walk);
         statusbar::StatusBar {
+            carrying: app.carrying.clone(),
             snap: &snap,
             theme: &theme,
             mode: app.mode.clone(),
@@ -1074,6 +1082,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             theme: &theme,
             mode: app.mode.clone(),
             prefix: app.cfg.prefix.describe(),
+            carrying: app.carrying.clone(),
         }
         .render(trect(snap.status), f.buffer_mut());
     }
@@ -1279,6 +1288,7 @@ mod frame_tests {
                         last_tool: Some("Edit".into()),
                     },
                     question: None,
+                    endpoint: None,
                 }),                spawned_by: None,
                 exited: false, scroll_offset: 0, wants_mouse: false, bracketed_paste: true, role: None, pinned: false, board: false,
                 repo: None,
@@ -1316,6 +1326,7 @@ mod frame_tests {
             cards_due: 0,
             triggers_armed: 0,
             recents: Vec::new(),
+            memories: Vec::new(),
         };
 
         app.rows.insert(1, vec![

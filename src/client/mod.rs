@@ -326,6 +326,19 @@ pub struct App {
     pub tick: usize,
     /// Row-to-target map produced by the sidebar during render, used to resolve clicks.
     pub sidebar_hits: Vec<(u16, Hit)>,
+    /// A note picked up in the sidebar and not yet dropped.
+    ///
+    /// Client-side only, and deliberately: a half-finished gesture is not a session fact, and
+    /// a daemon that knew about it would have to decide what happens to it when the client
+    /// detaches mid-drag. Letting go of the mouse is the only thing that reaches the daemon.
+    pub carrying: Option<Carry>,
+    /// Where the left button went down on a memory row: a pick-up that has not yet moved far
+    /// enough to be a drag.
+    ///
+    /// Separate from `carrying` because a click and a drag start identically, and promoting on
+    /// the button-down would mean every click on a note put the panel into a drag you then had
+    /// to cancel.
+    pub press: Option<(crate::proto::MemoryId, u16, u16)>,
     /// Cursor, scroll, and nothing else — see `roster::SidebarState`.
     pub sidebar: roster::SidebarState,
     /// Where each landable roster row was drawn: row, column, width, and what it is. Rects
@@ -554,6 +567,8 @@ impl App {
             toasts: VecDeque::new(),
             tick: 0,
             sidebar_hits: Vec::new(),
+            carrying: None,
+            press: None,
             sidebar: roster::SidebarState::default(),
             roster_hits: Vec::new(),
             dashboard_hits: Vec::new(),
@@ -1470,6 +1485,16 @@ fn handle_key(
     // Typing means you have finished reading what you highlighted. Leaving it up while new
     // output arrives underneath points at text that is no longer there.
     app.selection = None;
+    // Escape is the way out of a drag, and it has to be checked before anything else does
+    // something with the key: a note stuck to the pointer with no way to put it down would be
+    // a mode you cannot leave. Any other key drops it too — you have moved on.
+    if app.carrying.is_some() {
+        app.carrying = None;
+        app.press = None;
+        if k.code == KeyCode::Esc {
+            return Ok(());
+        }
+    }
     let chord = Chord::new(k.modifiers, k.code);
 
     // Overlay modes consume keys entirely.
@@ -1485,7 +1510,7 @@ fn handle_key(
                 .as_ref()
                 .map(|s| {
                     let w = s.view.sidebar_width.saturating_sub(2);
-                    roster::filtered_rows(s, roster::Density::of(w), &lens)
+                    roster::cursor_rows(s, roster::Density::of(w), &lens)
                 })
                 .unwrap_or_default();
             let page = 10;
@@ -1499,9 +1524,7 @@ fn handle_key(
                 // Acts *and* exits, so the common path — glance, jump, type — never leaves
                 // you parked in a mode you then have to notice and leave.
                 KeyCode::Enter => {
-                    if let Some(f) = app.sidebar.cursor {
-                        let _ = out.send(ClientFrame::Command(f.activate()));
-                    }
+                    activate_cursor(app, out);
                     app.mode = Mode::Terminal;
                 }
                 KeyCode::Char(' ') | KeyCode::Char('h') | KeyCode::Char('l')
@@ -1621,7 +1644,7 @@ fn handle_key(
             let rows = app
                 .snapshot
                 .as_ref()
-                .map(|s| roster::filtered_rows(s, roster::Density::Wide, &lens))
+                .map(|s| roster::cursor_rows(s, roster::Density::Wide, &lens))
                 .unwrap_or_default();
             match k.code {
                 KeyCode::Char('j') | KeyCode::Down => app.sidebar.step(&rows, 1),
@@ -1633,9 +1656,7 @@ fn handle_key(
                 KeyCode::Char('g') | KeyCode::Home => app.sidebar.jump(&rows, false),
                 KeyCode::Char('G') | KeyCode::End => app.sidebar.jump(&rows, true),
                 KeyCode::Enter => {
-                    if let Some(f) = app.sidebar.cursor {
-                        let _ = out.send(ClientFrame::Command(f.activate()));
-                    }
+                    activate_cursor(app, out);
                     app.mode = Mode::Terminal;
                 }
                 KeyCode::Char('p') => {
@@ -4520,7 +4541,7 @@ fn run_action(
                 if let Some(snap) = app.snapshot.as_ref() {
                     let w = snap.view.sidebar_width.saturating_sub(2);
                     let rows =
-                        roster::filtered_rows(snap, roster::Density::of(w), &app.sidebar.lens);
+                        roster::cursor_rows(snap, roster::Density::of(w), &app.sidebar.lens);
                     app.sidebar.resolve(&rows);
                 }
             }
@@ -4546,7 +4567,7 @@ fn run_action(
             if app.sidebar.cursor.is_none() {
                 if let Some(snap) = app.snapshot.as_ref() {
                     let rows =
-                        roster::filtered_rows(snap, roster::Density::Wide, &app.sidebar.lens);
+                        roster::cursor_rows(snap, roster::Density::Wide, &app.sidebar.lens);
                     app.sidebar.resolve(&rows);
                 }
             }
@@ -4676,6 +4697,86 @@ fn tab_at(snap: &Snapshot, x: u16) -> Option<TabId> {
     None
 }
 
+/// The agent under the pointer, if there is one a note could be handed to.
+///
+/// Three things are a valid target and they are all the same thing seen from different
+/// angles: an agent's row in the sidebar, an agent's *project* row (which stands for the
+/// agent you are focused on in it), and the pane itself. Dropping on the pane is the one that
+/// makes the gesture feel like a gesture — the note goes to the thing you are looking at,
+/// rather than to a row that represents it.
+///
+/// A service is never a target. Handing a note to `npm run dev` would type prose into a
+/// process that is not reading, which the bus would refuse anyway; refusing it here means the
+/// drag says so while you can still change your mind.
+fn drop_target(
+    snap: &Snapshot,
+    hits: &[(u16, Hit)],
+    x: u16,
+    y: u16,
+) -> Option<(PaneId, String)> {
+    let agent_at = |pane: PaneId| -> Option<(PaneId, String)> {
+        snap.panes
+            .iter()
+            .find(|p| p.id == pane)
+            .and_then(|p| p.agent.as_ref())
+            .filter(|a| a.class == crate::proto::AgentClass::Agent)
+            .map(|a| (pane, a.name.clone()))
+    };
+    if snap.sidebar.contains(x, y) {
+        return match hits.iter().find(|(hy, _)| *hy == y).map(|(_, h)| *h) {
+            Some(Hit::Pane(id)) => agent_at(id),
+            // A project row stands for the agent you are in: dropping on `api-refactor` means
+            // "give it to whoever I am talking to over there", which is what you meant.
+            Some(Hit::Space(id)) | Some(Hit::Group(id)) => snap
+                .spaces
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.focused_tab)
+                .and_then(|t| snap.tabs.iter().find(|x| x.id == t))
+                .and_then(|t| t.focused_pane)
+                .and_then(agent_at),
+            _ => None,
+        };
+    }
+    snap.panes
+        .iter()
+        .find(|p| !p.cell.is_empty() && p.cell.contains(x, y))
+        .and_then(|p| agent_at(p.id))
+}
+
+/// A note in transit between the sidebar and an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Carry {
+    pub memory: crate::proto::MemoryId,
+    /// What to call it while it is in the air.
+    pub name: String,
+    /// What is under the pointer right now, when it is something this can be dropped on.
+    ///
+    /// Resolved as the pointer moves rather than when it is released, because a drag with no
+    /// feedback is a guess: you have to be able to see that you are over `builder` before you
+    /// let go, not find out afterwards from a message in its pane.
+    pub over: Option<(PaneId, String)>,
+}
+
+/// Press enter on whatever the sidebar cursor is on.
+///
+/// A row that has nothing to do says why. The one case that can fail is a note with no agent
+/// focused, and it has to be *said*: a keypress that silently does nothing reads as a
+/// keybinding that is broken, not as a target that is missing.
+fn activate_cursor(app: &mut App, out: &mpsc::UnboundedSender<ClientFrame>) {
+    let Some(f) = app.sidebar.cursor else { return };
+    let Some(snap) = app.snapshot.as_ref() else { return };
+    match f.activate(snap) {
+        Some(cmd) => {
+            let _ = out.send(ClientFrame::Command(cmd));
+        }
+        None => app.toast(
+            NoticeLevel::Warn,
+            "focus an agent first, or drag the note onto one",
+        ),
+    }
+}
+
 fn tid_index(space: &crate::proto::SpaceInfo, tab: TabId) -> usize {
     space.tabs.iter().position(|&t| t == tab).unwrap_or(0)
 }
@@ -4720,13 +4821,62 @@ fn handle_mouse(
         return Ok(());
     }
 
+    // -- carrying a note ---------------------------------------------------
+    //
+    // Before every other branch, because a drag that began on a memory row is not a text
+    // selection, not a pane click, and not the sidebar's own wheel handling — and each of
+    // those branches returns early, so anything checked after them is never reached.
+    match m.kind {
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Promote a press to a carry only once the pointer has actually left the row it
+            // started on. A click and a drag begin identically, and promoting on the button
+            // press would put the panel into a drag every time you clicked a note.
+            if let Some((id, px, py)) = app.press {
+                if x != px || y != py {
+                    let name = snap
+                        .memories
+                        .iter()
+                        .find(|n| n.id == id)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_default();
+                    app.carrying = Some(Carry { memory: id, name, over: None });
+                    app.press = None;
+                }
+            }
+            if app.carrying.is_some() {
+                let over = drop_target(&snap, &app.sidebar_hits, x, y);
+                if let Some(c) = app.carrying.as_mut() {
+                    c.over = over;
+                }
+                return Ok(());
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.press = None;
+            let landed = drop_target(&snap, &app.sidebar_hits, x, y);
+            if let Some(c) = app.carrying.take() {
+                // Dropping on nothing is how you change your mind, so it is silent.
+                if let Some((pane, name)) = landed {
+                    let _ = out.send(ClientFrame::Command(Cmd::GiveMemory {
+                        memory: c.memory,
+                        to: pane,
+                    }));
+                    app.toast(NoticeLevel::Info, format!("{} → {name}", c.name));
+                }
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+
     // Right-click opens a context menu for whatever is under the cursor.
     if matches!(m.kind, MouseEventKind::Down(MouseButton::Right)) {
         let target = if snap.sidebar.contains(x, y) {
             match app.sidebar_hits.iter().find(|(hy, _)| *hy == y) {
                 Some((_, Hit::Space(id))) | Some((_, Hit::Group(id))) => Target::Space(*id),
                 Some((_, Hit::Pane(id))) => Target::Agent(*id),
-                None => Target::Root,
+                // A note has no context menu of its own yet; the panel's is still right.
+                Some((_, Hit::Memory(_))) | None => Target::Root,
             }
         } else if snap.tabbar.contains(x, y) {
             match tab_at(&snap, x) {
@@ -4770,7 +4920,7 @@ fn handle_mouse(
                     .find(|(hy, hx, w, _)| *hy == y && x >= *hx && x < hx + w)
                 {
                     app.sidebar.cursor = Some(*f);
-                    let _ = out.send(ClientFrame::Command(f.activate()));
+                    activate_cursor(app, out);
                     app.mode = Mode::Terminal;
                 }
             }
@@ -4901,6 +5051,14 @@ fn handle_mouse(
                         Hit::Group(id) => {
                             app.sidebar.cursor = Some(Focus::Group(id));
                             Some(Cmd::ToggleSpaceCollapsed(id))
+                        }
+                        // Picking one up, not going anywhere: a note is not a place. The
+                        // press is only remembered — it becomes a drag if the pointer moves,
+                        // and nothing at all if it does not, so a click still just selects.
+                        Hit::Memory(id) => {
+                            app.sidebar.cursor = Some(Focus::Memory(id));
+                            app.press = Some((id, x, y));
+                            None
                         }
                     };
                     if let Some(cmd) = cmd {
@@ -5145,6 +5303,7 @@ mod tests {
             cards_due: 0,
             triggers_armed: 0,
             recents: Vec::new(),
+            memories: Vec::new(),
         };
 
         // Walk the bar and collect which tab each column maps to.
@@ -5288,6 +5447,125 @@ mod tests {
             .into_iter()
             .filter(|c| matches!(c, Cmd::VaultSave { .. } | Cmd::FileSave { .. }))
             .collect()
+    }
+
+    /// A session with a note saved in `api-refactor`, and the sidebar hits the renderer would
+    /// have recorded for it. Built by hand rather than by rendering, because these tests are
+    /// about what the mouse handler does with a hit table, not about how one is produced.
+    fn app_with_memory() -> App {
+        let mut app = app_with_snapshot();
+        let snap = app.snapshot.as_mut().unwrap();
+        snap.memories = vec![crate::proto::MemoryInfo {
+            id: 7,
+            space: 1,
+            name: "api-shape".into(),
+            title: "API shape".into(),
+            bytes: 100,
+            age: 60,
+        }];
+        snap.sidebar = crate::proto::Rect { x: 0, y: 0, w: 24, h: 40 };
+        // builder is pane 1, in api-refactor.
+        app.sidebar_hits = vec![(5, Hit::Memory(7)), (9, Hit::Pane(1)), (10, Hit::Pane(3))];
+        app
+    }
+
+    /// Dispatch one mouse event and collect the commands it produced.
+    fn mouse_cmds(app: &mut App, kind: MouseEventKind, x: u16, y: u16) -> Vec<Cmd> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ev = crossterm::event::MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE };
+        handle_mouse(app, ev, &tx).unwrap();
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            out.push(f);
+        }
+        cmds(out)
+    }
+
+    /// The gesture, end to end.
+    #[test]
+    fn dragging_a_note_onto_an_agent_hands_it_over() {
+        let mut app = app_with_memory();
+        assert!(mouse_cmds(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 5).is_empty());
+        mouse_cmds(&mut app, MouseEventKind::Drag(MouseButton::Left), 6, 7);
+        assert!(app.carrying.is_some(), "the press should have become a carry");
+        // Over builder's row: the bar has to be able to name the target before you let go.
+        mouse_cmds(&mut app, MouseEventKind::Drag(MouseButton::Left), 6, 9);
+        assert_eq!(
+            app.carrying.as_ref().unwrap().over.as_ref().map(|(p, n)| (*p, n.clone())),
+            Some((1, "builder".to_string()))
+        );
+        let out = mouse_cmds(&mut app, MouseEventKind::Up(MouseButton::Left), 6, 9);
+        assert_eq!(out, vec![Cmd::GiveMemory { memory: 7, to: 1 }]);
+        assert!(app.carrying.is_none());
+    }
+
+    /// A click and a drag begin identically. Promoting on the button press would put the panel
+    /// into a drag every time you clicked a note.
+    #[test]
+    fn clicking_a_note_without_moving_selects_it_rather_than_dragging() {
+        let mut app = app_with_memory();
+        mouse_cmds(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 5);
+        assert!(app.carrying.is_none());
+        assert_eq!(app.sidebar.cursor, Some(Focus::Memory(7)));
+        let out = mouse_cmds(&mut app, MouseEventKind::Up(MouseButton::Left), 4, 5);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(app.press.is_none());
+    }
+
+    /// Dropping on nothing is how you change your mind, so it is silent and sends nothing.
+    #[test]
+    fn dropping_a_note_on_nothing_is_how_you_cancel() {
+        let mut app = app_with_memory();
+        mouse_cmds(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 5);
+        mouse_cmds(&mut app, MouseEventKind::Drag(MouseButton::Left), 6, 20);
+        let out = mouse_cmds(&mut app, MouseEventKind::Up(MouseButton::Left), 6, 20);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(app.carrying.is_none());
+    }
+
+    /// A pane with no agent in it is not a target: pane 3 is a bare shell.
+    #[test]
+    fn a_pane_with_no_agent_is_not_something_to_drop_a_note_on() {
+        let mut app = app_with_memory();
+        mouse_cmds(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 5);
+        mouse_cmds(&mut app, MouseEventKind::Drag(MouseButton::Left), 6, 10);
+        assert_eq!(app.carrying.as_ref().unwrap().over, None);
+        assert!(mouse_cmds(&mut app, MouseEventKind::Up(MouseButton::Left), 6, 10).is_empty());
+    }
+
+    /// A note stuck to the pointer with no way to put it down would be a mode you cannot leave.
+    #[test]
+    fn escape_puts_a_carried_note_back_down() {
+        let mut app = app_with_memory();
+        mouse_cmds(&mut app, MouseEventKind::Down(MouseButton::Left), 4, 5);
+        mouse_cmds(&mut app, MouseEventKind::Drag(MouseButton::Left), 6, 7);
+        assert!(app.carrying.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.carrying.is_none());
+    }
+
+    /// The keyboard's half of the same command: enter gives the note to whoever you are
+    /// looking at, so the gesture is not the only way in.
+    #[test]
+    fn enter_on_a_note_hands_it_to_the_focused_agent() {
+        let mut app = app_with_memory();
+        app.sidebar.cursor = Some(Focus::Memory(7));
+        app.mode = Mode::Sidebar;
+        let out = cmds(press(&mut app, KeyCode::Enter));
+        assert_eq!(out, vec![Cmd::GiveMemory { memory: 7, to: 1 }]);
+    }
+
+    /// A keypress that silently does nothing reads as a broken keybinding, not as a missing
+    /// target.
+    #[test]
+    fn enter_on_a_note_with_no_agent_focused_says_why() {
+        let mut app = app_with_memory();
+        app.snapshot.as_mut().unwrap().focused_pane = Some(3); // the bare shell
+        app.sidebar.cursor = Some(Focus::Memory(7));
+        app.mode = Mode::Sidebar;
+        let out = cmds(press(&mut app, KeyCode::Enter));
+        assert!(out.is_empty(), "{out:?}");
+        assert!(!app.toasts.is_empty(), "nothing explained the no-op");
     }
 
     fn cmds(frames: Vec<ClientFrame>) -> Vec<Cmd> {

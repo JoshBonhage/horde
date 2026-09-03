@@ -53,6 +53,23 @@ fn worktree_origin(eng: &Engine, req: &Request) -> Result<std::path::PathBuf, Er
         .ok_or_else(|| failed("no pane to take a directory from"))
 }
 
+/// The project a memory operation is about: the caller's *space*, not its pane.
+///
+/// The difference is the whole point. An agent in `.horde/worktrees/builder` is working on
+/// the project, and a note it saves is about the project — writing it into the worktree would
+/// put it somewhere that is deleted when the worktree is, and hide it from every other agent
+/// on the same codebase.
+fn memory_project(eng: &Engine, req: &Request) -> Result<std::path::PathBuf, Err_> {
+    let pane = pane_arg(eng, req, "from")
+        .or_else(|| eng.session.focused_pane())
+        .ok_or_else(|| failed("no pane to take a project from"))?;
+    let space = eng.session.panes.get(&pane).map(|p| p.space);
+    space
+        .and_then(|id| eng.session.space(id))
+        .map(|s| s.cwd.clone())
+        .ok_or_else(|| failed("no project for that pane"))
+}
+
 fn bad(msg: impl Into<String>) -> Err_ {
     Err_ { code: "bad_request", message: msg.into() }
 }
@@ -212,7 +229,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         // -- spaces ------------------------------------------------------
         "space.list" => {
             let cfg = eng.cfg.clone();
-            Ok(json!(eng.session.snapshot(&cfg, &eng.repos).spaces))
+            Ok(json!(eng.session.snapshot(&cfg, &eng.repos, &eng.notes).spaces))
         }
         "space.create" => {
             let cwd = str_arg(req, "cwd")
@@ -290,7 +307,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         // -- tabs --------------------------------------------------------
         "tab.list" => {
             let cfg = eng.cfg.clone();
-            Ok(json!(eng.session.snapshot(&cfg, &eng.repos).tabs))
+            Ok(json!(eng.session.snapshot(&cfg, &eng.repos, &eng.notes).tabs))
         }
         "tab.create" => {
             let space = eng
@@ -334,7 +351,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         // for both kinds rather than only for programs.
         "pane.list" => {
             let cfg = eng.cfg.clone();
-            Ok(json!(eng.session.snapshot(&cfg, &eng.repos).panes))
+            Ok(json!(eng.session.snapshot(&cfg, &eng.repos, &eng.notes).panes))
         }
         "pane.current" => Ok(json!({ "pane": eng.session.focused_pane() })),
         "pane.split" => {
@@ -551,6 +568,9 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                             // "agent" or "service". A dev server appears in the roster
                             // because you want to see it; it is not one of your agents.
                             "class": a.class,
+                            // Where a service is answering, when its screen said. Null for
+                            // an agent, which has no address to give.
+                            "endpoint": a.endpoint,
                             "state": a.state.label(),
                             "elapsed": a.since.elapsed().as_secs(),
                             "authority": a.authority,
@@ -898,6 +918,89 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
 
         // -- tasks -------------------------------------------------------
         // A board agents pull from, rather than a queue you push to. See daemon/tasks.rs.
+        // -- memory ---------------------------------------------------------------------
+        //
+        // Scoped to the caller's *project* the way the board is, and for the same reason: a
+        // note is knowledge about a codebase, and an agent saving one from a worktree is still
+        // writing about the project, not about its checkout. `memory_project` therefore walks
+        // to the space, never to the pane's own directory.
+        "memory.save" => {
+            let name = str_arg(req, "name").ok_or_else(|| bad("name required"))?.to_string();
+            let body = str_arg(req, "body").ok_or_else(|| bad("body required"))?.to_string();
+            let project = memory_project(eng, req)?;
+            let path = super::memory::save(&project, &name, &body)
+                .map_err(|e| failed(e.to_string()))?;
+            // Rather than waiting out the refresh: a note you just saved that does not appear
+            // for three seconds reads as a save that failed.
+            eng.notes.invalidate(&project);
+            eng.touch();
+            Ok(json!({ "name": name, "path": path, "bytes": body.len() }))
+        }
+        "memory.list" => {
+            let project = memory_project(eng, req)?;
+            let notes: Vec<serde_json::Value> = eng
+                .notes
+                .get(&project)
+                .iter()
+                .map(|n| {
+                    json!({
+                        "id": n.id,
+                        "name": n.name,
+                        "title": n.title,
+                        "path": n.path,
+                        "bytes": n.bytes,
+                        "age": n.modified.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+                    })
+                })
+                .collect();
+            Ok(json!(notes))
+        }
+        "memory.show" => {
+            let name = str_arg(req, "name").ok_or_else(|| bad("name required"))?;
+            let project = memory_project(eng, req)?;
+            let body = super::memory::read(&project, name).map_err(|e| not_found(e.to_string()))?;
+            Ok(json!({ "name": name, "body": body }))
+        }
+        "memory.rm" => {
+            let name = str_arg(req, "name").ok_or_else(|| bad("name required"))?;
+            let project = memory_project(eng, req)?;
+            let path =
+                super::memory::remove(&project, name).map_err(|e| not_found(e.to_string()))?;
+            eng.notes.invalidate(&project);
+            eng.touch();
+            Ok(json!({ "removed": path }))
+        }
+        "memory.give" => {
+            // The CLI's half of the sidebar's drag. By *name*, because that is what a person
+            // types and what an agent knows a note by; ids exist for the cursor, not for you.
+            let name = str_arg(req, "name").ok_or_else(|| bad("name required"))?;
+            let to = str_arg(req, "to").ok_or_else(|| bad("to required"))?;
+            let project = memory_project(eng, req)?;
+            let note = eng
+                .notes
+                .get(&project)
+                .iter()
+                .find(|n| n.name == name)
+                .cloned()
+                .ok_or_else(|| not_found(format!("no memory called {name:?}")))?;
+            let target = super::bus::Bus::resolve(&eng.session, to)
+                .ok_or_else(|| not_found(format!("no agent called {to:?}")))?;
+            let cwd = eng
+                .session
+                .panes
+                .get(&target)
+                .map(|p| p.cwd.clone())
+                .unwrap_or_else(|| project.clone());
+            let text = super::memory::handover_text(&note, &project, &cwd);
+            let cfg = eng.cfg.clone();
+            let msg = eng
+                .bus
+                .send(&mut eng.session, &cfg, super::bus::Outgoing::plain(None, to, &text))
+                .map_err(|e| failed(e.to_string()))?;
+            eng.touch();
+            let queued = msg.delivery == crate::proto::Delivery::Queued;
+            Ok(json!({ "name": note.name, "to": to, "queued": queued }))
+        }
         "task.add" => {
             let text = str_arg(req, "text").ok_or_else(|| bad("text required"))?;
             let from = pane_arg(eng, req, "from");

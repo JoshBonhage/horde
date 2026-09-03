@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 pub type SpaceId = u32;
 pub type TabId = u32;
 pub type PaneId = u32;
+/// A saved note. Minted by the daemon per file path and never reused — a stale click must not
+/// land on a different note than the one it was aimed at.
+pub type MemoryId = u64;
 
 /// Bumped when the wire format changes incompatibly. The client refuses to attach to a
 /// daemon that disagrees, which is the whole reason both halves ship in one binary.
@@ -23,7 +26,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -404,6 +407,15 @@ pub struct AgentInfo {
     /// What it is waiting on, when it is blocked and the prompt could be read.
     #[serde(default)]
     pub question: Option<Question>,
+    /// Where a service is answering, lifted off its screen: `:5173`, `:3000`.
+    ///
+    /// The counterpart of `question`, and here for the same reason. A blocked agent's row
+    /// has one useful thing to say and it is what it asked; a service's row has one useful
+    /// thing to say and it is the port, because "serving" is a fact you already knew from
+    /// the glyph. Only the daemon can read it — the client draws the focused tab and nothing
+    /// else, so the three servers in other tabs are exactly the ones it could never see.
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,6 +539,9 @@ pub struct Snapshot {
     /// deciding what this session has been working on.
     #[serde(default)]
     pub recents: Vec<RecentProject>,
+    /// Every project's saved notes, in the order the sidebar lists them.
+    #[serde(default)]
+    pub memories: Vec<MemoryInfo>,
 }
 
 /// A project the session has opened before.
@@ -541,6 +556,26 @@ pub struct RecentProject {
     /// offering to reopen something already on screen.
     #[serde(default)]
     pub live: bool,
+}
+
+/// One of a project's saved notes — `.horde/memory/<name>.md` — as the sidebar sees it.
+///
+/// The body is deliberately absent. A snapshot is replaced wholesale every frame and goes to
+/// every attached client, so carrying the text of every note would put a project's whole
+/// memory directory on the wire sixty times a second to render a list of titles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryInfo {
+    /// Stable for the life of the daemon, so a cursor or a half-finished drag still points at
+    /// the note it started on after the directory is rescanned.
+    pub id: MemoryId,
+    pub space: SpaceId,
+    /// How it is addressed: `horde memory show api-shape`.
+    pub name: String,
+    /// Its first heading, for a row with room for more than a filename.
+    pub title: String,
+    pub bytes: u64,
+    /// Seconds since it was written.
+    pub age: u64,
 }
 
 /// Panel visibility. Lives in the daemon so geometry has exactly one owner.
@@ -753,6 +788,11 @@ pub enum Cmd {
     /// Rename a column, carrying its cards. The configured list is the client's to edit; this
     /// is the daemon-side half that keeps the cards from being orphaned by that edit.
     ColumnRename { from: String, to: String },
+
+    /// Hand one of a project's saved notes to an agent: the sidebar's drag-and-drop, and the
+    /// enter key on a memory row. Delivered through the bus, so it queues behind a turn and
+    /// never answers a pending prompt.
+    GiveMemory { memory: MemoryId, to: PaneId },
 }
 
 // Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
@@ -1342,7 +1382,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 22, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 23, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the
@@ -1417,7 +1457,8 @@ mod digest_tests {
                 | Cmd::CardComment { .. }
                 | Cmd::CardArchive { .. }
                 | Cmd::CardHandOff { .. }
-                | Cmd::ColumnRename { .. } => {}
+                | Cmd::ColumnRename { .. }
+                | Cmd::GiveMemory { .. } => {}
             }
         }
 
@@ -1472,6 +1513,7 @@ mod digest_tests {
                 cards_due: _,
                 triggers_armed: _,
                 recents: _,
+                memories: _,
             } = snap;
             let PaneInfo {
                 id: _,

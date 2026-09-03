@@ -7,8 +7,10 @@
 pub mod approvals;
 pub mod agents;
 pub mod bus;
+pub mod compaction;
 pub mod digest;
 pub mod files;
+pub mod endpoint;
 pub mod handoff;
 pub mod journal;
 pub mod kanban;
@@ -22,6 +24,7 @@ pub mod lsp;
 /// is a mistake — a video frame, a raw scan — and a vault is a directory on somebody's disk.
 const MAX_ATTACHMENT: usize = 8 * 1024 * 1024;
 pub mod manifest;
+pub mod memory;
 pub mod notify;
 pub mod pane;
 pub mod persist;
@@ -139,6 +142,9 @@ pub struct Engine {
     /// Which client is waiting on a completion. One at a time, because a second request means
     /// the cursor moved and the first answer is already wrong.
     lsp_asked: Option<ClientId>,
+    /// Each project's saved notes, on their own slow cadence for the same reason `repos` is:
+    /// a directory read per frame would be a filesystem hit in the render path.
+    pub notes: memory::Store,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
     dirty_shape: bool,
@@ -219,7 +225,7 @@ impl Engine {
     /// someone believes the answer.
     pub fn snapshot(&self) -> crate::proto::Snapshot {
         let cfg = self.cfg.clone();
-        let mut s = self.session.snapshot(&cfg, &self.repos);
+        let mut s = self.session.snapshot(&cfg, &self.repos, &self.notes);
         s.tasks_open = self.board.open_count();
         s.tasks_claimed = self.board.claimed_count();
         // Twelve hours ahead, which is "today" without any calendar arithmetic: a card due
@@ -682,6 +688,48 @@ impl Engine {
         events
     }
 
+    /// Tell agents that are nearly out of context to save a memory before they compact.
+    ///
+    /// The one thing horde does on its own for this feature, and gated on `agents.memory_nudge`
+    /// for the same reason `task_nudge` is: it types into an agent's conversation without being
+    /// asked, and that is worth opting into rather than discovering.
+    ///
+    /// Through the bus, which means it *queues* — the agent is mid-turn when the warning
+    /// appears, and injecting there would race whatever it is emitting. It lands at the next
+    /// prompt, which is early enough: the compaction happens when the turn after that fills up.
+    ///
+    /// One per agent per fill-up. `memory_nudged` is set before the send, so a delivery failure
+    /// cannot produce a loop, and cleared in detection the moment the warning leaves the screen.
+    fn nudge_for_memory(&mut self) -> Vec<Event> {
+        if !self.cfg.memory_nudge {
+            return Vec::new();
+        }
+        let due: Vec<(PaneId, String)> = self
+            .session
+            .panes
+            .values()
+            .filter(|p| p.exited.is_none())
+            .filter_map(|p| p.agent.as_ref().map(|a| (p.id, a)))
+            // A service has no conversation to lose, and nothing to write a note with.
+            .filter(|(_, a)| a.class == crate::proto::AgentClass::Agent)
+            .filter(|(_, a)| a.context_low && a.memory_nudged.is_none())
+            .map(|(id, a)| (id, a.name.clone()))
+            .collect();
+
+        let mut events = Vec::new();
+        for (pane, name) in due {
+            if let Some(a) = self.session.panes.get_mut(&pane).and_then(|p| p.agent.as_mut()) {
+                a.memory_nudged = Some(std::time::Instant::now());
+            }
+            let body = compaction::nudge(&name);
+            let Engine { bus, session, cfg, .. } = self;
+            if let Ok(m) = bus.send(session, cfg, bus::Outgoing::plain(None, &name, &body)) {
+                events.push(Event::BusMessage(m));
+            }
+        }
+        events
+    }
+
     /// Hand over every card whose armed window has arrived.
     ///
     /// Run from the same slow sweep as [`Self::nudge_for_tasks`], because both are the same
@@ -1033,6 +1081,7 @@ async fn engine_loop(
         lsp: lsp::Registry::new(),
         lsp_paths: HashMap::new(),
         lsp_asked: None,
+        notes: memory::Store::default(),
         cfg,
         clients: HashMap::new(),
         dirty_shape: true,
@@ -1744,6 +1793,11 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         Cmd::TogglePanePinned(pane) => {
             eng.session.toggle_pane_pinned(pane, None);
         }
+        Cmd::GiveMemory { memory, to } => {
+            if let Err(e) = give_memory(eng, memory, to) {
+                problems.push((NoticeLevel::Warn, e.to_string()));
+            }
+        }
     }
 
     if let Some(p) = seen {
@@ -1819,6 +1873,7 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         // And hand over any card whose armed window has arrived. The same clock, because it
         // is the same question — is there something an agent should be told about.
         eng.hand_over_due_cards();
+        events.extend(eng.nudge_for_memory());
         let changed = !events.is_empty();
         for ev in events {
             eng.pending_events.push(ev);
@@ -2277,6 +2332,39 @@ fn advance_spent_models(eng: &mut Engine) {
     }
 }
 
+/// Hand a saved note to an agent.
+///
+/// Through the bus rather than by writing at the pane directly, and that is the whole reason
+/// this is three lines of routing instead of one `write_input`: the bus already knows that an
+/// agent mid-turn must be queued, and that an agent at a permission prompt must *never* be
+/// typed at, because text plus a newline would answer a question nobody read. A drag that
+/// approved a file deletion because you dropped a note on the wrong row would be the worst
+/// bug this feature could have.
+fn give_memory(eng: &mut Engine, memory: crate::proto::MemoryId, to: PaneId) -> Result<()> {
+    let note = eng.notes.find(memory).cloned().ok_or_else(|| anyhow!("no such memory"))?;
+    let pane = eng.session.panes.get(&to).ok_or_else(|| anyhow!("no such pane"))?;
+    let agent = pane
+        .agent
+        .as_ref()
+        .filter(|a| a.class == crate::proto::AgentClass::Agent)
+        .ok_or_else(|| anyhow!("nothing to hand it to in that pane"))?;
+    // The project the note belongs to, not the agent's own directory: an agent in a worktree
+    // is working on this project and the note is still this project's.
+    let project = eng
+        .session
+        .spaces
+        .iter()
+        .find(|s| eng.session.tab(pane.tab).is_some_and(|t| t.space == s.id))
+        .map(|s| s.cwd.clone())
+        .unwrap_or_else(|| pane.cwd.clone());
+    let text = memory::handover_text(&note, &project, &pane.cwd);
+    let name = agent.name.clone();
+    let cfg = eng.cfg.clone();
+    // `from_pane: None` — it came from you, at the sidebar, not from another agent.
+    eng.bus.send(&mut eng.session, &cfg, bus::Outgoing::plain(None, &name, &text))?;
+    Ok(())
+}
+
 fn refresh_repos(eng: &mut Engine) {
     let mut dirs: Vec<std::path::PathBuf> =
         eng.session.spaces.iter().map(|s| s.cwd.clone()).collect();
@@ -2287,6 +2375,14 @@ fn refresh_repos(eng: &mut Engine) {
         eng.repos.get(d);
     }
     eng.repos.retain(|k| dirs.iter().any(|d| d == k));
+
+    // Notes are per *project*, not per pane: a worktree holds a checkout, not a memory.
+    let projects: Vec<std::path::PathBuf> =
+        eng.session.spaces.iter().map(|s| s.cwd.clone()).collect();
+    for d in &projects {
+        eng.notes.get(d);
+    }
+    eng.notes.retain(|k| projects.iter().any(|d| d == k));
 }
 
 /// How many notes one pass may parse, across every vault.
@@ -3027,6 +3123,7 @@ mod tests {
             lsp: lsp::Registry::new(),
             lsp_paths: HashMap::new(),
             lsp_asked: None,
+            notes: memory::Store::default(),
             cfg,
             clients: HashMap::new(),
             dirty_shape: true,
@@ -3203,9 +3300,12 @@ mod tests {
             session_id: None,
             queued: Vec::new(),
             question: None,
+            endpoint: None,
             activity: Default::default(),
             touched: Default::default(),
             nudged_since: None,
+            memory_nudged: None,
+            context_low: false,
             alerted_since: None,
         });
 
@@ -3843,9 +3943,12 @@ mod tests {
             session_id: None,
             queued: Vec::new(),
             question: None,
+            endpoint: None,
             activity: Default::default(),
             touched: Default::default(),
             nudged_since: None,
+            memory_nudged: None,
+            context_low: false,
             alerted_since: None,
         });
     }
@@ -3908,7 +4011,7 @@ mod tests {
         let cfg = eng.cfg.clone();
         let info = eng
             .session
-            .snapshot(&cfg, &eng.repos)
+            .snapshot(&cfg, &eng.repos, &eng.notes)
             .panes
             .into_iter()
             .find(|p| p.id == pane)
@@ -3940,9 +4043,12 @@ mod tests {
             session_id: None,
             queued: Vec::new(),
             question: None,
+            endpoint: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                memory_nudged: None,
+                context_low: false,
                 alerted_since: None,
         });
 
@@ -4026,9 +4132,12 @@ mod tests {
                 session_id: None,
                 queued: Vec::new(),
                 question: None,
+                endpoint: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                memory_nudged: None,
+                context_low: false,
                 alerted_since: None,
             });
         }
@@ -4241,9 +4350,12 @@ mod tests {
                 session_id: None,
                 queued: Vec::new(),
                 question: None,
+                endpoint: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                memory_nudged: None,
+                context_low: false,
                 alerted_since: None,
             });
         }
@@ -4383,6 +4495,109 @@ mod tests {
             nudge_bodies(&eng.nudge_for_tasks()).is_empty(),
             "it has work; a second task can wait for someone free"
         );
+        kill_all(&mut eng);
+    }
+
+    // -- the memory nudge ----------------------------------------------------------------
+
+    /// One agent, low on context, with the nudge switched on.
+    fn engine_low_on_context(tag: &str) -> Engine {
+        let mut eng = engine_with_idle_agents(tag, 1);
+        eng.cfg.memory_nudge = true;
+        for p in eng.session.panes.values_mut() {
+            if let Some(a) = p.agent.as_mut() {
+                a.context_low = true;
+            }
+        }
+        eng
+    }
+
+    #[test]
+    fn an_agent_nearly_out_of_context_is_told_to_save_a_memory() {
+        let mut eng = engine_low_on_context("mem-basic");
+        let sent = nudge_bodies(&eng.nudge_for_memory());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].1.contains("horde memory save worker0-context"), "{sent:?}");
+        kill_all(&mut eng);
+    }
+
+    /// The gate. Everything else about memories works with this off; this is the half that
+    /// types into an agent's conversation unasked.
+    #[test]
+    fn nothing_is_said_while_the_nudge_is_switched_off() {
+        let mut eng = engine_low_on_context("mem-off");
+        eng.cfg.memory_nudge = false;
+        assert!(nudge_bodies(&eng.nudge_for_memory()).is_empty());
+        kill_all(&mut eng);
+    }
+
+    #[test]
+    fn one_fill_up_earns_exactly_one_nudge() {
+        let mut eng = engine_low_on_context("mem-once");
+        assert_eq!(nudge_bodies(&eng.nudge_for_memory()).len(), 1);
+        for _ in 0..3 {
+            assert!(
+                nudge_bodies(&eng.nudge_for_memory()).is_empty(),
+                "an agent staring at the same warning must not be told again"
+            );
+        }
+        kill_all(&mut eng);
+    }
+
+    /// The bug the smoke test found: clearing the flag the moment the warning left the screen
+    /// re-armed on a redraw, and one fill-up earned two nudges thirty seconds apart. Detection
+    /// now waits out the cooldown before re-arming, so a flicker changes nothing.
+    #[test]
+    fn a_warning_that_flickers_does_not_earn_a_second_nudge() {
+        let mut eng = engine_low_on_context("mem-flicker");
+        assert_eq!(nudge_bodies(&eng.nudge_for_memory()).len(), 1);
+        // The status line blinks out for a tick and comes straight back, which is what a
+        // redraw looks like to a detector.
+        for low in [false, true] {
+            for p in eng.session.panes.values_mut() {
+                if let Some(a) = p.agent.as_mut() {
+                    a.context_low = low;
+                    // What detection does, with no time having passed.
+                    if !low {
+                        if let Some(at) = a.memory_nudged {
+                            if at.elapsed() >= agents::MEMORY_NUDGE_COOLDOWN {
+                                a.memory_nudged = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(nudge_bodies(&eng.nudge_for_memory()).is_empty());
+        kill_all(&mut eng);
+    }
+
+    /// A genuine compaction is a warning gone for long enough that the next fill-up is a new
+    /// one, and that one has to be worth telling about.
+    #[test]
+    fn a_fresh_fill_up_after_a_compaction_is_told_again() {
+        let mut eng = engine_low_on_context("mem-again");
+        assert_eq!(nudge_bodies(&eng.nudge_for_memory()).len(), 1);
+        for p in eng.session.panes.values_mut() {
+            if let Some(a) = p.agent.as_mut() {
+                // What detection does once the cooldown has passed with the warning gone.
+                a.memory_nudged = None;
+            }
+        }
+        assert_eq!(nudge_bodies(&eng.nudge_for_memory()).len(), 1);
+        kill_all(&mut eng);
+    }
+
+    /// A dev server has no conversation to lose and nothing to write a note with.
+    #[test]
+    fn a_service_is_never_told_to_save_a_memory() {
+        let mut eng = engine_low_on_context("mem-service");
+        for p in eng.session.panes.values_mut() {
+            if let Some(a) = p.agent.as_mut() {
+                a.class = crate::proto::AgentClass::Service;
+            }
+        }
+        assert!(nudge_bodies(&eng.nudge_for_memory()).is_empty());
         kill_all(&mut eng);
     }
 

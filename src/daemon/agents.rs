@@ -20,6 +20,13 @@ use crate::proto::{AgentClass, AgentState, Event, PaneId};
 use super::manifest::{self, Manifest, Screen, Verdict};
 use super::state::{AgentRuntime, Session};
 
+/// How long after a nudge the same agent may earn another.
+///
+/// Long enough to cover a compaction and the turn that follows it, which is the soonest a
+/// genuinely fresh fill-up could arrive. Short enough that an agent left running all day and
+/// ignoring the nudge is eventually told again.
+pub const MEMORY_NUDGE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
 /// How long a hook report stays authoritative. If an integration is installed but the
 /// agent stops reporting (crash, killed mid-run), horde falls back to the screen manifest
 /// rather than showing a stale state forever.
@@ -113,9 +120,12 @@ impl Detector {
             session_id: None,
             queued: Vec::new(),
             question: None,
+            endpoint: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                memory_nudged: None,
+                context_low: false,
                 alerted_since: None,
         });
         if session_id.is_some() {
@@ -250,9 +260,12 @@ impl Detector {
                 session_id: None,
                 queued: Vec::new(),
                 question: None,
+                endpoint: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                memory_nudged: None,
+                context_low: false,
                 alerted_since: None,
             });
 
@@ -300,6 +313,44 @@ impl Detector {
                 AgentState::Blocked => super::question::extract(&lines),
                 _ => None,
             };
+
+            // Where a service is answering, for the same reason and in the same place.
+            //
+            // Sticky, unlike `question`, and that is the whole difference between them. A
+            // question is cleared the moment the prompt goes because answering a stale one
+            // is a real harm; an address is printed once at startup and then buried under
+            // request logs, so re-reading a screen that has scrolled past it must not blank
+            // a port that is still perfectly live. It is replaced when the screen says
+            // something newer, and dropped only when the service itself does.
+            if agent.class == AgentClass::Service {
+                if let Some(found) = super::endpoint::extract(&lines) {
+                    agent.endpoint = Some(found);
+                }
+            } else {
+                // A pane that changed hands from a server to an agent must not keep the
+                // server's port on its row.
+                agent.endpoint = None;
+            }
+
+            // Whether it is about to lose this conversation. Read here for the third time for
+            // the same reason as the two above: this is the one place holding the screen.
+            //
+            // The flag is cleared the moment the warning leaves the screen, which is what
+            // makes the nudge fire once per fill-up rather than once per session: an agent
+            // that compacts, works, and fills up again gets told again, and one staring at the
+            // same warning for an hour does not.
+            let pressure = super::compaction::pressure(&lines);
+            agent.context_low = matches!(pressure, Some(super::compaction::Pressure::Low { .. }));
+            // Re-arm only once the warning has been gone for the whole cooldown. Clearing the
+            // moment it left the screen re-armed on a redraw, which is how one fill-up earned
+            // two nudges.
+            if !agent.context_low {
+                if let Some(at) = agent.memory_nudged {
+                    if at.elapsed() >= MEMORY_NUDGE_COOLDOWN {
+                        agent.memory_nudged = None;
+                    }
+                }
+            }
         }
 
         events
@@ -544,9 +595,12 @@ mod tests {
             session_id: None,
             queued: Vec::new(),
             question: None,
+            endpoint: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                memory_nudged: None,
+                context_low: false,
                 alerted_since: None,
         }
     }

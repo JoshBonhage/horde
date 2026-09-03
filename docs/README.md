@@ -20,6 +20,7 @@ Read any page from the terminal with `horde docs <topic>`.
 |---|---|
 | **[orchestration](orchestration.md)** | **agent-to-agent messaging — the main event. Written to be read by an agent.** |
 | [agents](agents.md) | detection, the six states, lifecycle hooks vs screen manifests |
+| [memory](memory.md) | notes a project keeps, so context survives a compaction |
 | [worktrees](worktrees.md) | one git worktree per agent, so a fleet in one repo cannot overwrite itself |
 | [socket-api](socket-api.md) | the control protocol, every method, for scripting and for agents |
 

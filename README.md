@@ -142,7 +142,8 @@ This is the part that earns its keep past two agents.
 | | What it does | How |
 |---|---|---|
 | **Grouping** | Agents nest under their project, with a state rollup on each header | automatic |
-| **Colour** | Every project gets its own accent — tab bar, sidebar dot, pane borders | automatic; `horde space accent` to change |
+| **Colour** | Every project gets its own accent — tab bar, sidebar dot, pane borders, and the connectors down the sidebar's lists | automatic; `horde space accent` to change |
+| **Memory** | Notes a project keeps for its agents, so context survives a compaction | `horde memory save`, or drag one onto an agent |
 | **Roles** | Label what a pane is *for*: `reviewer`, `builder`, `docs` | `horde pane role %2 reviewer` |
 | **Pins** | Hold the agent you're babysitting at the top, whatever project it's in | `ctrl+b P` |
 | **Folding** | Collapse a project you're not looking at — it stays collapsed after a restart | `ctrl+b E` then `h` |
@@ -581,8 +582,10 @@ load-bearing:
 - **`done`** means finished while you weren't looking. It clears when you look at the pane,
   which is what makes the sidebar worth glancing at.
 - **`serving`** is not an agent at all. A pane running `npm run dev`, a watcher or a tunnel is
-  recognised as a *service*: its own colour, its own count, never handed work, and never
-  `done` — because a dev server has no finish to read. A pane sitting at a shell prompt is
+  recognised as a *service*: its own sidebar section, its own colour, never handed work, and
+  never `done` — because a dev server has no finish to read. Its row shows where it is
+  answering (`:5173`) rather than the word `serving`, and a connector in the project's own
+  accent ties it back to the agents it is serving. A pane sitting at a shell prompt is
   neither, whatever its scrollback still says.
 
 `ctrl+b A` opens the **approval queue**: every blocked agent in one list, longest wait first,

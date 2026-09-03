@@ -15,7 +15,7 @@
 //! nothing here caches. It is a projection, recomputed per frame, cheap because the session
 //! is small.
 
-use crate::proto::{AgentState, Cmd, PaneId, Snapshot, SpaceId};
+use crate::proto::{AgentClass, AgentState, Cmd, MemoryId, PaneId, Snapshot, SpaceId};
 
 /// How much chrome the panel's width can pay for.
 ///
@@ -146,12 +146,111 @@ impl Roll {
     }
 }
 
+/// Which of the sidebar's two lists a row was built for.
+///
+/// The same builder makes both, because they are the same shape: projects with things
+/// running under them. What differs is only which class of thing is collected and what an
+/// empty result means, and neither is worth a second copy of the grouping, rail and pin
+/// logic that would then have to be kept in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    /// Things you talk to.
+    Agents,
+    /// Notes the project has saved for its agents: `.horde/memory/*.md`.
+    Memory,
+    /// Things that just run: dev servers, watchers, tunnels.
+    Services,
+}
+
+impl Section {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Section::Agents => "AGENTS",
+            Section::Memory => "MEMORY",
+            Section::Services => "SERVICES",
+        }
+    }
+}
+
+/// The connector drawn down a row's indent column, tying it to the project it hangs from.
+///
+/// The tie is a *colour* first and a glyph second. Every rail is drawn in its project's
+/// accent — the same hue as that project's dot up in SPACES — so the three servers under
+/// `api-refactor` and the two agents under `api-refactor` are one visible strand running the
+/// height of the panel, even though a rule and a section label sit between them. The glyphs
+/// only say where in the strand you are; without the colour they would just be a tree, and a
+/// tree drawn twice in two sections says nothing about how the two relate.
+///
+/// Guaranteed to be `None` at `Density::Tight`, where the indent is zero and there is no
+/// column to draw in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Rail {
+    /// No connector: a top-level row, a pinned agent lifted out of its group, or a panel too
+    /// narrow to spend a column on one.
+    #[default]
+    None,
+    /// A row with more of its group below it.
+    Branch,
+    /// The last row of its group, which is where the strand ends.
+    End,
+    /// A continuation under a row that was not the last: the group carries on beneath.
+    Through,
+}
+
+impl Rail {
+    /// The two columns it occupies, or nothing at all.
+    ///
+    /// A connector is exactly as wide as `Density::indent`, and the renderer pads the rest of
+    /// the indent out, so a row's label starts in the same column whether it has one or not —
+    /// a tree whose names do not line up is harder to scan than no tree at all. `None` is
+    /// empty rather than two spaces precisely so that a row with no indent to spend does not
+    /// pay for a gutter it is not using.
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            Rail::None => "",
+            Rail::Branch => "├─",
+            Rail::End => "╰─",
+            Rail::Through => "│ ",
+        }
+    }
+}
+
+/// What a group header counts.
+///
+/// Two shapes because two sections have genuinely different things to say. An agent or a
+/// service has a *state*, and the header's job is to say how many are in each — glyph-coded,
+/// because `◍2` is the one thing you want to see from across the room. A saved note has no
+/// state at all; it either exists or it does not, so its header has one number to give and
+/// pretending otherwise would mean inventing a state for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tally {
+    States(Roll),
+    Count(usize),
+}
+
+impl Tally {
+    /// The states, for a header that has them, and an empty roll for one that does not.
+    ///
+    /// For readers that only care about agent counts and would otherwise each write the same
+    /// `match`. The sidebar does not use it — it renders the two shapes differently, which is
+    /// the point of the type.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn roll(&self) -> Roll {
+        match self {
+            Tally::States(r) => *r,
+            Tally::Count(_) => Roll::default(),
+        }
+    }
+}
+
 /// One line of the sidebar's agent list, and the unit a cursor will step over.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowKind {
     /// A space's header, standing over its agents.
-    Group { space: SpaceId, roll: Roll, collapsed: bool },
+    Group { space: SpaceId, tally: Tally, collapsed: bool },
     Agent { pane: PaneId, space: SpaceId, pinned: bool },
+    /// One of a project's saved notes.
+    Memory { id: MemoryId, space: SpaceId },
     /// The indented "12 tools · 1 failed" line under a working agent. Not a row you can
     /// land on: it describes the row above rather than naming anything of its own.
     Activity(PaneId),
@@ -163,22 +262,63 @@ pub enum RowKind {
 pub struct Row {
     pub kind: RowKind,
     pub indent: u16,
+    /// Where this row sits in its group's strand.
+    pub rail: Rail,
+    /// Whose accent colours the strand — the project this row hangs from.
+    ///
+    /// Carried on the row rather than re-derived by the renderer because `Activity` names
+    /// only a pane, and asking the renderer to walk back up the list to find out which
+    /// project that pane is in is exactly the parallel arithmetic this module exists to
+    /// prevent.
+    pub tint: Option<SpaceId>,
+    /// Whether the cursor may land here.
+    ///
+    /// True for everything except a SERVICES group header, which is drawn — a project's
+    /// servers still need a project to hang from — but is not a stop. Two headers for one
+    /// project would be two cursor stops that do the identical thing when you press enter,
+    /// and, worse, two rows answering to the same `Focus`: the cursor is named by identity
+    /// rather than by index precisely so it survives the list being rebuilt, and a `Focus`
+    /// that matches two rows would teleport it to the first of them on the next frame.
+    stop: bool,
 }
 
 impl Row {
     fn new(kind: RowKind) -> Row {
-        Row { kind, indent: 0 }
+        Row { kind, indent: 0, rail: Rail::None, tint: None, stop: true }
     }
 
     fn indented(kind: RowKind, indent: u16) -> Row {
-        Row { kind, indent }
+        Row { kind, indent, rail: Rail::None, tint: None, stop: true }
+    }
+
+    /// Drawn, but not somewhere the cursor stops.
+    fn silent(mut self) -> Row {
+        self.stop = false;
+        self
+    }
+
+    fn tinted(mut self, space: SpaceId) -> Row {
+        self.tint = Some(space);
+        self
+    }
+
+    /// Give the row a connector, unless the panel is too narrow to have a column for one.
+    fn railed(mut self, rail: Rail) -> Row {
+        if self.indent > 0 {
+            self.rail = rail;
+        }
+        self
     }
 
     /// What the cursor would be on here, if it can land here at all.
     pub fn focus(&self) -> Option<Focus> {
+        if !self.stop {
+            return None;
+        }
         match self.kind {
             RowKind::Group { space, .. } => Some(Focus::Group(space)),
             RowKind::Agent { pane, .. } => Some(Focus::Agent(pane)),
+            RowKind::Memory { id, .. } => Some(Focus::Memory(id)),
             RowKind::Activity(_) | RowKind::Empty(_) => None,
         }
     }
@@ -192,16 +332,33 @@ impl Row {
 pub enum Focus {
     Group(SpaceId),
     Agent(PaneId),
+    Memory(MemoryId),
 }
 
 impl Focus {
-    /// What pressing enter on this does.
-    pub fn activate(&self) -> Cmd {
+    /// What pressing enter on this does, given where you are.
+    ///
+    /// `None` where there is nothing sensible to do — pressing enter on a note with no agent
+    /// focused. The caller says so rather than this guessing at a target, because handing a
+    /// note to the wrong agent is a message you cannot take back out of its context.
+    pub fn activate(&self, snap: &Snapshot) -> Option<Cmd> {
         match self {
             // A group header stands for its project, so entering it goes there — the same
             // thing clicking the space row does.
-            Focus::Group(s) => Cmd::FocusSpace(*s),
-            Focus::Agent(p) => Cmd::FocusPane(*p),
+            Focus::Group(s) => Some(Cmd::FocusSpace(*s)),
+            Focus::Agent(p) => Some(Cmd::FocusPane(*p)),
+            // A note is not somewhere you go, it is something you hand over. The keyboard's
+            // answer to the drag: give it to whoever you are looking at.
+            Focus::Memory(id) => {
+                let to = snap.focused_pane.filter(|p| {
+                    snap.panes
+                        .iter()
+                        .find(|x| x.id == *p)
+                        .and_then(|x| x.agent.as_ref())
+                        .is_some_and(|a| a.class == AgentClass::Agent)
+                })?;
+                Some(Cmd::GiveMemory { memory: *id, to })
+            }
         }
     }
 }
@@ -354,6 +511,7 @@ impl SidebarState {
             let alive = match f {
                 Focus::Group(s) => snap.spaces.iter().any(|x| x.id == s),
                 Focus::Agent(p) => snap.panes.iter().any(|x| x.id == p),
+                Focus::Memory(m) => snap.memories.iter().any(|x| x.id == m),
             };
             if !alive {
                 // Keep `at` — it is what lets `resolve` put the cursor back near where the
@@ -374,6 +532,10 @@ pub struct AgentRow {
     pub pane: PaneId,
     pub space: SpaceId,
     pub state: AgentState,
+    /// Which of the two sections this belongs in. Read from the snapshot rather than
+    /// inferred from the state: a dev server that cannot bind its port is `blocked`, and
+    /// sorting on state would file it under the agents on its worst day.
+    pub class: AgentClass,
     /// Whether it has a second line to draw beneath it.
     pub has_activity: bool,
     pub pinned: bool,
@@ -395,6 +557,7 @@ pub fn collect_agents(snap: &Snapshot) -> Vec<AgentRow> {
                     pane: pid,
                     space: space.id,
                     state: a.state,
+                    class: a.class,
                     pinned: pane.pinned,
                     // Only while it is actually doing something; a finished turn's counts
                     // would be stale trivia.
@@ -407,65 +570,192 @@ pub fn collect_agents(snap: &Snapshot) -> Vec<AgentRow> {
     out
 }
 
-/// The AGENTS section as a flat list: a header per space that has agents, then its agents,
+/// Every section, concatenated in the order the cursor walks them.
+///
+/// The panel draws them as separate blocks with rules between, but the cursor, the key
+/// handler and the roster overlay all want one list — and it has to be *the same* list the
+/// panel drew, or `j` walks rows that are not on screen. Building it from the same function
+/// three times is what guarantees that; deriving it separately is the parallel arithmetic
+/// this module exists to prevent.
+pub fn cursor_rows(snap: &Snapshot, d: Density, lens: &Lens) -> Vec<Row> {
+    let mut out = Vec::new();
+    for section in [Section::Agents, Section::Memory, Section::Services] {
+        out.extend(filtered_rows(snap, d, lens, section));
+    }
+    out
+}
+
+/// One thing to be grouped under its project, before the grouping is worked out.
+///
+/// The three sections hold three unrelated kinds of thing — a pane you talk to, a pane that
+/// runs, a file on disk — and share every bit of what the sidebar *does* with them: group
+/// under a header, hang on the project's strand, lift the pinned ones out, end the strand on
+/// the last row. Reducing all three to this is what lets that logic exist once.
+struct Item {
+    space: SpaceId,
+    kind: RowKind,
+    /// Its state, for the header's rollup. `None` for a note, which has none.
+    state: Option<AgentState>,
+    /// A second line to draw beneath it, indented further.
+    second: Option<RowKind>,
+    pinned: bool,
+}
+
+/// One section as a flat list: a header per space that has anything in it, then its rows,
 /// filtered by the active lens.
 ///
-/// A space with no agents gets no header. The SPACES section above already lists every
-/// project; repeating the empty ones here would spend the panel's scarcest resource — rows —
-/// on saying nothing twice.
-pub fn filtered_rows(snap: &Snapshot, d: Density, lens: &Lens) -> Vec<Row> {
-    let all = collect_agents(snap);
-    if all.is_empty() {
-        // Say how to get one rather than leaving an unexplained empty panel.
-        return vec![Row::new(RowKind::Empty("none yet"))];
+/// A space with nothing in this section gets no header. The SPACES list above already names
+/// every project; repeating the empty ones here would spend the panel's scarcest resource —
+/// rows — on saying nothing twice.
+///
+/// The lens filters the two agent-shaped sections, and that is deliberate. A service is a
+/// thing in the session like any other, so `needs you` has to be able to show a dev server
+/// that cannot bind its port — that is precisely a thing you have to go and fix. It follows
+/// that `working` empties the SERVICES list, which is also right: "show me what is mid-turn"
+/// should not list three processes that will never finish.
+///
+/// It does **not** filter MEMORY, and that is the one exception worth stating. A lens is a
+/// question about what your agents are doing, and a saved note is not doing anything — it is
+/// the context you reach for *while* answering that question, so hiding it exactly when you
+/// have narrowed down to one blocked agent would take it away at the only moment it is
+/// wanted.
+pub fn filtered_rows(snap: &Snapshot, d: Density, lens: &Lens, section: Section) -> Vec<Row> {
+    let items = match section {
+        Section::Memory => memory_items(snap),
+        Section::Agents | Section::Services => {
+            let want = if section == Section::Agents {
+                AgentClass::Agent
+            } else {
+                AgentClass::Service
+            };
+            let all: Vec<AgentRow> =
+                collect_agents(snap).into_iter().filter(|a| a.class == want).collect();
+            if all.is_empty() {
+                return empty(section);
+            }
+            let kept: Vec<AgentRow> =
+                all.into_iter().filter(|a| lens.matches(a, snap)).collect();
+            if kept.is_empty() {
+                return match section {
+                    // An empty *filtered* list is a different fact from an empty session, and
+                    // has to say which one it is or it reads as everything having stopped.
+                    Section::Agents => vec![Row::new(RowKind::Empty("no agents match"))],
+                    _ => Vec::new(),
+                };
+            }
+            kept.into_iter()
+                .map(|a| Item {
+                    space: a.space,
+                    kind: RowKind::Agent { pane: a.pane, space: a.space, pinned: a.pinned },
+                    state: Some(a.state),
+                    second: a.has_activity.then_some(RowKind::Activity(a.pane)),
+                    pinned: a.pinned,
+                })
+                .collect()
+        }
+    };
+    if items.is_empty() {
+        return empty(section);
     }
-    let agents: Vec<AgentRow> = all.into_iter().filter(|a| lens.matches(a, snap)).collect();
-    if agents.is_empty() {
-        // An empty *filtered* list is a different fact from an empty session, and has to say
-        // which one it is or it reads as everything having stopped.
-        return vec![Row::new(RowKind::Empty("no agents match"))];
-    }
+    grouped(snap, d, section, items)
+}
 
+/// What an empty section shows.
+///
+/// Only AGENTS says anything. The others go entirely, chrome included: most sessions never
+/// run a dev server or save a note, and a rule and a label announcing that would be three
+/// rows spent on a non-event — and when a *lens* emptied them, the AGENTS label above is
+/// already saying the list is filtered, three rows further up.
+fn empty(section: Section) -> Vec<Row> {
+    match section {
+        // Say how to get one rather than leaving an unexplained empty panel.
+        Section::Agents => vec![Row::new(RowKind::Empty("none yet"))],
+        Section::Memory | Section::Services => Vec::new(),
+    }
+}
+
+/// The saved notes, in the order the daemon listed them — newest first within each project.
+fn memory_items(snap: &Snapshot) -> Vec<Item> {
+    snap.memories
+        .iter()
+        .map(|m| Item {
+            space: m.space,
+            kind: RowKind::Memory { id: m.id, space: m.space },
+            state: None,
+            second: None,
+            pinned: false,
+        })
+        .collect()
+}
+
+/// Group items under a header per project and hang them on that project's strand.
+fn grouped(snap: &Snapshot, d: Density, section: Section, items: Vec<Item>) -> Vec<Row> {
     let mut out = Vec::new();
 
-    // Pinned agents lift to the top, out of their groups. The one sanctioned exception to the
+    // Pinned rows lift to the top, out of their groups. The one sanctioned exception to the
     // stable ordering above — and it is not really an exception, because *you* moved these.
     // Rows that reorder themselves are worse than rows you scan; rows you put somewhere are
     // not, since you know where you put them.
-    for a in agents.iter().filter(|a| a.pinned) {
-        out.push(Row::new(RowKind::Agent { pane: a.pane, space: a.space, pinned: true }));
-        if a.has_activity {
-            out.push(Row::indented(RowKind::Activity(a.pane), 2));
+    //
+    // They keep their project's tint and lose their rail: the colour still says which project
+    // it belongs to, while the missing connector says it is not sitting under that project's
+    // header any more. Drawing a `├─` here would promise a group above it that is not there.
+    for it in items.iter().filter(|i| i.pinned) {
+        out.push(Row::new(it.kind.clone()).tinted(it.space));
+        if let Some(second) = it.second.clone() {
+            out.push(Row::indented(second, 2).tinted(it.space));
         }
     }
 
     for space in &snap.spaces {
-        let mine: Vec<&AgentRow> = agents.iter().filter(|a| a.space == space.id).collect();
+        let mine: Vec<&Item> = items.iter().filter(|i| i.space == space.id).collect();
         if mine.is_empty() {
             continue;
         }
-        // The rollup counts every agent in the space, pinned ones included. Pinning moves a
+        // The tally counts everything in the space, pinned rows included. Pinning moves a
         // row; it does not change what is running in a project, which is what the header
         // answers.
-        let mut roll = Roll::default();
-        for a in &mine {
-            roll.add(a.state);
-        }
-        out.push(Row::new(RowKind::Group {
-            space: space.id,
-            roll,
-            collapsed: space.collapsed,
-        }));
+        let tally = match section {
+            Section::Memory => Tally::Count(mine.len()),
+            _ => {
+                let mut roll = Roll::default();
+                for it in &mine {
+                    if let Some(state) = it.state {
+                        roll.add(state);
+                    }
+                }
+                Tally::States(roll)
+            }
+        };
+        let head = Row::new(RowKind::Group { space: space.id, tally, collapsed: space.collapsed })
+            .tinted(space.id);
+        out.push(match section {
+            Section::Agents => head,
+            // Only the first header for a project is a cursor stop — see `Row::stop`.
+            _ => head.silent(),
+        });
         if space.collapsed {
             continue;
         }
-        for a in mine.into_iter().filter(|a| !a.pinned) {
-            out.push(Row::indented(
-                RowKind::Agent { pane: a.pane, space: a.space, pinned: false },
-                d.indent(),
-            ));
-            if a.has_activity {
-                out.push(Row::indented(RowKind::Activity(a.pane), d.indent() + 2));
+        let body: Vec<&Item> = mine.into_iter().filter(|i| !i.pinned).collect();
+        for (i, it) in body.iter().enumerate() {
+            // `╰─` only on the row the strand actually ends on. Measured against the body of
+            // the group rather than the whole space, because a pinned row is drawn above the
+            // header and is not on this strand at all.
+            let last = i + 1 == body.len();
+            out.push(
+                Row::indented(it.kind.clone(), d.indent())
+                    .tinted(it.space)
+                    .railed(if last { Rail::End } else { Rail::Branch }),
+            );
+            if let Some(second) = it.second.clone() {
+                // The strand has to run *past* a two-line row, or a working agent's activity
+                // line would break the connector to everything under it.
+                out.push(
+                    Row::indented(second, d.indent() + 2)
+                        .tinted(it.space)
+                        .railed(if last { Rail::None } else { Rail::Through }),
+                );
             }
         }
     }
@@ -498,6 +788,7 @@ pub mod tests {
                 reason: "t".into(),
                 activity: Default::default(),
                 question: None,
+                endpoint: None,
             }),
             spawned_by: None,
             exited: false,
@@ -570,12 +861,302 @@ pub mod tests {
             cards_due: 0,
             triggers_armed: 0,
             recents: Vec::new(),
+            memories: Vec::new(),
         }
+    }
+
+    /// A service pane, so the two sections can be told apart in a test rather than by eye.
+    pub fn service(id: u32, space: u32, tab: u32, name: &str, state: AgentState) -> PaneInfo {
+        let mut p = pane(id, space, tab, Some((name, state)));
+        p.agent.as_mut().unwrap().class = AgentClass::Service;
+        p
+    }
+
+    /// `snap()` plus two dev servers in `api-refactor` and one in `docs`.
+    pub fn served() -> Snapshot {
+        let mut s = snap();
+        s.tabs[0].panes.extend([5, 6]);
+        s.tabs[1].panes.push(7);
+        s.panes.push(service(5, 1, 1, "vite", AgentState::Serving));
+        s.panes.push(service(6, 1, 1, "tsc", AgentState::Serving));
+        s.panes.push(service(7, 2, 2, "hugo", AgentState::Serving));
+        s
+    }
+
+    /// The whole reason the section exists: a project running one agent and three
+    /// `npm run dev` panes must not read as a project running four agents.
+    #[test]
+    fn a_dev_server_is_not_in_the_agent_list() {
+        let rows = filtered_rows(&served(), Density::Normal, &Lens::All, Section::Agents);
+        assert!(
+            !rows.iter().any(|r| matches!(r.kind, RowKind::Agent { pane: 5..=7, .. })),
+            "{rows:?}"
+        );
+        let services = filtered_rows(&served(), Density::Normal, &Lens::All, Section::Services);
+        let panes: Vec<PaneId> = services
+            .iter()
+            .filter_map(|r| match r.kind {
+                RowKind::Agent { pane, .. } => Some(pane),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(panes, vec![5, 6, 7], "{services:?}");
+    }
+
+    /// Each section rolls up its own list. A header that counted the whole space would put
+    /// the servers back into the agent count by the back door.
+    #[test]
+    fn a_section_header_counts_only_what_is_under_it() {
+        let rows = filtered_rows(&served(), Density::Normal, &Lens::All, Section::Agents);
+        let RowKind::Group { tally, .. } = rows[0].kind else { panic!("{:?}", rows[0]) };
+        let roll = tally.roll();
+        assert_eq!(roll, Roll { blocked: 1, working: 1, done: 0, idle: 0, serving: 0 });
+
+        let rows = filtered_rows(&served(), Density::Normal, &Lens::All, Section::Services);
+        let RowKind::Group { tally, .. } = rows[0].kind else { panic!("{:?}", rows[0]) };
+        let roll = tally.roll();
+        assert_eq!(roll, Roll { blocked: 0, working: 0, done: 0, idle: 0, serving: 2 });
+    }
+
+    /// Most sessions never run a dev server, and a rule and a label announcing that would be
+    /// three rows spent on a non-event.
+    #[test]
+    fn no_services_at_all_is_no_section_rather_than_an_empty_one() {
+        let rows = filtered_rows(&snap(), Density::Normal, &Lens::All, Section::Services);
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// The AGENTS label three rows up is already saying the list is filtered, so an empty
+    /// SERVICES list under it needs no explanation of its own.
+    #[test]
+    fn a_lens_that_matches_no_service_hides_the_section() {
+        let rows = filtered_rows(&served(), Density::Normal, &Lens::Working, Section::Services);
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// A dev server that cannot bind its port is exactly the thing `needs you` is for.
+    #[test]
+    fn a_blocked_service_survives_the_needs_you_lens() {
+        let mut s = served();
+        s.panes.iter_mut().find(|p| p.id == 5).unwrap().agent.as_mut().unwrap().state =
+            AgentState::Blocked;
+        let rows = filtered_rows(&s, Density::Normal, &Lens::NeedsYou, Section::Services);
+        assert!(rows.iter().any(|r| matches!(r.kind, RowKind::Agent { pane: 5, .. })), "{rows:?}");
+        assert!(!rows.iter().any(|r| matches!(r.kind, RowKind::Agent { pane: 6, .. })), "{rows:?}");
+    }
+
+    #[test]
+    fn the_strand_ends_on_the_last_row_of_its_group() {
+        let rows = filtered_rows(&served(), Density::Normal, &Lens::All, Section::Services);
+        let rails: Vec<Rail> = rows.iter().map(|r| r.rail).collect();
+        // header, vite, tsc, header, hugo
+        assert_eq!(
+            rails,
+            vec![Rail::None, Rail::Branch, Rail::End, Rail::None, Rail::End],
+            "{rows:?}"
+        );
+    }
+
+    /// An agent with a second line must not break the connector to everything below it.
+    #[test]
+    fn the_strand_runs_past_a_two_line_row() {
+        let mut s = snap();
+        let a = s.panes.iter_mut().find(|p| p.id == 1).unwrap().agent.as_mut().unwrap();
+        a.activity.tools = 12;
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
+        // header, builder, builder's activity, reviewer, ...
+        assert!(matches!(rows[2].kind, RowKind::Activity(1)), "{rows:?}");
+        assert_eq!(rows[1].rail, Rail::Branch);
+        assert_eq!(rows[2].rail, Rail::Through, "the strand has to reach the reviewer below");
+        assert_eq!(rows[3].rail, Rail::End);
+    }
+
+    /// The last row's activity line has nothing below it, so the strand stops rather than
+    /// trailing off into the section rule.
+    #[test]
+    fn the_strand_stops_under_the_last_row() {
+        let mut s = snap();
+        let a = s.panes.iter_mut().find(|p| p.id == 2).unwrap().agent.as_mut().unwrap();
+        a.state = AgentState::Working;
+        a.activity.tools = 3;
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
+        let at = rows.iter().position(|r| matches!(r.kind, RowKind::Activity(2))).unwrap();
+        assert_eq!(rows[at - 1].rail, Rail::End);
+        assert_eq!(rows[at].rail, Rail::None, "{rows:?}");
+    }
+
+    /// A pinned row is drawn above the header, so a connector would promise a group above it
+    /// that is not there. The colour stays: it still belongs to that project.
+    #[test]
+    fn a_pinned_row_keeps_its_colour_and_loses_its_connector() {
+        let mut s = snap();
+        s.panes.iter_mut().find(|p| p.id == 2).unwrap().pinned = true;
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
+        assert!(matches!(rows[0].kind, RowKind::Agent { pane: 2, pinned: true, .. }), "{rows:?}");
+        assert_eq!(rows[0].rail, Rail::None);
+        assert_eq!(rows[0].tint, Some(1));
+    }
+
+    /// At the width where the indent yields, so does the connector: there is no column left
+    /// to draw it in.
+    #[test]
+    fn a_tight_panel_draws_no_connector() {
+        let rows = filtered_rows(&snap(), Density::Tight, &Lens::All, Section::Agents);
+        assert!(rows.iter().all(|r| r.rail == Rail::None), "{rows:?}");
+        let wide = filtered_rows(&snap(), Density::Wide, &Lens::All, Section::Agents);
+        assert!(wide.iter().any(|r| r.rail != Rail::None), "{wide:?}");
+    }
+
+    /// Every row on a project's strand has to name the same project, or the renderer cannot
+    /// colour them alike — which is the entire point of the connector.
+    #[test]
+    fn both_sections_tint_a_project_the_same_way() {
+        let agents = filtered_rows(&served(), Density::Normal, &Lens::All, Section::Agents);
+        let services = filtered_rows(&served(), Density::Normal, &Lens::All, Section::Services);
+        let tint = |rows: &[Row], pane: PaneId| {
+            rows.iter()
+                .find(|r| matches!(r.kind, RowKind::Agent { pane: p, .. } if p == pane))
+                .unwrap()
+                .tint
+        };
+        // builder and vite are both api-refactor's, in two different sections.
+        assert_eq!(tint(&agents, 1), Some(1));
+        assert_eq!(tint(&services, 5), Some(1));
+        assert_eq!(tint(&services, 7), Some(2), "hugo is docs'");
+    }
+
+    /// `served()` plus two notes in `api-refactor` and one in `docs`.
+    pub fn noted() -> Snapshot {
+        let mut s = served();
+        let note = |id, space, name: &str| crate::proto::MemoryInfo {
+            id,
+            space,
+            name: name.into(),
+            title: format!("about {name}"),
+            bytes: 100,
+            age: id * 60,
+        };
+        s.memories = vec![note(1, 1, "api-shape"), note(2, 1, "ruled-out"), note(3, 2, "voice")];
+        s
+    }
+
+    #[test]
+    fn notes_are_grouped_under_their_project_like_everything_else() {
+        let rows = filtered_rows(&noted(), Density::Normal, &Lens::All, Section::Memory);
+        let kinds: Vec<&RowKind> = rows.iter().map(|r| &r.kind).collect();
+        assert!(matches!(kinds[0], RowKind::Group { space: 1, .. }), "{kinds:?}");
+        assert!(matches!(kinds[1], RowKind::Memory { id: 1, space: 1 }));
+        assert!(matches!(kinds[2], RowKind::Memory { id: 2, space: 1 }));
+        assert!(matches!(kinds[3], RowKind::Group { space: 2, .. }));
+        assert!(matches!(kinds[4], RowKind::Memory { id: 3, space: 2 }));
+    }
+
+    /// A note has no state, so counting it as one would mean inventing a state for a file.
+    #[test]
+    fn a_memory_header_counts_rather_than_rolling_up_states() {
+        let rows = filtered_rows(&noted(), Density::Normal, &Lens::All, Section::Memory);
+        let RowKind::Group { tally, .. } = rows[0].kind else { panic!("{:?}", rows[0]) };
+        assert_eq!(tally, Tally::Count(2));
+    }
+
+    /// Notes hang on the same coloured strand as the agents they are for, in a different
+    /// section — which is the whole reason the connector exists.
+    #[test]
+    fn a_note_is_on_the_same_strand_as_its_project_s_agents() {
+        let snap = noted();
+        let agents = filtered_rows(&snap, Density::Normal, &Lens::All, Section::Agents);
+        let notes = filtered_rows(&snap, Density::Normal, &Lens::All, Section::Memory);
+        let builder = agents
+            .iter()
+            .find(|r| matches!(r.kind, RowKind::Agent { pane: 1, .. }))
+            .unwrap();
+        let api_shape =
+            notes.iter().find(|r| matches!(r.kind, RowKind::Memory { id: 1, .. })).unwrap();
+        assert_eq!(builder.tint, api_shape.tint);
+        assert_eq!(notes.last().unwrap().rail, Rail::End);
+    }
+
+    /// A lens is a question about what your agents are doing. A note is not doing anything —
+    /// it is the context you reach for *while* answering that question, so narrowing down to
+    /// one blocked agent must not take it away at the moment it is wanted.
+    #[test]
+    fn a_lens_never_hides_the_notes() {
+        for lens in [Lens::NeedsYou, Lens::Working, Lens::Role("nobody".into())] {
+            let rows = filtered_rows(&noted(), Density::Normal, &lens, Section::Memory);
+            let n = rows.iter().filter(|r| matches!(r.kind, RowKind::Memory { .. })).count();
+            assert_eq!(n, 3, "{lens:?} hid the notes: {rows:?}");
+        }
+    }
+
+    /// Most projects have never saved one, and a rule and a label saying so would be three
+    /// rows spent on a non-event.
+    #[test]
+    fn a_project_with_no_notes_gets_no_memory_section() {
+        let rows = filtered_rows(&served(), Density::Normal, &Lens::All, Section::Memory);
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
+    /// Enter on a note hands it to whoever you are looking at — and declines rather than
+    /// guessing when that is not an agent, because a note in the wrong agent's context cannot
+    /// be taken back out.
+    #[test]
+    fn a_note_is_handed_to_the_focused_agent_or_to_nobody() {
+        let mut s = noted();
+        s.focused_pane = Some(1); // builder
+        assert_eq!(
+            Focus::Memory(1).activate(&s),
+            Some(Cmd::GiveMemory { memory: 1, to: 1 })
+        );
+        s.focused_pane = Some(3); // a bare shell
+        assert_eq!(Focus::Memory(1).activate(&s), None);
+        s.focused_pane = Some(5); // vite, a service
+        assert_eq!(Focus::Memory(1).activate(&s), None, "a server has no conversation");
+    }
+
+    /// The cursor is named by identity so it survives the list being rebuilt. A note that has
+    /// been deleted must release it rather than holding it on a row that is gone.
+    #[test]
+    fn a_deleted_note_releases_the_cursor() {
+        let mut st = SidebarState { cursor: Some(Focus::Memory(2)), ..Default::default() };
+        let mut s = noted();
+        st.prune(&s);
+        assert_eq!(st.cursor, Some(Focus::Memory(2)));
+        s.memories.retain(|m| m.id != 2);
+        st.prune(&s);
+        assert_eq!(st.cursor, None);
+    }
+
+    /// The list the cursor walks runs agents first, then services, so `G` lands on the last
+    /// server rather than the last agent — the panel and the key handler agree about what is
+    /// below what.
+    #[test]
+    fn the_cursor_walks_out_of_the_agents_and_into_the_servers() {
+        let rows = cursor_rows(&served(), Density::Normal, &Lens::All);
+        let mut st = SidebarState::default();
+        st.jump(&rows, true);
+        assert_eq!(st.cursor, Some(Focus::Agent(7)), "{rows:?}");
+        // And back up through the services header, which is drawn but is not a stop.
+        st.step(&rows, -1);
+        assert_eq!(st.cursor, Some(Focus::Agent(6)));
+    }
+
+    /// Two headers for one project would be two rows answering to the same `Focus`, and the
+    /// cursor — which is named by identity so it survives the list being rebuilt — would
+    /// teleport to the first of them on the next frame.
+    #[test]
+    fn the_cursor_never_lands_on_a_services_header() {
+        let rows = cursor_rows(&served(), Density::Normal, &Lens::All);
+        let mut seen = Vec::new();
+        for f in rows.iter().filter_map(Row::focus) {
+            assert!(!seen.contains(&f), "{f:?} answers to two rows: {rows:?}");
+            seen.push(f);
+        }
+        assert!(seen.contains(&Focus::Agent(5)), "a server is still a stop: {seen:?}");
     }
 
     #[test]
     fn every_agent_sits_under_a_header_for_its_own_space() {
-        let rows = filtered_rows(&snap(), Density::Normal, &Lens::All);
+        let rows = filtered_rows(&snap(), Density::Normal, &Lens::All, Section::Agents);
         let kinds: Vec<&RowKind> = rows.iter().map(|r| &r.kind).collect();
         // api-refactor's header, then both of its agents, then docs' header, then writer.
         assert!(matches!(kinds[0], RowKind::Group { space: 1, .. }), "{kinds:?}");
@@ -588,8 +1169,9 @@ pub mod tests {
 
     #[test]
     fn a_group_header_rolls_up_the_states_of_its_agents() {
-        let rows = filtered_rows(&snap(), Density::Normal, &Lens::All);
-        let RowKind::Group { roll, .. } = rows[0].kind else { panic!("{:?}", rows[0]) };
+        let rows = filtered_rows(&snap(), Density::Normal, &Lens::All, Section::Agents);
+        let RowKind::Group { tally, .. } = rows[0].kind else { panic!("{:?}", rows[0]) };
+        let roll = tally.roll();
         assert_eq!(roll, Roll { blocked: 1, working: 1, done: 0, idle: 0, serving: 0 });
     }
 
@@ -599,7 +1181,7 @@ pub mod tests {
     fn a_space_with_no_agents_gets_no_header() {
         let mut s = snap();
         s.panes.retain(|p| p.space != 2);
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         assert!(
             !rows.iter().any(|r| matches!(r.kind, RowKind::Group { space: 2, .. })),
             "{rows:?}"
@@ -610,7 +1192,7 @@ pub mod tests {
     fn no_agents_at_all_says_so_rather_than_returning_nothing() {
         let mut s = snap();
         s.panes.iter_mut().for_each(|p| p.agent = None);
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].kind, RowKind::Empty("none yet")));
     }
@@ -619,8 +1201,8 @@ pub mod tests {
     /// header above still carries the grouping.
     #[test]
     fn a_tight_panel_groups_without_indenting() {
-        let wide = filtered_rows(&snap(), Density::Wide, &Lens::All);
-        let tight = filtered_rows(&snap(), Density::Tight, &Lens::All);
+        let wide = filtered_rows(&snap(), Density::Wide, &Lens::All, Section::Agents);
+        let tight = filtered_rows(&snap(), Density::Tight, &Lens::All, Section::Agents);
         assert_eq!(wide[1].indent, 2);
         assert_eq!(tight[1].indent, 0);
         // The grouping itself is unchanged — only the indent yields.
@@ -665,7 +1247,7 @@ pub mod tests {
                 };
             }
         }
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         let activity: Vec<&Row> =
             rows.iter().filter(|r| matches!(r.kind, RowKind::Activity(_))).collect();
         // Only `builder` is working; the blocked and idle agents get nothing.
@@ -690,7 +1272,7 @@ pub mod tests {
     fn a_collapsed_space_keeps_its_header_and_hides_its_agents() {
         let mut s = snap();
         s.spaces[0].collapsed = true;
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         assert!(
             matches!(rows[0].kind, RowKind::Group { space: 1, collapsed: true, .. }),
             "the header stays, or the project vanishes rather than folds: {rows:?}"
@@ -709,8 +1291,9 @@ pub mod tests {
     fn a_collapsed_group_still_rolls_up_what_it_hides() {
         let mut s = snap();
         s.spaces[0].collapsed = true;
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
-        let RowKind::Group { roll, .. } = rows[0].kind else { panic!() };
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
+        let RowKind::Group { tally, .. } = rows[0].kind else { panic!() };
+        let roll = tally.roll();
         assert_eq!(roll, Roll { blocked: 1, working: 1, done: 0, idle: 0, serving: 0 });
     }
 
@@ -718,7 +1301,7 @@ pub mod tests {
     fn a_pinned_agent_is_lifted_out_of_its_group() {
         let mut s = snap();
         s.panes.iter_mut().find(|p| p.id == 4).unwrap().pinned = true;
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         assert!(
             matches!(rows[0].kind, RowKind::Agent { pane: 4, pinned: true, .. }),
             "pinned rows come first: {rows:?}"
@@ -734,11 +1317,11 @@ pub mod tests {
     fn a_pinned_agent_is_still_counted_by_the_group_it_left() {
         let mut s = snap();
         s.panes.iter_mut().find(|p| p.id == 1).unwrap().pinned = true;
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         let g = rows
             .iter()
             .find_map(|r| match r.kind {
-                RowKind::Group { space: 1, roll, .. } => Some(roll),
+                RowKind::Group { space: 1, tally, .. } => Some(tally.roll()),
                 _ => None,
             })
             .expect("api-refactor still has a header");
@@ -750,7 +1333,7 @@ pub mod tests {
     }
 
     fn rows() -> Vec<Row> {
-        filtered_rows(&snap(), Density::Normal, &Lens::All)
+        filtered_rows(&snap(), Density::Normal, &Lens::All, Section::Agents)
     }
 
     #[test]
@@ -783,7 +1366,7 @@ pub mod tests {
                     crate::proto::Activity { tools: 3, files: 0, errors: 0, turns: 1, last_tool: None };
             }
         }
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         assert!(rows.iter().any(|r| matches!(r.kind, RowKind::Activity(_))));
         let mut st = SidebarState::default();
         // Walk the whole list and check every landing spot. An activity line describes the
@@ -815,7 +1398,7 @@ pub mod tests {
     #[test]
     fn the_cursor_survives_the_space_it_was_on_disappearing() {
         let mut s = snap();
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         let mut st = SidebarState::default();
         st.resolve(&rows);
         st.step(&rows, 3); // onto docs' header
@@ -824,7 +1407,7 @@ pub mod tests {
         s.spaces.retain(|x| x.id != 2);
         s.panes.retain(|p| p.space != 2);
         st.prune(&s);
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         let at = st.resolve(&rows).expect("the cursor must land somewhere live");
         assert!(rows[at].focus().is_some());
         // Near where it was, not back at the top.
@@ -834,14 +1417,14 @@ pub mod tests {
     #[test]
     fn the_cursor_survives_its_agent_exiting() {
         let mut s = snap();
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         let mut st = SidebarState::default();
         st.cursor = Some(Focus::Agent(2));
         st.resolve(&rows);
 
         s.panes.retain(|p| p.id != 2);
         st.prune(&s);
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         assert!(st.resolve(&rows).is_some());
         assert_ne!(st.cursor, Some(Focus::Agent(2)));
     }
@@ -852,7 +1435,7 @@ pub mod tests {
     fn a_cursor_on_an_empty_list_resolves_to_nothing() {
         let mut s = snap();
         s.panes.iter_mut().for_each(|p| p.agent = None);
-        let rows = filtered_rows(&s, Density::Normal, &Lens::All);
+        let rows = filtered_rows(&s, Density::Normal, &Lens::All, Section::Agents);
         let mut st = SidebarState::default();
         assert_eq!(st.resolve(&rows), None);
         st.step(&rows, 1);
@@ -862,12 +1445,12 @@ pub mod tests {
 
     #[test]
     fn enter_goes_to_the_space_for_a_header_and_the_pane_for_an_agent() {
-        assert_eq!(Focus::Group(3).activate(), Cmd::FocusSpace(3));
-        assert_eq!(Focus::Agent(7).activate(), Cmd::FocusPane(7));
+        assert_eq!(Focus::Group(3).activate(&snap()), Some(Cmd::FocusSpace(3)));
+        assert_eq!(Focus::Agent(7).activate(&snap()), Some(Cmd::FocusPane(7)));
     }
 
     fn lensed(s: &Snapshot, l: Lens) -> Vec<Row> {
-        filtered_rows(s, Density::Normal, &l)
+        filtered_rows(s, Density::Normal, &l, Section::Agents)
     }
 
     #[test]

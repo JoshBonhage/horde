@@ -17,6 +17,7 @@ pub const PAGES: &[(&str, &str, &str)] = &[
     ("quick-start", "install, first session, first agent", include_str!("../../docs/quick-start.md")),
     ("concepts", "spaces, tabs, panes, the daemon", include_str!("../../docs/concepts.md")),
     ("agents", "detection, states, lifecycle hooks", include_str!("../../docs/agents.md")),
+    ("memory", "notes a project keeps for its agents", include_str!("../../docs/memory.md")),
     ("socket-api", "the control protocol, every method", include_str!("../../docs/socket-api.md")),
     ("configuration", "config.toml and the settings page", include_str!("../../docs/configuration.md")),
     (
