@@ -766,7 +766,7 @@ fn spawn(
     // else, and inheriting it would paint the reason over whatever pane horde is drawing.
     let tail = Arc::new(Mutex::new(Vec::<String>::new()));
     let tail2 = tail.clone();
-    tokio::spawn(async move {
+    let stderr_done = tokio::spawn(async move {
         let mut buf = [0u8; 4096];
         let mut line = String::new();
         while let Ok(n) = stderr.read(&mut buf).await {
@@ -812,7 +812,13 @@ fn spawn(
             }
         }
         // Stdout closed: the child is gone, or on its way. Whatever it last said on stderr is
-        // the only explanation there will be.
+        // the only explanation there will be, so wait for stderr to be read to its end before
+        // looking. Both pipes close together when the child exits, and which reader wakes
+        // first is up to the scheduler: on Linux this task usually won, and reported a bare
+        // "exited" with the real reason still sitting unread in the pipe. The wait is bounded
+        // because the pipe closes when the child does; the timeout only matters for a server
+        // that shut its stdout and then kept running, which still deserves a report.
+        let _ = tokio::time::timeout(Duration::from_secs(2), stderr_done).await;
         let why = tail3
             .lock()
             .ok()
