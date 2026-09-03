@@ -4,9 +4,9 @@
 
 <br>
 
-**The terminal multiplexer built for coding agents.**
+**A terminal multiplexer where your coding agents work together.**
 
-Your agents keep running when you close the window. horde tells you which one needs you.
+They start each other, message each other, share a task queue, and keep running when you close the window.
 
 <br>
 
@@ -15,19 +15,17 @@ Your agents keep running when you close the window. horde tells you which one ne
 ![Tests](https://img.shields.io/badge/1092%20tests-passing-2ea986?style=for-the-badge&labelColor=1a3b3b)
 ![Binary](https://img.shields.io/badge/one%20binary-no%20runtime-086c69?style=for-the-badge&labelColor=1a3b3b)
 
-**[Install](#install)** · **[First five minutes](#the-first-five-minutes)** · **[How it works](#how-it-works)** · **[Keys](docs/keys.md)** · **[Agents](docs/agents.md)** · **[Config](docs/configuration.md)** · **[Socket API](docs/socket-api.md)** · **[Unattended](docs/unattended.md)**
+**[Install](#install)** · **[First five minutes](#the-first-five-minutes)** · **[Agents together](#agents-that-work-together)** · **[How it works](#how-it-works)** · **[Keys](docs/keys.md)** · **[Agents](docs/agents.md)** · **[Config](docs/configuration.md)** · **[Socket API](docs/socket-api.md)** · **[Unattended](docs/unattended.md)**
 
 </div>
 
 ---
 
-# Run a fleet of agents. Watch one screen.
+# Agents that work together. One screen that shows you all of them.
 
-You have six repos open and an agent working in each. One finishes. One hits a permission prompt and sits there. One has been thinking for twenty minutes, or is stuck, and from the outside those look the same.
+Most tools give one agent one chat window. horde gives you a place where agents can start other agents, hand each other work, ask a question and wait for the answer, and pull jobs from a shared queue. Each one gets its own terminal, and if they share a repo, its own git worktree, so nobody overwrites anybody.
 
-tmux can hold the terminals. It cannot tell you any of that.
-
-horde can. A background daemon owns every terminal, so nothing stops when you detach. It reads each agent's state, groups them under the project they belong to, and puts the one waiting on you at the top. Come back after lunch and `horde digest` tells you what happened. Leave for the night and scheduled rules can start work without you.
+You see all of it in one window. Which agent is working, which one finished, which one is sitting at a permission prompt waiting for you. Close the window and nothing stops, because a background daemon owns every terminal. Come back and `horde digest` tells you what happened while you were gone.
 
 <div align="center">
 <br>
@@ -39,23 +37,23 @@ horde can. A background daemon owns every terminal, so nothing stops when you de
 <table>
 <tr><td width="50%" valign="top">
 
-**Without horde**
+**One agent, one window**
 
-- Six terminal tabs, and you remember which is which
-- An agent finishes while you are away. You find out by scrolling
+- You are the router. Every handoff goes through you
+- Two agents in one repo means one of them loses work
+- Ten jobs means you deciding who does what, ten times
 - Close the lid, lose the session
-- "Is it thinking or is it stuck?" means reading its scrollback
 - Nothing happens unless you are sitting there
 
 </td><td width="50%" valign="top">
 
-**With horde**
+**A horde**
 
-- Agents grouped by project, each with its state beside it
-- `horde digest` says what happened since you last looked
+- `horde send`, `horde ask`, `horde broadcast`. Agents talk to each other
+- `--worktree` gives each agent its own tree and branch, beside the repo
+- `horde task add` ten times. Three agents drain the queue themselves
 - Detach any time. The daemon outlives every window
-- `◐ 14 tools · 3 files` next to `◍ waiting 12m`
-- Rules that start agents on a schedule, with guards you set
+- Scheduled rules start agents while you sleep, with guards you set
 
 </td></tr>
 </table>
@@ -109,6 +107,13 @@ horde integration install claude       # let Claude Code report its own state
 horde spawn --cmd claude --name builder
 ```
 
+Now tell that agent it has company:
+
+```
+You are running inside horde. Run `horde docs orchestration` to learn how to
+start other agents and talk to them, then `horde roster` to see who is here.
+```
+
 `ctrl+b d` detaches. Your agents keep running. `ctrl+b ?` lists every key.
 
 <details>
@@ -120,6 +125,7 @@ horde spawn --cmd claude --name builder
 horde status          # what the daemon thinks is going on
 horde roster          # every agent: name, state, how long, and why
 horde digest          # what happened while you were away
+horde bus tail        # what the agents have been saying to each other
 horde worktree list   # every tree horde made, and who is in each
 horde theme list      # every palette, the built-ins and your own
 horde stop            # stop the daemon and everything it owns
@@ -129,13 +135,53 @@ horde stop            # stop the daemon and everything it owns
 
 ---
 
+## Agents that work together
+
+Every horde pane carries `HORDE_PANE` and `HORDE_DOCS` in its environment, so an agent can find out where it is and read the same manual you can. From there it has the whole CLI. These are the patterns that come up.
+
+**Start a team.** An agent spawns agents. Each gets a name, a job, and if you say so, its own worktree.
+
+```sh
+horde spawn --cmd claude --name parser --role builder --worktree --board --task "port the old parser"
+horde spawn --cmd codex  --name reviewer --role reviewer --worktree
+```
+
+**Ask and wait.** `ask` blocks until the other agent replies, and prints the reply, so it composes like any other shell command.
+
+```sh
+verdict=$(horde ask reviewer "is the migration in src/db/*.rs sound?")
+```
+
+**Work a queue instead of dispatching.** Put the jobs on the project's board. Agents claim the oldest open one, do it, report, and go back for more. A fast agent takes more. An agent that dies mid-task returns it to the board instead of losing it.
+
+```sh
+for f in src/*.rs; do horde task add "review $f and report anything broken"; done
+horde broadcast "run: while w=\$(horde task claim); [ -n \"\$w\" ]; do <do \$w>; horde task done --result \"<summary>\"; done"
+horde task list                  # watch it drain
+```
+
+**Hand work down a chain.** Each stage is told who to notify next.
+
+```sh
+horde send builder  "implement the migration, then: horde send reviewer \"ready for review\""
+horde send reviewer "when told, review it, then: horde send tester \"approved\""
+```
+
+A message arrives in the other agent's terminal as if you had typed it, prefixed `[horde] message from builder:`. If the target is mid-turn or sitting at a permission prompt, horde holds the message and delivers it when it is safe, because typing into a prompt that says "approve this file write?" would answer it. `queued` is not a failure.
+
+Everything the agents say to each other is recorded. `horde bus tail` is the transcript.
+
+Full guide, written for the agents themselves: **[docs/orchestration.md](docs/orchestration.md)**. Agents can read it with `horde docs orchestration`.
+
+---
+
 ## How it works
 
-One process owns the terminals. The window you look at is a client that draws frames and forwards keys, and owns nothing. Close it and only the client ends.
+One process owns the terminals. The window you look at is a client that draws frames and forwards keys, and owns nothing. Close it and only the client ends. Agents reach the daemon through the same socket the client does.
 
 <div align="center">
 <br>
-<img src="assets/architecture.png" alt="horde architecture: a client that draws, a daemon that owns every pty and knows each agent's state, and a socket API that agents use too" width="100%">
+<img src="assets/architecture.png" alt="horde architecture: a client that draws, a daemon that owns every pty and knows each agent's state, and a socket API that both you and the agents talk through" width="100%">
 <br>
 </div>
 
@@ -143,8 +189,6 @@ Two things fall out of that split:
 
 - **Close the terminal and nothing stops.** `horde` reattaches to the same daemon, same processes, same conversations.
 - **Rebuild without killing anything.** `horde upgrade` hands every live terminal to the new binary over a socket. Same pids before and after.
-
-Agents talk to horde through the same socket the client uses. Each pane carries `HORDE_PANE`, `HORDE_SPACE` and `HORDE_DOCS` in its environment, so an agent can find out who and where it is, message another agent, or take work from the board, without being told how.
 
 ---
 
@@ -591,14 +635,12 @@ Full reference: **[docs/configuration.md](docs/configuration.md)**.
 
 ## Point your agents at this
 
-An agent cannot discover any of this on its own. Tell it once, in `CLAUDE.md`, a system prompt, or the first thing you say to it:
+An agent cannot discover any of this on its own. Say it once, in `CLAUDE.md` or a system prompt, and every pane carries `HORDE_DOCS` in its environment holding the command to read the rest:
 
 ```
 You are running inside horde, a terminal multiplexer where agents can talk to each other.
 Run `horde docs orchestration` to learn how, then `horde roster` to see who else is here.
 ```
-
-Every horde pane carries `HORDE_DOCS` in its environment holding that exact command, so an agent that inspects its environment will find it.
 
 ---
 

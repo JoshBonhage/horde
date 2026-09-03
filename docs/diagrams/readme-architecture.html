@@ -32,7 +32,7 @@
 <body>
   <div class="frame">
     <p class="eyebrow">Architecture · horde</p>
-    <h1>One daemon owns the terminals. The window is just a view.</h1>
+    <h1>One daemon owns the terminals. Agents talk to it the same way you do.</h1>
 
     <svg viewBox="0 0 1000 620" xmlns="http://www.w3.org/2000/svg" font-family="'Geist', system-ui, sans-serif">
       <defs>
@@ -83,6 +83,12 @@
       <rect x="584" y="356" width="72" height="12" rx="2" fill="#11141a"/>
       <text x="620" y="365" fill="#79c0ff" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">HORDE.SOCK</text>
 
+
+      <!-- an agent calling horde: reviewer -> socket API. Dashed elbow, hops the pty elbow at (720,416). -->
+      <path d="M 740,296 H 728 Q 720,296 720,304 V 408 a 8,8 0 0,0 0,16 V 424 Q 720,432 712,432 H 664" fill="none" stroke="#79c0ff" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-link)"/>
+      <rect x="680" y="440" width="28" height="12" rx="2" fill="#11141a"/>
+      <text x="694" y="449" fill="#79c0ff" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">SEND</text>
+
       <!-- NODES -->
       <!-- you -->
       <rect x="40" y="248" width="112" height="64" rx="6" fill="#11141a"/>
@@ -118,7 +124,7 @@
       <rect x="484" y="400" width="180" height="64" rx="6" fill="#11141a"/>
       <rect x="484" y="400" width="180" height="64" rx="6" fill="rgba(205,214,228,0.03)" stroke="rgba(205,214,228,0.30)" stroke-width="1"/>
       <text x="574" y="428" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">socket API</text>
-      <text x="574" y="444" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">horde cli · agents use it too</text>
+      <text x="574" y="444" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">horde send · ask · spawn · task</text>
 
       <!-- panes -->
       <rect x="740" y="112" width="180" height="64" rx="6" fill="#11141a"/>
@@ -157,7 +163,7 @@
       <text x="720" y="569" fill="#cdd6e4" font-size="9">passive: reported, not driven</text>
 
       <line x1="880" y1="566" x2="916" y2="566" stroke="#79c0ff" stroke-width="1.2"/>
-      <text x="924" y="569" fill="#cdd6e4" font-size="9">API</text>
+      <text x="924" y="569" fill="#cdd6e4" font-size="9">socket API</text>
     </svg>
   </div>
 </body>
