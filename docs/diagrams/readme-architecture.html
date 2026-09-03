@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>horde: one daemon, any number of terminals</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    /* horde's own palette, not a brand skin: page bg, text, mint accent, blue for the API. */
+    :root {
+      --paper:  #11141a;
+      --ink:    #cdd6e4;
+      --muted:  #8b94a3;
+      --soft:   #555d6a;
+      --accent: #7ee2c0;
+      --link:   #79c0ff;
+      --font-sans:  'Geist', system-ui, sans-serif;
+      --font-serif: 'Instrument Serif', serif;
+      --font-mono:  'Geist Mono', ui-monospace, monospace;
+    }
+    body { font-family: var(--font-sans); background: var(--paper); color: var(--ink);
+           min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 3rem 2rem; }
+    .frame { max-width: 1200px; width: 100%; }
+    .eyebrow { font-family: var(--font-mono); font-size: 0.66rem; font-weight: 500; letter-spacing: 0.18em;
+               text-transform: uppercase; color: var(--muted); margin-bottom: 0.5rem; }
+    h1 { font-family: var(--font-serif); font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem); font-weight: 400;
+         letter-spacing: -0.02em; line-height: 1.15; color: var(--ink); margin-bottom: 1.5rem; }
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · horde</p>
+    <h1>One daemon owns the terminals. The window is just a view.</h1>
+
+    <svg viewBox="0 0 1000 620" xmlns="http://www.w3.org/2000/svg" font-family="'Geist', system-ui, sans-serif">
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#8b94a3"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#7ee2c0"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#79c0ff"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#11141a"/>
+
+      <!-- ZONE: the daemon. Drawn first so everything sits on it. -->
+      <rect x="452" y="64" width="508" height="440" rx="8" fill="rgba(205,214,228,0.02)" stroke="rgba(205,214,228,0.12)" stroke-width="0.8"/>
+      <rect x="468" y="68" width="304" height="12" rx="2" fill="#11141a"/>
+      <text x="620" y="77" fill="rgba(205,214,228,0.45)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">HORDE DAEMON · ONE PROCESS · OUTLIVES EVERY WINDOW</text>
+
+      <!-- ARROWS (before boxes) -->
+      <!-- you -> client: keys -->
+      <line x1="152" y1="280" x2="208" y2="280" stroke="#8b94a3" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- client -> engine: keys (upper), engine -> client: frames (lower). Two lanes, 32px apart. -->
+      <line x1="388" y1="264" x2="484" y2="264" stroke="#8b94a3" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="416" y="244" width="40" height="12" rx="2" fill="#11141a"/>
+      <text x="436" y="253" fill="#8b94a3" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">KEYS</text>
+
+      <line x1="484" y1="296" x2="388" y2="296" stroke="#7ee2c0" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+      <rect x="412" y="304" width="48" height="12" rx="2" fill="#11141a"/>
+      <text x="436" y="313" fill="#7ee2c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">FRAMES</text>
+
+      <!-- engine -> three panes. Up, straight, down. Elbows r=8 at mid x=704. -->
+      <path d="M 664,264 H 696 Q 704,264 704,256 V 152 Q 704,144 712,144 H 740" fill="none" stroke="#8b94a3" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="664" y1="280" x2="740" y2="280" stroke="#8b94a3" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 664,296 H 696 Q 704,296 704,304 V 408 Q 704,416 712,416 H 740" fill="none" stroke="#8b94a3" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="668" y="360" width="28" height="12" rx="2" fill="#11141a"/>
+      <text x="682" y="369" fill="#8b94a3" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PTY</text>
+
+      <!-- panes report back to the detector (dashed, passive): hooks and screen reads -->
+      <line x1="740" y1="128" x2="664" y2="128" stroke="#8b94a3" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <rect x="680" y="108" width="44" height="12" rx="2" fill="#11141a"/>
+      <text x="702" y="117" fill="#8b94a3" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">HOOKS</text>
+
+      <!-- detector -> engine: state -->
+      <line x1="574" y1="176" x2="574" y2="232" stroke="#8b94a3" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="584" y="196" width="40" height="12" rx="2" fill="#11141a"/>
+      <text x="604" y="205" fill="#8b94a3" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">STATE</text>
+
+      <!-- socket api -> engine: every command, from you or from an agent -->
+      <line x1="574" y1="400" x2="574" y2="328" stroke="#79c0ff" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <rect x="584" y="356" width="72" height="12" rx="2" fill="#11141a"/>
+      <text x="620" y="365" fill="#79c0ff" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">HORDE.SOCK</text>
+
+      <!-- NODES -->
+      <!-- you -->
+      <rect x="40" y="248" width="112" height="64" rx="6" fill="#11141a"/>
+      <rect x="40" y="248" width="112" height="64" rx="6" fill="rgba(139,148,163,0.10)" stroke="#555d6a" stroke-width="1"/>
+      <text x="96" y="276" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">you</text>
+      <text x="96" y="292" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">any terminal</text>
+
+      <!-- client -->
+      <rect x="208" y="232" width="180" height="96" rx="6" fill="#11141a"/>
+      <rect x="208" y="232" width="180" height="96" rx="6" fill="rgba(205,214,228,0.04)" stroke="#cdd6e4" stroke-width="1"/>
+      <rect x="216" y="238" width="36" height="12" rx="2" fill="transparent" stroke="rgba(205,214,228,0.40)" stroke-width="0.8"/>
+      <text x="234" y="247" fill="rgba(205,214,228,0.8)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">TUI</text>
+      <text x="298" y="278" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">horde client</text>
+      <text x="298" y="294" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">draws · forwards keys</text>
+      <text x="298" y="308" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">owns nothing</text>
+
+      <!-- engine (focal) -->
+      <rect x="484" y="232" width="180" height="96" rx="6" fill="#11141a"/>
+      <rect x="484" y="232" width="180" height="96" rx="6" fill="rgba(126,226,192,0.10)" stroke="#7ee2c0" stroke-width="1.2"/>
+      <rect x="492" y="238" width="44" height="12" rx="2" fill="transparent" stroke="rgba(126,226,192,0.5)" stroke-width="0.8"/>
+      <text x="514" y="247" fill="#7ee2c0" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CORE</text>
+      <text x="574" y="278" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">engine</text>
+      <text x="574" y="294" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">every pty · layout</text>
+      <text x="574" y="308" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">who needs you</text>
+
+      <!-- detector -->
+      <rect x="484" y="112" width="180" height="64" rx="6" fill="#11141a"/>
+      <rect x="484" y="112" width="180" height="64" rx="6" fill="rgba(205,214,228,0.05)" stroke="#8b94a3" stroke-width="1"/>
+      <text x="574" y="140" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">detector</text>
+      <text x="574" y="156" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">working · blocked · done</text>
+
+      <!-- socket api -->
+      <rect x="484" y="400" width="180" height="64" rx="6" fill="#11141a"/>
+      <rect x="484" y="400" width="180" height="64" rx="6" fill="rgba(205,214,228,0.03)" stroke="rgba(205,214,228,0.30)" stroke-width="1"/>
+      <text x="574" y="428" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">socket API</text>
+      <text x="574" y="444" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">horde cli · agents use it too</text>
+
+      <!-- panes -->
+      <rect x="740" y="112" width="180" height="64" rx="6" fill="#11141a"/>
+      <rect x="740" y="112" width="180" height="64" rx="6" fill="rgba(205,214,228,0.04)" stroke="#cdd6e4" stroke-width="1"/>
+      <text x="830" y="140" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">◐ builder</text>
+      <text x="830" y="156" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">claude · working</text>
+
+      <rect x="740" y="248" width="180" height="64" rx="6" fill="#11141a"/>
+      <rect x="740" y="248" width="180" height="64" rx="6" fill="rgba(205,214,228,0.04)" stroke="#cdd6e4" stroke-width="1"/>
+      <text x="830" y="276" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">◍ reviewer</text>
+      <text x="830" y="292" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">codex · waiting on you</text>
+
+      <rect x="740" y="384" width="180" height="64" rx="6" fill="#11141a"/>
+      <rect x="740" y="384" width="180" height="64" rx="6" fill="rgba(205,214,228,0.04)" stroke="#cdd6e4" stroke-width="1"/>
+      <text x="830" y="412" fill="#cdd6e4" font-size="12" font-weight="600" text-anchor="middle">◆ vite</text>
+      <text x="830" y="428" fill="#8b94a3" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">service · :5173</text>
+
+      <!-- ANNOTATION: the one idea that matters -->
+      <text x="298" y="356" fill="#8b94a3" font-size="14" font-family="'Instrument Serif', serif" font-style="italic" text-anchor="middle">close the terminal and only this box ends</text>
+      <line x1="298" y1="340" x2="298" y2="328" stroke="#555d6a" stroke-width="0.8"/>
+
+      <!-- LEGEND -->
+      <line x1="30" y1="548" x2="970" y2="548" stroke="rgba(205,214,228,0.10)" stroke-width="0.8"/>
+      <text x="30" y="568" fill="#8b94a3" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+      <rect x="116" y="560" width="12" height="12" rx="2" fill="rgba(126,226,192,0.10)" stroke="#7ee2c0" stroke-width="1"/>
+      <text x="136" y="569" fill="#cdd6e4" font-size="9">the one thing that must not die</text>
+
+      <rect x="332" y="560" width="12" height="12" rx="2" fill="rgba(205,214,228,0.04)" stroke="#cdd6e4" stroke-width="1"/>
+      <text x="352" y="569" fill="#cdd6e4" font-size="9">a process: the client, or a pane</text>
+
+      <rect x="548" y="560" width="12" height="12" rx="2" fill="rgba(205,214,228,0.05)" stroke="#8b94a3" stroke-width="1"/>
+      <text x="568" y="569" fill="#cdd6e4" font-size="9">derived state</text>
+
+      <line x1="676" y1="566" x2="712" y2="566" stroke="#8b94a3" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="720" y="569" fill="#cdd6e4" font-size="9">passive: reported, not driven</text>
+
+      <line x1="880" y1="566" x2="916" y2="566" stroke="#79c0ff" stroke-width="1.2"/>
+      <text x="924" y="569" fill="#cdd6e4" font-size="9">API</text>
+    </svg>
+  </div>
+</body>
+</html>
