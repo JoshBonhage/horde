@@ -233,6 +233,17 @@ fn describe_action(name: &str, action: &Action) -> String {
         // The generic name-to-words fallback would render this as bare "digest", which does
         // not say what it does.
         Action::Cmd(crate::proto::Cmd::RequestDigest) => "what happened while you were away".into(),
+        // A split says which way the *new pane* goes, which is the thing the four arrow keys
+        // differ by and the one thing the binding name cannot say without repeating itself
+        // once per alias ("split right bar" is not a sentence anybody wants in the help).
+        Action::Cmd(crate::proto::Cmd::SplitDir(d)) => {
+            format!("new pane {}", match d {
+                crate::proto::Dir::Left => "to the left",
+                crate::proto::Dir::Right => "to the right",
+                crate::proto::Dir::Up => "above",
+                crate::proto::Dir::Down => "below",
+            })
+        }
         Action::Cmd(_) => name.replace('_', " "),
     }
 }
@@ -1105,9 +1116,26 @@ mod tests {
     fn action_descriptions_prefer_prose_over_the_raw_name() {
         assert_eq!(describe_action("detach", &Action::Detach), "detach (agents keep running)");
         // Command actions fall back to a readable form of their name.
+        // A split is described by its direction, not by its binding name: four arrows and
+        // four tmux aliases share one action, and only the direction tells them apart.
         assert_eq!(
-            describe_action("split_right", &Action::Cmd(crate::proto::Cmd::SplitRight)),
-            "split right"
+            describe_action(
+                "split_right_bar",
+                &Action::Cmd(crate::proto::Cmd::SplitDir(crate::proto::Dir::Right))
+            ),
+            "new pane to the right"
+        );
+        assert_eq!(
+            describe_action(
+                "split_up",
+                &Action::Cmd(crate::proto::Cmd::SplitDir(crate::proto::Dir::Up))
+            ),
+            "new pane above"
+        );
+        // Other commands still fall back to a readable form of their name.
+        assert_eq!(
+            describe_action("close_pane", &Action::Cmd(crate::proto::Cmd::ClosePane)),
+            "close pane"
         );
     }
 

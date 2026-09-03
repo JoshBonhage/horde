@@ -12,10 +12,10 @@ See [The leader](#the-leader).
 
 | Key | Action |
 |---|---|
-| `\|` or `%` | split right |
-| `-` or `"` | split down |
+| `←` `↓` `↑` `→` | **split** — the new pane goes where you point |
+| `\|` or `%` | split right (tmux's keys, kept) |
+| `-` or `"` | split down (likewise) |
 | `h` `j` `k` `l` | move focus — resolved by geometry, not tree position |
-| arrows | same |
 | `H` `J` `K` `L` | resize |
 | `ctrl+h/j/k/l` | swap panes |
 | `z` | zoom / unzoom |

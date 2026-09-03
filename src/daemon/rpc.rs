@@ -1280,8 +1280,8 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
 
 fn command_by_name(name: &str, req: &Request) -> Option<Cmd> {
     Some(match name {
-        "split-right" => Cmd::SplitRight,
-        "split-down" => Cmd::SplitDown,
+        "split-right" => Cmd::SplitDir(Dir::Right),
+        "split-down" => Cmd::SplitDir(Dir::Down),
         "close-pane" => Cmd::ClosePane,
         "zoom" => Cmd::ToggleZoom,
         "focus-left" => Cmd::FocusDir(Dir::Left),

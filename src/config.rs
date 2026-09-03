@@ -1529,20 +1529,25 @@ impl Default for Keymap {
         };
         let table: Vec<(&str, Trigger, Action)> = vec![
             // Panes
-            ("split_right", Trigger::Prefix(d("|")), Action::Cmd(SplitRight)),
-            ("split_right_alt", Trigger::Prefix(d("%")), Action::Cmd(SplitRight)),
-            ("split_down", Trigger::Prefix(d("-")), Action::Cmd(SplitDown)),
-            ("split_down_alt", Trigger::Prefix(d("\"")), Action::Cmd(SplitDown)),
+            // Arrows split, in the direction you point. The layout has always been able to
+            // put a new pane on any of the four sides; before this only two of them had a
+            // key. Focus keeps `hjkl` and `leader w hjkl`, so nothing became unreachable --
+            // what changed is that an arrow now makes a pane instead of moving between them.
+            ("split_left", Trigger::Prefix(d("left")), Action::Cmd(SplitDir(Dir::Left))),
+            ("split_down", Trigger::Prefix(d("down")), Action::Cmd(SplitDir(Dir::Down))),
+            ("split_up", Trigger::Prefix(d("up")), Action::Cmd(SplitDir(Dir::Up))),
+            ("split_right", Trigger::Prefix(d("right")), Action::Cmd(SplitDir(Dir::Right))),
+            // tmux's own split keys, kept: they are muscle memory, and they cost two lines.
+            ("split_right_bar", Trigger::Prefix(d("|")), Action::Cmd(SplitDir(Dir::Right))),
+            ("split_right_pct", Trigger::Prefix(d("%")), Action::Cmd(SplitDir(Dir::Right))),
+            ("split_down_dash", Trigger::Prefix(d("-")), Action::Cmd(SplitDir(Dir::Down))),
+            ("split_down_quote", Trigger::Prefix(d("\"")), Action::Cmd(SplitDir(Dir::Down))),
             ("close_pane", Trigger::Prefix(d("x")), Action::Cmd(ClosePane)),
             ("zoom", Trigger::Prefix(d("z")), Action::Cmd(ToggleZoom)),
             ("focus_left", Trigger::Prefix(d("h")), Action::Cmd(FocusDir(Dir::Left))),
             ("focus_down", Trigger::Prefix(d("j")), Action::Cmd(FocusDir(Dir::Down))),
             ("focus_up", Trigger::Prefix(d("k")), Action::Cmd(FocusDir(Dir::Up))),
             ("focus_right", Trigger::Prefix(d("l")), Action::Cmd(FocusDir(Dir::Right))),
-            ("focus_left_arrow", Trigger::Prefix(d("left")), Action::Cmd(FocusDir(Dir::Left))),
-            ("focus_down_arrow", Trigger::Prefix(d("down")), Action::Cmd(FocusDir(Dir::Down))),
-            ("focus_up_arrow", Trigger::Prefix(d("up")), Action::Cmd(FocusDir(Dir::Up))),
-            ("focus_right_arrow", Trigger::Prefix(d("right")), Action::Cmd(FocusDir(Dir::Right))),
             ("resize_left", Trigger::Prefix(d("H")), Action::Cmd(Resize { dir: Dir::Left, cells: 3 })),
             ("resize_down", Trigger::Prefix(d("J")), Action::Cmd(Resize { dir: Dir::Down, cells: 2 })),
             ("resize_up", Trigger::Prefix(d("K")), Action::Cmd(Resize { dir: Dir::Up, cells: 2 })),
@@ -1620,8 +1625,8 @@ impl Default for Keymap {
             ("leader_project_new", Trigger::Leader(seq(&["p", "n"])), Action::Cmd(NewSpace { name: None })),
             ("leader_project_rename", Trigger::Leader(seq(&["p", "r"])), Action::RenamePane),
             // Windows: a mirror of the prefix splits, for the hand that lives on the leader.
-            ("leader_window_split_right", Trigger::Leader(seq(&["w", "v"])), Action::Cmd(SplitRight)),
-            ("leader_window_split_down", Trigger::Leader(seq(&["w", "s"])), Action::Cmd(SplitDown)),
+            ("leader_window_split_right", Trigger::Leader(seq(&["w", "v"])), Action::Cmd(SplitDir(Dir::Right))),
+            ("leader_window_split_down", Trigger::Leader(seq(&["w", "s"])), Action::Cmd(SplitDir(Dir::Down))),
             ("leader_window_zoom", Trigger::Leader(seq(&["w", "z"])), Action::Cmd(ToggleZoom)),
             ("leader_window_close", Trigger::Leader(seq(&["w", "x"])), Action::Cmd(ClosePane)),
             ("leader_window_left", Trigger::Leader(seq(&["w", "h"])), Action::Cmd(FocusDir(Dir::Left))),
@@ -2476,6 +2481,61 @@ bogus_action = "prefix+q"
         let quiet = write_tmp("kit-quiet", "scrollback = 100\n");
         assert_eq!(Config::load_from(&quiet).0.kit, cfg!(feature = "full"));
         let _ = std::fs::remove_file(quiet);
+    }
+
+    /// Prefix + an arrow makes a pane on that side. All four, because the whole point of
+    /// moving off `|` and `-` is that the layout could always split four ways and only two
+    /// of them had a key.
+    #[test]
+    fn prefix_and_an_arrow_splits_toward_the_arrow() {
+        let km = Keymap::default();
+        for (key, dir) in [
+            ("left", Dir::Left),
+            ("right", Dir::Right),
+            ("up", Dir::Up),
+            ("down", Dir::Down),
+        ] {
+            let chord = Chord::parse(key).unwrap();
+            assert_eq!(
+                km.lookup(&Trigger::Prefix(chord)),
+                Some(&Action::Cmd(Cmd::SplitDir(dir))),
+                "prefix+{key} should split {dir:?}"
+            );
+        }
+    }
+
+    /// Focus did not lose a key, it lost an *alias*. Arrows were a second way to do what
+    /// `hjkl` does; taking them for splits costs nothing as long as `hjkl` still moves.
+    #[test]
+    fn focus_still_has_a_key_in_every_direction() {
+        let km = Keymap::default();
+        for (key, dir) in [
+            ("h", Dir::Left),
+            ("j", Dir::Down),
+            ("k", Dir::Up),
+            ("l", Dir::Right),
+        ] {
+            let chord = Chord::parse(key).unwrap();
+            assert_eq!(
+                km.lookup(&Trigger::Prefix(chord)),
+                Some(&Action::Cmd(Cmd::FocusDir(dir))),
+                "prefix+{key} should still focus {dir:?}"
+            );
+        }
+    }
+
+    /// tmux's split keys still work, because they are muscle memory and cost two lines.
+    #[test]
+    fn the_tmux_split_keys_still_split() {
+        let km = Keymap::default();
+        for (key, dir) in [("|", Dir::Right), ("%", Dir::Right), ("-", Dir::Down)] {
+            let chord = Chord::parse(key).unwrap();
+            assert_eq!(
+                km.lookup(&Trigger::Prefix(chord)),
+                Some(&Action::Cmd(Cmd::SplitDir(dir))),
+                "prefix+{key}"
+            );
+        }
     }
 
     /// A key still bound to a kit action on a kit-less build is worse than no key at all: it

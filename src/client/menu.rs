@@ -163,8 +163,10 @@ pub fn build(target: Target, snap: &Snapshot, prefix: &str) -> Level {
             let zoomed = snap.view.zoom == Some(pane);
 
             let mut items = vec![
-                Item::new("Split right", &k("|"), Act::Cmd(Cmd::SplitRight)),
-                Item::new("Split down", &k("-"), Act::Cmd(Cmd::SplitDown)),
+                Item::new("Split right", &k("right"), Act::Cmd(Cmd::SplitDir(Dir::Right))),
+                Item::new("Split down", &k("down"), Act::Cmd(Cmd::SplitDir(Dir::Down))),
+                Item::new("Split left", &k("left"), Act::Cmd(Cmd::SplitDir(Dir::Left))),
+                Item::new("Split up", &k("up"), Act::Cmd(Cmd::SplitDir(Dir::Up))),
                 Item::new("Start agent here…", "", Act::Submenu(Sub::Spawn)),
                 Item::new("Run command…", "", Act::Prompt(Prompt::RunCommand)),
                 Item::separator(),
@@ -509,8 +511,15 @@ mod tests {
     #[test]
     fn hints_show_the_keyboard_equivalent() {
         let l = build(Target::Pane(1), &snap(), "ctrl+b");
-        let split = l.items.iter().find(|i| i.label == "Split right").unwrap();
-        assert_eq!(split.hint, "ctrl+b |");
+        let hint = |label: &str| {
+            l.items.iter().find(|i| i.label == label).unwrap_or_else(|| panic!("{label}")).hint.clone()
+        };
+        // The arrow, not the tmux alias: the menu should teach the key you are meant to reach
+        // for, and all four directions have one.
+        assert_eq!(hint("Split right"), "ctrl+b right");
+        assert_eq!(hint("Split left"), "ctrl+b left");
+        assert_eq!(hint("Split up"), "ctrl+b up");
+        assert_eq!(hint("Split down"), "ctrl+b down");
     }
 
     #[test]

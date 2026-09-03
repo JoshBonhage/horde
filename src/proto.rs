@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -636,8 +636,13 @@ pub enum ClientFrame {
 /// interactive and fire far more often.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Cmd {
-    SplitRight,
-    SplitDown,
+    /// Split the focused pane, putting the new one on `dir`'s side.
+    ///
+    /// One command with a direction rather than two named ones, matching `FocusDir` and
+    /// `SwapDir`. The layout has always been able to split all four ways -- `Layout::split`
+    /// takes a `Dir` and has a test for Left -- and only this enum was keeping two of them
+    /// unreachable from a keybinding.
+    SplitDir(Dir),
     ClosePane,
     FocusDir(Dir),
     Resize { dir: Dir, cells: u16 },
@@ -1322,11 +1327,11 @@ mod digest_tests {
     #[test]
     fn cmd_variants_are_append_only() {
         for (cmd, want) in [
-            (Cmd::SplitRight, 0u8),
-            (Cmd::NewTab, 7),
-            (Cmd::JumpAttention, 18),
-            (Cmd::RequestDigest, 30),
-            (Cmd::Redraw, 31),
+            (Cmd::SplitDir(Dir::Right), 0u8),
+            (Cmd::NewTab, 6),
+            (Cmd::JumpAttention, 17),
+            (Cmd::RequestDigest, 29),
+            (Cmd::Redraw, 30),
         ] {
             let bytes = postcard::to_allocvec(&cmd).unwrap();
             assert_eq!(bytes[0], want, "{cmd:?} moved: variants must only ever be appended");
@@ -1337,7 +1342,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 21, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 22, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the
@@ -1358,8 +1363,7 @@ mod digest_tests {
         #[allow(dead_code)]
         fn every_cmd(c: Cmd) {
             match c {
-                Cmd::SplitRight
-                | Cmd::SplitDown
+                Cmd::SplitDir(..)
                 | Cmd::ClosePane
                 | Cmd::FocusDir(..)
                 | Cmd::Resize { .. }

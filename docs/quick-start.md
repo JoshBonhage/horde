@@ -36,8 +36,8 @@ copied or restored from dotfiles does not silently cost you the walkthrough.
 ## First splits
 
 ```
-ctrl+b |     split right
-ctrl+b -     split down
+ctrl+b →     split — the new pane goes where you point (all four arrows)
+ctrl+b |  -  split right / down, tmux's keys, still there
 ctrl+b hjkl  move between panes
 ctrl+b z     zoom the focused pane
 ctrl+b ?     every key

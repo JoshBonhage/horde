@@ -262,7 +262,8 @@ you four rather than an error.
 
 | Key | What it does |
 |---|---|
-| `\|` `-` | split right / down (`%` and `"` also work) |
+| `←` `↓` `↑` `→` | **split** — the new pane goes where you point, all four sides |
+| `\|` `-` | split right / down, tmux's keys (`%` and `"` also work) |
 | `h` `j` `k` `l` | move focus — **resolved by geometry, not tree position** |
 | `H` `J` `K` `L` | resize the focused edge |
 | `ctrl+h/j/k/l` | swap this pane with its neighbour |

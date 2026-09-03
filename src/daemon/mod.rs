@@ -1492,8 +1492,7 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
     let mut seen: Option<PaneId> = None;
 
     match cmd {
-        Cmd::SplitRight | Cmd::SplitDown => {
-            let dir = if cmd == Cmd::SplitRight { Dir::Right } else { Dir::Down };
+        Cmd::SplitDir(dir) => {
             if let Err(e) = eng.session.split(&cfg, None, dir, None) {
                 problems.push((NoticeLevel::Warn, e.to_string()));
             }
@@ -3973,7 +3972,7 @@ mod tests {
     fn a_spawn_requests_a_prompt_detection_pass() {
         let mut eng = engine();
         eng.detect_soon = false;
-        apply_cmd(&mut eng, Cmd::SplitRight);
+        apply_cmd(&mut eng, Cmd::SplitDir(Dir::Right));
         assert!(eng.detect_soon, "spawning a pane must ask for a detection pass");
 
         // And that pass happens on the very next tick, not only on the cadence.

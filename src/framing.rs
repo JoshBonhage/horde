@@ -54,7 +54,7 @@ mod tests {
     #[tokio::test]
     async fn round_trips_frames_back_to_back() {
         let a = ClientFrame::Input { pane: 7, bytes: b"hello".to_vec() };
-        let b = ClientFrame::Command(Cmd::SplitRight);
+        let b = ClientFrame::Command(Cmd::SplitDir(crate::proto::Dir::Right));
 
         let mut buf = Vec::new();
         buf.extend(encode(&a).unwrap());
@@ -65,7 +65,7 @@ mod tests {
         let got_b: ClientFrame = read_frame(&mut cursor).await.unwrap();
 
         assert!(matches!(got_a, ClientFrame::Input { pane: 7, .. }));
-        assert!(matches!(got_b, ClientFrame::Command(Cmd::SplitRight)));
+        assert!(matches!(got_b, ClientFrame::Command(Cmd::SplitDir(crate::proto::Dir::Right))));
     }
 
     #[tokio::test]

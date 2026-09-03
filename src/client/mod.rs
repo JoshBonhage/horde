@@ -2746,8 +2746,8 @@ fn settings_key(
 fn command_for(name: &str) -> Option<Cmd> {
     use crate::proto::Dir;
     Some(match name {
-        "split-right" => Cmd::SplitRight,
-        "split-down" => Cmd::SplitDown,
+        "split-right" => Cmd::SplitDir(Dir::Right),
+        "split-down" => Cmd::SplitDir(Dir::Down),
         "close-pane" => Cmd::ClosePane,
         "zoom" => Cmd::ToggleZoom,
         "focus-left" => Cmd::FocusDir(Dir::Left),
@@ -7525,7 +7525,7 @@ mod tests {
         press_chord(&mut app, "w");
         let out = press_chord(&mut app, "v");
         assert_eq!(app.mode, Mode::Terminal);
-        assert_eq!(cmds(out), vec![Cmd::SplitRight], "leader w v splits right");
+        assert_eq!(cmds(out), vec![Cmd::SplitDir(crate::proto::Dir::Right)], "leader w v splits right");
     }
 
     /// Backspace steps back one key rather than dumping the sequence, so a mistyped middle
