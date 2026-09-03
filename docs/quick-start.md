@@ -21,6 +21,16 @@ horde
 That is all. horde starts its own background daemon, creates a space named after the
 directory, and drops you into a shell.
 
+The first thing you see is a three-question walkthrough: where notes
+live, whether Claude Code should report its own state through hooks (see
+[below](#worth-doing-once) — the walkthrough can do this for you), and whether horde may act
+while nobody is attached. Every answer is already chosen, so `enter` through it is fine and
+`esc` skips it. It is all config afterwards, and reopenable from Settings → Agents.
+
+You get it once. Finishing it or skipping it writes `setup.done`, which is the only thing that
+decides whether you are asked — not whether a `config.toml` happens to exist, so a config you
+copied or restored from dotfiles does not silently cost you the walkthrough.
+
 `ctrl+b d` detaches. **Your agents keep running.** `horde` reattaches.
 
 ## First splits
@@ -100,9 +110,14 @@ names the headline, so you know whether it is worth opening.
 horde integration install claude
 ```
 
-This installs lifecycle hooks so Claude Code reports its own state instead of horde guessing
-from the screen. It merges into `~/.claude/settings.json`, backs the file up first, leaves
-other tools' hooks alone, and is safe to re-run. Restart running Claude sessions afterwards.
+The first-run walkthrough offers this, and Settings → Agents has it as a row; this is the same
+thing from a shell.
+
+It installs lifecycle hooks so Claude Code reports its own state instead of horde guessing from
+the screen, and installs the skill that teaches an agent to use the bus. It merges into
+`~/.claude/settings.json`, backs the file up first, leaves other tools' hooks alone, and is safe
+to re-run. Restart running Claude sessions afterwards. `horde integration uninstall claude`
+reverses both.
 
 Why it matters: screen detection reads whatever is on screen, and Claude's
 `esc to interrupt` marker sits at the end of a long status line — a narrow pane truncates it

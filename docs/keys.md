@@ -3,6 +3,11 @@
 Prefix is `ctrl+b`, configurable. `ctrl+b ?` lists the live keymap, which is the
 authoritative version — this page describes the defaults.
 
+There is a second way in: the **leader**, `ctrl+space`, which opens a table of multi-key
+sequences instead of single keys. The prefix is for the multiplexer's own verbs and stays
+one keystroke deep; the leader is where everything else goes, grouped by what it is for.
+See [The leader](#the-leader).
+
 ## Panes
 
 | Key | Action |
@@ -46,11 +51,381 @@ authoritative version — this page describes the defaults.
 | `g` | command palette |
 | `.` | settings |
 | `?` | keys |
+| `0` | the start screen — tabs are 1–9, so home is 0 |
+| `N` | this project's notes |
+| `V` | the vault, with its tree |
+| `w` | write a new note |
+| `F` | this project's files |
+| `G` | the link graph |
+| `T` | your own board — the kanban, which is not the agents' task board |
 | `d` | detach — agents keep running |
 | `ctrl+b` | send the prefix itself to the pane |
 
 `ctrl+b a` is the one that earns its keep once you have more than two agents: it walks the
 queue of agents that are `blocked` or `done`, so you never hunt for the one waiting on you.
+
+## The start screen
+
+**Opening horde lands here, every time.** Arriving is the moment you want the state of
+things — which agents need you, which projects are live, which ones you had open last time
+— rather than whichever pane happened to be focused when you left.
+
+The daemon is untouched by this. Agents keep running whether or not anyone is looking, which
+is the whole point of a daemon; it is only the *view* that resets, and `esc` is one keystroke
+from the terminal. `ctrl+b 0` or `ctrl+space d` brings it back whenever you want.
+
+| Key | Action |
+|---|---|
+| `j` `k`, arrows | walk the rows — and, in the menu, `h` `l` across it |
+| `enter` | open the row — focus a live project, reopen a remembered one, run a menu entry |
+| `p` or `P` | the project picker |
+| `n` | new project |
+| `w` `N` `V` | write a note · browse notes · the vault |
+| `o` `D` | roster · digest |
+| `.` `?` | settings · keys |
+| `esc` | drop into the terminal |
+| `q` | detach |
+
+Under the session sits **actions**: the same keys as a block, three to a line, wrapping onto
+as many lines as it takes. The cursor walks it like any other row — down moves a whole line,
+left and right move one entry — so nothing on this screen has to be remembered before it can
+be used. On a screen too short for everything the project listing scrolls, rather than the
+menu falling off the bottom.
+
+A live project shows what is running in it (`main*  2 agents  ◍1`); a remembered one says
+`resume` and how long ago. The row tells you which before you press anything, so `enter`
+never starts a second copy of a project you already had open.
+
+Every so often something shambles across the wordmark, takes about twenty-five seconds
+about it, and then the screen is completely still again for a minute or so — it only moves
+while the start screen is up and there is room for the banner, and it draws no frames at all
+in between. `zombie = false` under `[ui]` turns it off; `animate = false` turns it off along
+with the spinners.
+
+Set `dashboard = false` under `[ui]` to attach straight into the terminal instead.
+
+## Opening a project
+
+`enter` on a project — on the start screen, or `ctrl+b F` any time — shows you **the
+project**: its files, as a tree, filtered as you type. `enter` on a file opens it for editing
+inside horde. `ctrl+t` gives you a terminal in it, and `ctrl+p` opens the file in a pane of its own.
+
+A pane showing a file is a pane in every way that matters: it splits, zooms, swaps and
+resizes with everything else, so an agent working in one half and the file it is working on
+in the other is just a normal layout. It is read-only for now — writing has a place already,
+and moving that into a pane is its own change. It takes no input, is never mistaken for an
+agent, and does not survive `horde upgrade`, which reopens from the path instead.
+
+That way round on purpose. Opening a project is usually about a file, and the multiplexer is
+a keystroke away rather than the thing you go through to reach anything else.
+
+Folders are closed until you ask for them, so a project arrives as its shape rather than as
+every file it contains. `enter` or `→` opens one, `←` closes it, and typing a query opens
+whatever holds a match — a folder collapsed over the thing you are looking for is a folder
+lying to you. Directories come before files at every level, which is how a project reads.
+
+The listing is what you wrote, not what the machine made: build output, vendored code,
+version history, and binaries are skipped. It is not a full `.gitignore` implementation —
+just the directories that are output in every language — and it stops at a few thousand
+files rather than pretending to offer a list nobody could pick from.
+
+Editing a project file is the same editor notes use, minus the live preview — that is a
+markdown idea and would happily read `**p` in C as bold text. Code gets **syntax colouring**
+instead: comments, keywords, types, strings and numbers, in the colours of whichever theme
+you are running, so a window painted in gruvbox does not have somebody else's editor inside
+it.
+
+Which languages a build understands is a property of the binary, not a setting: grammars are
+compiled in. `horde status` lists them. The default build knows markdown, rust, typescript,
+tsx, javascript, python, json, toml and bash, and costs about 6.6 MB for the privilege — a
+build that only wants notes is
+
+```sh
+cargo build --release --no-default-features --features lang-markdown
+```
+
+which comes out around half the size.
+
+## Notes
+
+There are two ways in, and they answer different questions.
+
+`ctrl+b N` is the **finder**: every note, filtered as you type, with what links to each one.
+Reach for it when you know roughly what the note is called. `enter` opens the note in
+`$EDITOR` in a split.
+
+`ctrl+b V` is the **vault** — somewhere to *be* rather than something to search. It opens the
+vault's home note with the tree of notes beside it, so what else is in there stays visible
+while you read and write:
+
+```
+   Home.md                                        │ VAULT  5
+                                                  │
+   # Home                                         │ Daily/
+                                                  │     2026-08-20
+   The front page of the vault.                   │ ▸ Home
+                                                  │ Projects/
+   • Projects/horde                               │     horde-desktop
+   • Daily/2026-08-20                             │     horde
+                                                  │ Reading/
+                                                  │     obsidian sync
+   i insert   : command   / search   u undo        │
+```
+
+The home note is `Home.md`, or failing that `index.md`, then `README.md`, at the vault root —
+the three names a vault with a front page will already have used. Only the root: a `Home.md`
+filed inside a folder is that folder's front page, not the vault's. If there is no such note,
+horde writes `Home.md` for you, because an empty vault is the ordinary state of a new one.
+
+Inside it:
+
+| Key | Action |
+|---|---|
+| `ctrl+n` | **a new note** — asks for a title, then opens it |
+| `:new <title>` | the same, with the title typed up front |
+| `\` | show or hide the tree |
+| click a note | open it |
+| everything else | the editor, as below |
+
+### Making a note
+
+**`ctrl+n` makes a note, everywhere on the notes side** — in the browser, and in a note. One
+key, so it does not depend on which surface you are looking at.
+
+The one exception is **while you are typing**: in insert mode `ctrl+n` is completion, because
+that is vim's own key for it and the editor honours it. From insert, `esc` first.
+
+`:new <title>` does the same thing with the title given up front, which saves the prompt. Both
+land the note in the vault you are reading, turn the title into a filename with the characters
+a filename cannot hold taken out, and redraw the tree with the new note on it.
+
+Both refuse while the note you are holding has unsaved work — write it with `:w` first.
+
+**It never leaves the vault.** `ctrl+n` opens the editor's own command line, in its footer,
+with `:new ` already typed — so the note you are reading and the tree beside it stay on screen
+while you name the new one:
+
+```
+   # Home                                          │ Daily/
+                                                   │     2026-08-20
+   The front page of the vault.                     │ ▸ Home
+                                                   │ Projects/
+   :new Reading list                                │     horde
+```
+
+That is deliberate rather than incidental. horde's shared prompt is drawn over the *panes*, so
+asking for a note through it dimmed the vault away and showed you the multiplexer to type into —
+being thrown out of what you were doing in order to answer one question. The editor asks with
+its own footer instead and stays put. `esc`, or backspacing off the front of the line, puts you
+back in the note.
+
+The note browser still uses the shared prompt, but it is now drawn over the browser rather than
+over the panes, and `esc` returns to the browser with your filter intact.
+
+The tree is context, not the point — on a terminal too narrow to carry both, the note keeps
+the width and the tree goes away. Clicking a note with unsaved work in the current one is
+refused rather than obeyed; write it first with `:w`.
+
+**Backing out leaves the notes side**, rather than dropping you in the browser. There is nothing
+in the browser the vault page does not already have — the tree switches notes, `ctrl+n` makes
+them — so that step was one more screen for no gain. A note you opened *from* the browser still
+goes back to the browser, because that is the browser's own flow.
+
+A project file opened with `ctrl+b F` never grows this tree. It has its own, and a second one
+listing your notes beside your source is not a thing anybody wants.
+
+### Setting up
+
+The first time horde starts with no `config.toml`, it opens a short walkthrough: where notes
+live, whether Claude Code should report its own state through hooks, and whether horde may act
+while nobody is attached. Every step has a sensible answer already chosen, so `enter` four times
+is a valid way through it, and `esc` skips it entirely. It writes `config.toml`, creates the
+vault, and reloads, so what you chose is what is running.
+
+Nothing about it is one-way — everything it asks lives in config and changes whenever you like.
+**Settings → Agents → Run setup again** reopens it, showing what is in force rather than
+starting from nothing, and finishing merges into your `config.toml` without disturbing anything
+you wrote by hand.
+
+**Writing a note never needs a project.** `ctrl+b w` asks for a title and drops you into
+it, from wherever you are — a pane, the start screen, another note. A thought worth keeping
+rarely arrives while you happen to have the right directory open.
+
+Where it goes: the project's own vault if it has one, else the **home vault**, which is
+always there. That is `~/notes` by default and `vault.home` in config. horde creates it the first time you
+write a note — not before, since making directories on somebody's disk unasked is rude, and
+asking for a note *is* the ask. It marks it with a `.horde-vault` file so it is found again by looking rather than
+by being configured — the same trick `.obsidian/` plays, which is also why an Obsidian vault
+you already keep is adopted as-is when you open a space **on** it.
+
+Only the directory itself, or the one `vault.dir` names. horde does not go looking through
+subdirectories for a vault to adopt: open a space on your home directory and it would index
+whichever one it happened to find first, which is a surprise nobody asked for.
+
+Notes are tracked, human-owned content, which is why they are never under `.horde/`: that
+directory is excluded from git on purpose, and notes are the opposite of scratch.
+
+The browser shows the vault as a **tree** — folders as headings, notes indented under them.
+The cursor walks past folders, since there is nothing to do to one.
+
+| Key | Action |
+|---|---|
+| any letter | filter by title, folder or tag |
+| `↑` `↓` | move |
+| `enter` | **read the note**, rendered |
+| `ctrl+e` | **write in it**, in horde |
+| `ctrl+p` | open it **in a pane**, beside what is already there |
+| `ctrl+n` | new note |
+| `backspace` | delete a character of the filter |
+| `esc` | close |
+
+### Writing a note
+
+`ctrl+e` opens the note for editing inside horde — no pane, no `$EDITOR`, no multiplexer.
+It is **modeless**: typing types. This is a notes app, and a vim grammar here would make
+every note a small quiz about which mode you are in before a keystroke means what it looks
+like it means.
+
+It is also a **live preview**. Markers do their job and get out of the way as you type:
+`**bold**` reads as bold, `# ` gives its line weight, `[[a link]]` loses its brackets. The
+one exception is the line the cursor is on, which shows its source — hiding characters under
+a cursor would make the arrow keys lie about where they are going.
+
+| Key | Action |
+|---|---|
+| anything | types |
+| arrows, `home` `end`, `page` | move |
+| `ctrl+z` / `ctrl+y` | undo / redo |
+| `ctrl+s` | save |
+| `ctrl+r` | save and read it rendered |
+| `esc` | save and go back |
+
+Leaving saves. An editor that can lose a note because you pressed the wrong key to get out
+of it is not one to trust a thought to — which is also why there is undo, grouped by run
+rather than by keystroke, so taking back a word costs one press instead of eleven. The status bar shows `WRITING` in its own colour,
+and a `•` next to the filename while there is anything unsaved.
+
+### Reading a note
+
+`enter` renders the note rather than showing its source: headings carry weight, emphasis is
+emphasised, wikilinks lose their brackets, code sits on its own ground, and callouts become
+a coloured bar. Prose is wrapped to a readable column whatever the terminal's width.
+
+| Key | Action |
+|---|---|
+| `j` `k`, `space`, `page` | scroll · `g` `G` for the ends |
+| `tab` / `shift+tab` | walk the note's links — the one in play is marked `▸` |
+| `enter` | follow the selected link |
+| `e` | open this note in `$EDITOR` |
+| `esc` | back to the browser |
+
+Following a link is what separates a vault from a directory of files: the name is resolved
+by the daemon, which is the side holding the index. A link to a note nobody has written says
+so rather than opening an empty file.
+
+A terminal has one font size, so a heading earns its weight from colour, boldness and a rule
+under it rather than from being larger. Images are not rendered — that needs a terminal
+graphics protocol, and is deliberately out of scope.
+
+This is the one full-screen view with no single-key commands of its own: every printable
+key types into the filter, because a view whose whole job is searching should not have `p`
+mean something else.
+
+Agents read the same index over the socket — `vault.list`, `vault.search`, `vault.read`.
+
+## The graph
+
+`ctrl+b G` draws the vault: a node per note, an edge per wikilink, laid out by a force
+simulation until it settles and then stops. Notes that link to each other end up near each
+other, so a cluster on screen is a subject in the vault.
+
+| Key | Action |
+|---|---|
+| `tab` / `j` `k` | next / previous node |
+| `↑` `↓` `←` `→` | pan |
+| `+` `-` | zoom · `0` recentres |
+| `enter` | open the note in `$EDITOR` |
+| `esc` | close |
+
+What the drawing tells you:
+
+- **A hollow node with no colour is a ghost** — a `[[link]]` to a note nobody has written.
+  They are shown rather than hidden, because the notes a vault is missing are worth seeing.
+- **Colour is the cluster**: a note's first tag, or its folder when it has no tags.
+- **Size is connectedness.** A bigger dot is linked to more things.
+- **Above a couple of hundred edges, only the selected node's links are drawn**, and the
+  header says so. Drawing all of them fills a terminal with braille and hides the shape the
+  layout is there to show; the clustering still reads, because that lives in where the nodes
+  sit rather than in the lines.
+
+The layout stops moving once it settles, and stops redrawing with it — a graph left open on
+screen costs no more than any other still picture.
+
+## The kanban
+
+`ctrl+b T` opens **your own** board — not the task board agents pull work from. Cards in
+columns you named, with due dates, tags, descriptions and a comment thread. Full details in
+[kanban](kanban.md).
+
+`T` rather than the obvious `K`, because `K` is already resize-up; the mnemonic lives on the
+leader instead, at `ctrl+space k`.
+
+| Key | Action |
+|---|---|
+| `h` `j` `k` `l` | move the cursor |
+| `H` `L` | shove the card into the column left or right |
+| `J` `K` | move the card within its column |
+| `n` | new card · `enter` open it · `X` archive it |
+| `/` | filter · `p` this project or all · `x` show archived |
+| `C` `R` `D` | new column · rename · remove |
+| `<` `>` | move the column |
+| `v` | the list view, and back |
+| `esc` | back to the terminal |
+
+Drag a card with the mouse to move it; double-click to open it; double-click a column's name
+to rename it. Shift-drag is left alone, so your terminal's own text selection still works.
+
+On a card: `r` title · `e` description · `d` due · `t` tags · `p` project · `a` arm it for the
+agents · `A` hand it over now · `c` comment. **`esc` saves and `ctrl+c` discards** — in a
+description `enter` is a new line, so it cannot be the key that saves.
+
+## The leader
+
+`ctrl+space` opens the leader table. Unlike the prefix, a leader binding can be several keys
+long, so bindings live in named groups rather than competing for the same 40-odd single
+letters. Press it and wait: a popup lists every key you can press next, with `+name` marking
+a group that has more behind it.
+
+| Key | Group |
+|---|---|
+| `space` | the finder |
+| `d` | the start screen |
+| `n` | notes — `n` new · `o` browse · `f` find · `g` graph · `v` vault |
+| `k` | your own board — the kanban |
+| `g` | graph |
+| `a` | agents — `a` attention · `q` approvals · `r` roster · `d` digest · `b` bus |
+| `f` | find — `a` actions · `s` spaces |
+| `p` | project — `f` files · `p` switch · `n` new · `r` rename |
+| `w` | window — `v` `s` split · `z` zoom · `x` close · `h j k l` focus |
+| `?` | keys |
+| `.` | settings |
+
+Three rules make it safe to press:
+
+- **Nothing typed after the leader can reach a program.** A sequence that turns out not to
+  exist is dropped, never replayed into the pane — otherwise abandoning `ctrl+space w` would
+  type `w` at whatever an agent was doing.
+- **`esc` abandons, `backspace` steps back one key.** Backspace off the last key returns to
+  the open table rather than leaving it, so a wrong first key costs one press.
+- **The status bar shows the trail.** `LEADER w` means one key is held and horde is waiting;
+  a mode that quietly stops your keys reaching a pane is the worst thing it could do.
+
+Bare letters work here precisely because they cannot be typing — which is why `[keys]`
+refuses a bare printable as a *direct* binding but accepts it after the leader.
+
+Two doors that do not depend on the chord: **`ctrl+b space`** always opens the table, and
+**`ctrl+space ctrl+space`** sends a real `ctrl+space` (NUL) to the pane, for the emacs and
+readline users whose `set-mark` it is.
 
 ### The approval queue
 

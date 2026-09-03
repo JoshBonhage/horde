@@ -8,10 +8,19 @@ pub mod approvals;
 pub mod agents;
 pub mod bus;
 pub mod digest;
+pub mod files;
 pub mod handoff;
 pub mod journal;
+pub mod kanban;
 pub mod layout;
 pub mod logfile;
+pub mod lsp;
+
+/// The most a pasted attachment may be.
+///
+/// Eight megabytes is a very large screenshot and a very small photograph. Anything past it
+/// is a mistake — a video frame, a raw scan — and a vault is a directory on somebody's disk.
+const MAX_ATTACHMENT: usize = 8 * 1024 * 1024;
 pub mod manifest;
 pub mod notify;
 pub mod pane;
@@ -24,6 +33,7 @@ pub mod state;
 pub mod tasks;
 pub mod triggers;
 pub mod upgrade;
+pub mod vault;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -91,6 +101,9 @@ pub struct Engine {
     pub session: Session,
     pub bus: bus::Bus,
     pub board: tasks::Board,
+    /// The personal board. Separate from `board` in every way that matters — see
+    /// [`kanban`] — and touching it only through the one seam that hands a card over.
+    pub kanban: kanban::Kanban,
     pub triggers: triggers::Store,
     /// What each blocked pane was last seen asking, so a prompt can be required to hold still
     /// before it is answered. See [`approvals`].
@@ -109,9 +122,23 @@ pub struct Engine {
     /// get back is still the whole story. See [`notify`].
     pub last_alert: u64,
     pub agents: agents::Detector,
+    /// Projects opened before, most recent first. What the dashboard offers to reopen.
+    pub recents: Vec<persist::SavedRecent>,
     /// Branch and dirty state per directory, refreshed on its own slow cadence because each
     /// answer costs a fork. Read by every snapshot, written by nothing else.
     pub repos: repo::Cache,
+    /// One note index per vault root, not per space: two spaces opened on the same project
+    /// are looking at the same notes, and indexing them twice would be work done to produce
+    /// two answers that must agree.
+    pub vaults: HashMap<PathBuf, vault::Index>,
+    /// Language servers, one per project and language, started only when a file that needs
+    /// one is opened. Nothing in here exists unless `config.toml` asked for it.
+    pub lsp: lsp::Registry,
+    /// Absolute path to the name the client used for it, for documents the editor has open.
+    lsp_paths: HashMap<PathBuf, String>,
+    /// Which client is waiting on a completion. One at a time, because a second request means
+    /// the cursor moved and the first answer is already wrong.
+    lsp_asked: Option<ClientId>,
     clients: HashMap<ClientId, Client>,
     /// Set when the shape changed and clients need a fresh snapshot.
     dirty_shape: bool,
@@ -145,6 +172,444 @@ impl Engine {
     /// Ask for a detection pass on the next tick, after spawning a pane.
     pub fn detect_now(&mut self) {
         self.detect_soon = true;
+    }
+
+    /// How many projects the dashboard remembers.
+    ///
+    /// Small on purpose: this is a list you pick from by eye, and a screen of forgotten
+    /// directories is a worse answer than the six you actually use.
+    pub const MAX_RECENTS: usize = 12;
+
+    /// Record that a project was opened or returned to, most recent first.
+    ///
+    /// Keyed on the directory, not the name: a space can be renamed, and renaming it should
+    /// not make horde think you have two projects.
+    pub fn remember_project(&mut self, name: &str, cwd: &std::path::Path) {
+        let cwd = cwd.to_string_lossy().to_string();
+        self.recents.retain(|r| r.cwd != cwd);
+        self.recents.insert(
+            0,
+            persist::SavedRecent { name: name.to_string(), cwd, last_used: now_millis() },
+        );
+        self.recents.truncate(Self::MAX_RECENTS);
+    }
+
+    /// Move the focused project to the head of the recents list, if it is not already there.
+    ///
+    /// Cheap enough to call every tick because the common case is a string comparison that
+    /// says "already first". That is also what keeps `last_used` from being rewritten sixty
+    /// times a second — the list only changes when the project you are looking at does.
+    pub fn note_focused_project(&mut self) {
+        let Some(space) = self.session.focused_space.and_then(|id| self.session.space(id)) else {
+            return;
+        };
+        let cwd = space.cwd.to_string_lossy().to_string();
+        if self.recents.first().is_some_and(|r| r.cwd == cwd) {
+            return;
+        }
+        let (name, cwd) = (space.name.clone(), space.cwd.clone());
+        self.remember_project(&name, &cwd);
+    }
+
+    /// The whole snapshot, session shape plus everything only the daemon knows.
+    ///
+    /// One assembly point for both channels. The render path and the JSON `session.snapshot`
+    /// used to build this separately, and the JSON one quietly reported zero open tasks and
+    /// no armed triggers however many there were — the kind of drift that only shows up when
+    /// someone believes the answer.
+    pub fn snapshot(&self) -> crate::proto::Snapshot {
+        let cfg = self.cfg.clone();
+        let mut s = self.session.snapshot(&cfg, &self.repos);
+        s.tasks_open = self.board.open_count();
+        s.tasks_claimed = self.board.claimed_count();
+        // Twelve hours ahead, which is "today" without any calendar arithmetic: a card due
+        // today is stored at today's local noon, so anything at or before now-plus-twelve is
+        // due today or already late, and tomorrow's noon is still out of reach.
+        s.cards_due = self.kanban.due_count(now_millis() + 12 * 3_600_000);
+        s.triggers_armed = if self.cfg.unattended { self.triggers.armed_count() } else { 0 };
+        s.recents = self.recent_projects();
+        for space in s.spaces.iter_mut() {
+            space.notes = self.vault_for(space.id).map(|v| v.len());
+            space.lsp = self.lsp_info(space.id);
+        }
+        s
+    }
+
+    /// Put a pasted picture in the vault's attachment folder.
+    ///
+    /// Jailed like everything else that arrives over a socket, and capped: bytes from a
+    /// client are bytes from somewhere, and a vault is a directory on somebody's disk.
+    pub fn vault_attach(&mut self, space: SpaceId, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        if bytes.is_empty() {
+            return Err(anyhow!("nothing to attach"));
+        }
+        if bytes.len() > MAX_ATTACHMENT {
+            return Err(anyhow!(
+                "{} bytes; the limit is {MAX_ATTACHMENT}",
+                bytes.len()
+            ));
+        }
+        // The name is a filename, never a path. `safe_join` would catch a traversal anyway;
+        // this makes one impossible to express rather than merely refused.
+        let file = std::path::Path::new(name)
+            .file_name()
+            .ok_or_else(|| anyhow!("not a filename"))?
+            .to_string_lossy()
+            .to_string();
+        let root = self.vault_root_for_write(space)?;
+        let dir = root.join(crate::client::image::ATTACHMENTS);
+        std::fs::create_dir_all(&dir)?;
+        let path = vault::safe_join(&dir, &file)?;
+        std::fs::write(&path, bytes)?;
+        self.touch();
+        Ok(path)
+    }
+
+    /// Where a document the editor has open actually is, and what the client calls it.
+    ///
+    /// `vault` picks the root: a note is relative to the vault and a file to the project, and
+    /// only the client knows which of the two it opened.
+    fn doc_path(&self, space: SpaceId, rel: &str, vault: bool) -> Option<PathBuf> {
+        let root = if vault {
+            self.vault_root(space)?
+        } else {
+            self.session.space(space)?.cwd.clone()
+        };
+        vault::safe_join(&root, rel).ok()
+    }
+
+    /// Hand a buffer to whichever language server wants it.
+    pub fn doc_changed(&mut self, space: SpaceId, rel: &str, body: &str, vault: bool) {
+        let Some(path) = self.doc_path(space, rel, vault) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        // Remembered so diagnostics can come back named the way the client named it. The
+        // daemon deals in absolute paths and the editor knows a relative one; the translation
+        // has to happen somewhere, and here is where both are in hand.
+        self.lsp_paths.insert(path.clone(), rel.to_string());
+        let cfg = self.cfg.clone();
+        self.lsp.did_open(&cfg, &root, &lang, &path, body);
+    }
+
+    /// The editor closed. Stop analysing what nobody is looking at.
+    pub fn doc_closed(&mut self, space: SpaceId, rel: &str, vault: bool) {
+        let Some(path) = self.doc_path(space, rel, vault) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        self.lsp_paths.remove(&path);
+        self.lsp.did_close(&root, &lang, &path);
+    }
+
+    /// The language servers running for a project, as the chrome shows them.
+    fn lsp_info(&self, space: SpaceId) -> Vec<crate::proto::LspInfo> {
+        let Some(cwd) = self.session.space(space).map(|s| s.cwd.clone()) else { return Vec::new() };
+        self.lsp
+            .serving()
+            .into_iter()
+            .filter(|((root, _), _)| *root == cwd)
+            .map(|((_, lang), s)| {
+                let (errors, warnings) = s.counts();
+                let (state, detail) = match &s.state {
+                    lsp::State::Starting => (crate::proto::LspState::Starting, None),
+                    lsp::State::Ready => (crate::proto::LspState::Ready, None),
+                    lsp::State::Waiting(w) => (crate::proto::LspState::Waiting, Some(w.clone())),
+                    lsp::State::Failed(w) => (crate::proto::LspState::Failed, Some(w.clone())),
+                };
+                crate::proto::LspInfo {
+                    lang: lang.clone(),
+                    state,
+                    open: s.open_count(),
+                    errors,
+                    warnings,
+                    // A server that failed without saying anything on stdout said it on
+                    // stderr, which is the only place the reason exists. Failing that, name
+                    // what horde actually tried to run — which is usually the whole answer.
+                    detail: detail
+                        .or_else(|| s.last_error())
+                        .or_else(|| Some(s.command.clone()))
+                        .filter(|_| !matches!(s.state, lsp::State::Ready)),
+                }
+            })
+            .collect()
+    }
+
+    /// Where a space's notes live: its own vault if it has one, else the home vault.
+    pub fn vault_root(&self, space: SpaceId) -> Option<PathBuf> {
+        self.session
+            .space(space)
+            .and_then(|s| vault::locate(&s.cwd, &self.cfg.vault_dir))
+            .or_else(|| self.cfg.vault_home.is_dir().then(|| self.cfg.vault_home.clone()))
+    }
+
+    /// Where a note is about to be written, making the vault if there is not one yet.
+    ///
+    /// Creating a directory on somebody's disk unasked would be rude, so nothing does it at
+    /// startup — but asking for a note *is* the ask. Without this the home vault is a
+    /// promise that only holds once you have already made the directory by hand, which is
+    /// exactly the wrong way round.
+    fn vault_root_for_write(&mut self, space: SpaceId) -> Result<PathBuf> {
+        if let Some(root) = self.vault_root(space) {
+            return Ok(root);
+        }
+        let home = self.cfg.vault_home.clone();
+        vault::init(&home).with_context(|| format!("could not make a vault at {}", home.display()))?;
+        self.notice(NoticeLevel::Info, format!("made a vault at {}", home.display()));
+        refresh_vaults(self);
+        Ok(home)
+    }
+
+    /// The index a space is reading. Falls back to the home vault, so a project with no
+    /// notes of its own is still somewhere you can write one.
+    pub fn vault_for(&self, space: SpaceId) -> Option<&vault::Index> {
+        self.vaults.get(&self.vault_root(space)?)
+    }
+
+    /// Write a note, creating it if it does not exist, and reindex at once.
+    ///
+    /// Synchronous reindex rather than waiting for the next scan: the daemon did the writing,
+    /// so there is nothing to discover — and a note that does not appear in its own vault
+    /// until a timer fires is a note you cannot trust the index about.
+    pub fn vault_write(&mut self, space: SpaceId, rel: &str, body: &str) -> Result<PathBuf> {
+        self.vault_put(space, rel, body, None, false)
+    }
+
+    /// Write a note, with the rules that apply when the writer might not be a person.
+    ///
+    /// `by` is who to credit; `Some` also means "this is not a human's own note", which
+    /// decides both the folder it defaults into and whether it gets stamped. `append` adds to
+    /// what is there rather than replacing it, which is what makes a dated note a log rather
+    /// than the last thing that happened to be written to it.
+    pub fn vault_put(
+        &mut self,
+        space: SpaceId,
+        rel: &str,
+        body: &str,
+        by: Option<&str>,
+        append: bool,
+    ) -> Result<PathBuf> {
+        if body.len() > vault::MAX_NOTE {
+            return Err(anyhow!(
+                "note is {} bytes; the limit is {}. Something is writing in a loop.",
+                body.len(),
+                vault::MAX_NOTE
+            ));
+        }
+        let root = self.vault_root_for_write(space)?;
+        // An agent's note goes in its own folder unless it named one. Not enforced against a
+        // caller that gives a path — an agent asked to write somewhere specific should be
+        // able to — but the default is the safe one, which is what defaults are for.
+        let rel = match by {
+            Some(_) if !rel.contains('/') => format!("{}/{rel}", vault::AGENT_DIR),
+            _ => rel.to_string(),
+        };
+        let path = vault::safe_join(&root, &rel)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = match (append, existing.is_empty()) {
+            (true, false) => {
+                // A blank line between, so appended sections read as separate entries rather
+                // than as one that ran on.
+                let joined = format!("{}\n\n{}", existing.trim_end(), body.trim_start());
+                if joined.len() > vault::MAX_NOTE {
+                    return Err(anyhow!("appending would take the note past {} bytes", vault::MAX_NOTE));
+                }
+                joined
+            }
+            _ => match by {
+                Some(who) => {
+                    vault::attribute(body, who, &triggers::local_date(now_millis()))
+                }
+                None => body.to_string(),
+            },
+        };
+        std::fs::write(&path, &text)?;
+        if let Some(idx) = self.vaults.get_mut(&root) {
+            idx.refresh(usize::MAX);
+        }
+        self.touch();
+        Ok(path)
+    }
+
+    /// Answer a vault question. `None` when the space has no vault to ask.
+    pub fn vault_answer(
+        &self,
+        space: SpaceId,
+        kind: &crate::proto::VaultQuery,
+    ) -> Option<crate::proto::VaultReply> {
+        use crate::proto::{NoteLine, VaultQuery};
+        let idx = self.vault_for(space)?;
+        let line = |id: vault::NoteId| -> Option<NoteLine> {
+            let n = idx.note(id)?;
+            Some(NoteLine {
+                path: n.path.to_string_lossy().to_string(),
+                title: n.title.clone(),
+                tags: n.tags.clone(),
+                mtime: n.mtime,
+                backlinks: idx.backlinks(id).len(),
+            })
+        };
+
+        let mut reply = crate::proto::VaultReply {
+            space,
+            root: idx.root.to_string_lossy().to_string(),
+            notes: Vec::new(),
+            body: None,
+            backlinks: Vec::new(),
+            graph: None,
+            tasks: Vec::new(),
+        };
+        match kind {
+            VaultQuery::List => reply.notes = idx.search("").into_iter().filter_map(line).collect(),
+            VaultQuery::Search { q } => {
+                reply.notes = idx.search(q).into_iter().filter_map(line).collect()
+            }
+            VaultQuery::Note { path } => {
+                let id = idx.notes.iter().position(|n| n.path.to_string_lossy() == path.as_str())?;
+                reply.notes = line(id).into_iter().collect();
+                // Read from disk rather than keeping bodies in memory: the index is a map of
+                // the vault, not a copy of it.
+                reply.body = std::fs::read_to_string(idx.root.join(path)).ok();
+                reply.backlinks = idx.backlinks(id).iter().filter_map(|b| line(*b)).collect();
+                // A task may name this note by its filename or by any title it answers to,
+                // because that is how a link written by hand names it.
+                let n = &idx.notes[id];
+                let mut names = vec![n.stem(), n.title.clone()];
+                names.extend(n.aliases.iter().cloned());
+                reply.tasks = self
+                    .board
+                    .about(&names)
+                    .into_iter()
+                    .map(|t| crate::proto::TaskLine {
+                        id: t.id,
+                        text: t.text.clone(),
+                        owner: t.owner.clone(),
+                        result: t.result.clone(),
+                        dropped: matches!(t.state, tasks::TaskState::Dropped),
+                        done: !t.is_open() && !t.is_claimed(),
+                    })
+                    .collect();
+            }
+            VaultQuery::Graph => reply.graph = Some(idx.graph()),
+        }
+        Some(reply)
+    }
+
+    /// The personal board, as of now.
+    ///
+    /// `space` is a *client-side* id, resolved to a project name here because that is what a
+    /// card holds — see [`kanban::Card::project`]. `None` means every project, which is a
+    /// board you are reading rather than a board you are working in.
+    pub fn kanban_answer(&self, space: Option<SpaceId>) -> crate::proto::KanbanReply {
+        let project = space.and_then(|s| self.session.space(s)).map(|s| s.name.clone());
+        crate::proto::KanbanReply {
+            cards: self.kanban.all().to_vec(),
+            columns: self.cfg.kanban_columns.clone(),
+            project,
+        }
+    }
+
+    /// Send the board to one client, after it asked or after it changed something.
+    fn send_kanban(&self, to: ClientId, space: Option<SpaceId>) {
+        let reply = self.kanban_answer(space);
+        if let Some(c) = self.clients.get(&to) {
+            let _ = c.out.send(ServerFrame::Kanban(Box::new(reply)));
+        }
+    }
+
+    /// The name that goes on a comment you wrote.
+    ///
+    /// `user@host`, because a board that will also carry agent-written comments needs the
+    /// human ones to be recognisably a person rather than another process called `user`.
+    /// Overridable, since a machine's real hostname is often uglier than what you would
+    /// choose to sign your own notes with.
+    pub fn local_user(&self) -> String {
+        if let Some(name) = &self.cfg.kanban_author {
+            return name.clone();
+        }
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "user".into());
+        match hostname() {
+            Some(h) => format!("{user}@{h}"),
+            None => user,
+        }
+    }
+
+    /// How many files the browser will list before saying there are too many.
+    const FILE_LIMIT: usize = 4_000;
+
+    /// A project's files.
+    pub fn file_list(&self, space: SpaceId) -> Option<crate::proto::FileList> {
+        let root = self.session.space(space)?.cwd.clone();
+        let (files, truncated) = files::list(&root, Self::FILE_LIMIT);
+        Some(crate::proto::FileList {
+            space,
+            root: root.to_string_lossy().to_string(),
+            files: files.iter().map(|f| f.path.to_string_lossy().to_string()).collect(),
+            truncated,
+            body: None,
+            path: None,
+        })
+    }
+
+    /// One project file's text.
+    pub fn file_read(&self, space: SpaceId, rel: &str) -> Result<crate::proto::FileList> {
+        let root = self.session.space(space).ok_or_else(|| anyhow!("no such space"))?.cwd.clone();
+        let path = vault::safe_join(&root, rel)?;
+        let body = std::fs::read_to_string(&path)?;
+        Ok(crate::proto::FileList {
+            space,
+            root: root.to_string_lossy().to_string(),
+            files: Vec::new(),
+            truncated: false,
+            body: Some(body),
+            path: Some(rel.to_string()),
+        })
+    }
+
+    /// Write a project file, jailed to the project — the same rule notes get, for the same
+    /// reason: a path arriving from a text field must not be able to name anything else.
+    pub fn file_write(&mut self, space: SpaceId, rel: &str, body: &str) -> Result<()> {
+        let root = self.session.space(space).ok_or_else(|| anyhow!("no such space"))?.cwd.clone();
+        let path = vault::safe_join(&root, rel)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, body)?;
+        Ok(())
+    }
+
+    /// Tell a language server about a file, starting one if this is the first of its
+    /// language in this project.
+    ///
+    /// Does nothing at all unless `config.toml` declares a server for the language — which is
+    /// the promise that opening horde spawns nothing you did not ask for.
+    pub fn lsp_sync(&mut self, space: SpaceId, rel: &str, text: &str) {
+        let Some(root) = self.session.space(space).map(|s| s.cwd.clone()) else { return };
+        let Ok(path) = vault::safe_join(&root, rel) else { return };
+        let Some(lang) = lsp::language_for(&self.cfg, &path) else { return };
+        let cfg = self.cfg.clone();
+        // `did_open` on a file already open is a change, so this one call is both.
+        self.lsp.did_open(&cfg, &root, &lang, &path, text);
+    }
+
+    /// The recents list as the wire carries it, with the ones already on screen marked.
+    ///
+    /// `live` is computed here rather than stored, because whether a project is open is a
+    /// fact about right now and the list outlives every session it describes.
+    fn recent_projects(&self) -> Vec<crate::proto::RecentProject> {
+        self.recents
+            .iter()
+            .map(|r| crate::proto::RecentProject {
+                name: r.name.clone(),
+                cwd: r.cwd.clone(),
+                last_used: r.last_used,
+                live: self.session.spaces.iter().any(|s| s.cwd.to_string_lossy() == r.cwd),
+            })
+            .collect()
     }
 
     // Field-splitting wrappers. `self.agents.scan(&mut self.session, ...)` cannot borrow
@@ -217,10 +682,57 @@ impl Engine {
         events
     }
 
-    /// Tell one enlisted agent in `space` that its project has work waiting.
+    /// Hand over every card whose armed window has arrived.
+    ///
+    /// Run from the same slow sweep as [`Self::nudge_for_tasks`], because both are the same
+    /// question asked on a clock — is there something an agent should know about — and a
+    /// second timer would be a second thing to get wrong.
+    ///
+    /// Gated on `agents.board`, which is the promise that switch already makes: turning the
+    /// agents' board off has to turn off everything that puts work on it, or the setting is a
+    /// lie told in one place and honoured in another.
+    fn hand_over_due_cards(&mut self) {
+        if !self.cfg.board {
+            return;
+        }
+        for card in self.kanban.ready_to_hand_over(now_millis()) {
+            match hand_over(self, card) {
+                Ok(task) => log_line(&format!("kanban: card #{card} handed over as task #{task}")),
+                // Logged rather than surfaced: this fires on a timer with nobody necessarily
+                // watching, and a toast for something that will be retried on the next sweep
+                // is noise. The card's own thread is where the record belongs.
+                Err(e) => log_line(&format!("kanban: card #{card} could not be handed over: {e}")),
+            }
+        }
+    }
+
+    /// The roles of the agents enlisted for board work in one project.
+    ///
+    /// What decides whether role-tagged work can be taken by anybody here. Enlistment is part of
+    /// the question, not decoration: a reviewer sitting in the project who never ran
+    /// `horde task work` is not going to claim anything, so counting it would report a task as
+    /// covered when nothing will ever pick it up.
+    pub fn roles_enlisted_in(&self, space_name: &str) -> Vec<String> {
+        let Some(space) = self.session.spaces.iter().find(|s| s.name == space_name) else {
+            return Vec::new();
+        };
+        self.session
+            .panes
+            .values()
+            .filter(|p| p.space == space.id && p.board && p.exited.is_none())
+            .filter(|p| p.agent.is_some())
+            .filter_map(|p| p.role.clone())
+            .collect()
+    }
+
+    /// Tell one enlisted agent in `space` that its project has work waiting *for it*.
+    ///
+    /// This is horde's dispatcher, and it is deliberately not an agent. It knows which project a
+    /// task belongs to, which role may take it, who is enlisted, who is already holding
+    /// something, and who has been idle longest — and it decides in the daemon, where the answer
+    /// is the same every time and cannot be blocked at a permission prompt.
     fn nudge_one(&mut self, space: SpaceId, space_name: &str) -> Option<Event> {
-        let open = self.board.offered_to(space_name);
-        if open == 0 {
+        if self.board.offered_to(space_name) == 0 {
             return None;
         }
 
@@ -243,64 +755,87 @@ impl Engine {
         // Enlistment is the second half of the fix. Scope stops work crossing projects;
         // this stops it reaching an agent that never volunteered for any. An agent you opened
         // to think with, sitting idle in the same repository as a fleet, is not a worker.
-        let candidates: Vec<(PaneId, String, std::time::Instant)> = self
+        let candidates: Vec<Candidate> = self
             .session
             .panes
             .values()
             .filter(|p| p.space == space && p.board && p.exited.is_none())
-            .filter_map(|p| p.agent.as_ref().map(|a| (p.id, a)))
+            .filter_map(|p| p.agent.as_ref().map(|a| (p, a)))
             .filter(|(_, a)| eligible_state(a, &board_workers))
             .filter(|(_, a)| a.queued.is_empty())
             .filter(|(_, a)| !holding.contains(&a.name))
-            .map(|(id, a)| (id, a.name.clone(), a.since))
+            .map(|(p, a)| Candidate {
+                pane: p.id,
+                name: a.name.clone(),
+                role: p.role.clone(),
+                since: a.since,
+            })
             .collect();
 
-        // Agents told about the board that have not acted yet. They are about to consume
-        // tasks, so they count against the work available — otherwise "one per pass" simply
-        // wakes every idle agent over successive passes, which is the waste this is meant to
-        // avoid. Observed: one task, four idle agents, four nudges.
-        let already_told = self
-            .session
-            .panes
-            .values()
-            .filter(|p| p.space == space && p.board)
-            .filter_map(|p| p.agent.as_ref())
-            .filter(|a| eligible_state(a, &board_workers))
-            .filter(|a| a.nudged_since == Some(a.since))
-            .count();
+        // Whether an agent has been woken already and not yet acted. Such an agent is about to
+        // consume a task, so it counts against the work available — otherwise "one per pass"
+        // simply wakes every idle agent over successive passes, which is the waste this is meant
+        // to avoid. Observed: one task, four idle agents, four nudges.
+        let told = |p: &crate::daemon::pane::Pane| {
+            p.agent.as_ref().is_some_and(|a| a.nudged_since == Some(a.since))
+        };
 
-        // Never wake more agents than there is work for, but do wake several when there is:
-        // five tasks and three idle agents should end up with three agents working.
-        if open <= holding.len() + already_told {
-            return None;
-        }
+        // Accounted per role, because the work is. Five reviewer tasks are not five tasks for a
+        // builder, and one pool of numbers would either wake a builder for work it cannot claim
+        // or hold back a reviewer because somebody else is busy.
+        let engaged_like = |role: Option<&str>| -> usize {
+            self.session
+                .panes
+                .values()
+                .filter(|p| p.space == space && p.board && p.exited.is_none())
+                .filter(|p| p.role.as_deref() == role)
+                .filter(|p| {
+                    p.agent.as_ref().is_some_and(|a| holding.contains(&a.name))
+                        || (told(p) && p.agent.as_ref().is_some_and(|a| eligible_state(a, &board_workers)))
+                })
+                .count()
+        };
 
-        // Whoever has been idle longest is the most available, and picking by `since` rather
-        // than by pane id spreads successive tasks across the fleet.
-        let (pane, name, since) = candidates
-            .into_iter()
-            .filter(|(id, _, since)| {
-                self.session
-                    .panes
-                    .get(id)
-                    .and_then(|p| p.agent.as_ref())
-                    .is_some_and(|a| a.nudged_since != Some(*since))
-            })
-            .min_by_key(|(_, _, since)| *since)?;
+        // General hands first. An agent kept for anything is the cheapest one to spend on work
+        // that named nobody, and spending a specialist on it is how the one task only they could
+        // have taken ends up waiting for them.
+        let mut order = candidates;
+        order.sort_by_key(|c| (c.role.is_some(), c.since));
+
+        let chosen = order.into_iter().find(|c| {
+            // Not already woken and still waiting to act on it.
+            let fresh = self
+                .session
+                .panes
+                .get(&c.pane)
+                .and_then(|p| p.agent.as_ref())
+                .is_some_and(|a| a.nudged_since != Some(c.since));
+            let mine = self.board.offered_to_agent(space_name, c.role.as_deref());
+            fresh && mine > engaged_like(c.role.as_deref())
+        })?;
+        let Candidate { pane, name, role, since } = chosen;
+        let waiting = self.board.offered_to_agent(space_name, role.as_deref());
 
         // Marked before sending, so a failure cannot produce a nudge loop.
         if let Some(a) = self.session.panes.get_mut(&pane).and_then(|p| p.agent.as_mut()) {
             a.nudged_since = Some(since);
         }
 
+        // Says what it is being offered, not what the board holds. An agent told "9 tasks
+        // waiting" that then claims twice and gets nothing has been lied to, and the honest
+        // number is the one it can act on.
         let body = format!(
-            "{open} task{} waiting on the {space_name} board. Run `horde task claim` to take \
+            "{waiting} task{} on the {space_name} board {}. Run `horde task claim` to take \
              the next one, do it, then `horde task done --result \"<what happened>\"`. Repeat \
              while it keeps returning work.",
-            if open == 1 { "" } else { "s" }
+            if waiting == 1 { "" } else { "s" },
+            match &role {
+                Some(r) => format!("for {r}"),
+                None => "waiting".to_string(),
+            }
         );
         let Engine { bus, session, cfg, .. } = self;
-        match bus.send(session, cfg, None, &name, &body, false, false, None) {
+        match bus.send(session, cfg, bus::Outgoing::plain(None, &name, &body)) {
             Ok(m) => Some(Event::BusMessage(m)),
             Err(_) => None,
         }
@@ -483,6 +1018,7 @@ async fn engine_loop(
         session,
         bus: bus::Bus::new(crate::config::bus_log_path()),
         board: tasks::Board::new(crate::config::tasks_path()),
+        kanban: kanban::Kanban::new(crate::config::kanban_path()),
         triggers: triggers::Store::new(crate::config::triggers_path()),
         approvals: approvals::Seen::default(),
         journal: journal::Journal::new(crate::config::journal_path()),
@@ -491,7 +1027,12 @@ async fn engine_loop(
         last_seen: 0,
         last_alert: 0,
         agents,
+        recents: Vec::new(),
         repos: repo::Cache::default(),
+        vaults: HashMap::new(),
+        lsp: lsp::Registry::new(),
+        lsp_paths: HashMap::new(),
+        lsp_asked: None,
         cfg,
         clients: HashMap::new(),
         dirty_shape: true,
@@ -601,6 +1142,10 @@ async fn engine_loop(
         }
     }
 
+    // Children do not outlive the daemon that started them. `kill_on_drop` would mostly
+    // handle it, but "mostly" is how a stopped horde leaves a rust-analyzer holding a
+    // gigabyte until the machine reboots.
+    eng.lsp.shutdown();
     if !HANDED_OVER.load(std::sync::atomic::Ordering::SeqCst) {
         let _ = persist::save(&eng, &crate::config::state_path());
     }
@@ -760,6 +1305,181 @@ fn handle_client_frame(eng: &mut Engine, id: ClientId, frame: ClientFrame) {
                 let _ = c.out.send(ServerFrame::Digest(Box::new(d)));
             }
         }
+        // The second command with a result rather than an effect, and answered the same
+        // way: to the client that asked, never broadcast.
+        ClientFrame::Command(Cmd::VaultQuery { space, kind }) => {
+            if let Some(reply) = eng.vault_answer(space, &kind) {
+                if let Some(c) = eng.clients.get(&id) {
+                    let _ = c.out.send(ServerFrame::Vault(Box::new(reply)));
+                }
+            }
+        }
+        // Writes answer the caller with what is now on disk, so a view never shows a note
+        // it merely hoped had been saved.
+        ClientFrame::Command(Cmd::VaultSave { space, path, body }) => {
+            match eng.vault_write(space, &path, &body) {
+                Ok(_) => {
+                    if let Some(reply) =
+                        eng.vault_answer(space, &crate::proto::VaultQuery::Note { path })
+                    {
+                        if let Some(c) = eng.clients.get(&id) {
+                            let _ = c.out.send(ServerFrame::Vault(Box::new(reply)));
+                        }
+                    }
+                }
+                Err(e) => eng.notice(NoticeLevel::Error, format!("could not save the note: {e}")),
+            }
+        }
+        ClientFrame::Command(Cmd::VaultInit { space }) => {
+            // Where a vault *would* go: the project's configured notes directory, or the
+            // home vault when the project has no opinion.
+            let root = eng
+                .session
+                .space(space)
+                .map(|s| s.cwd.join(&eng.cfg.vault_dir))
+                .unwrap_or_else(|| eng.cfg.vault_home.clone());
+            match vault::init(&root) {
+                Ok(fresh) => {
+                    let msg = if fresh {
+                        format!("made a vault at {}", root.display())
+                    } else {
+                        format!("{} is already a vault", root.display())
+                    };
+                    eng.notice(NoticeLevel::Info, msg);
+                    refresh_vaults(eng);
+                }
+                Err(e) => eng.notice(NoticeLevel::Error, format!("could not make a vault: {e}")),
+            }
+        }
+        // -- the kanban ------------------------------------------------------
+        //
+        // Every one of these answers with the whole board rather than with what it changed.
+        // The client holds one authoritative picture and replaces it, exactly as it does with
+        // `Snapshot`, so a card cannot end up drawn in a state it was never in. A board is a
+        // few hundred cards; a diff protocol would be a second source of truth to keep honest
+        // for no measurable gain.
+        //
+        // A failed write says so and re-sends the board unchanged, because the alternative —
+        // staying quiet — leaves the view showing the move it optimistically drew.
+        ClientFrame::Command(Cmd::KanbanQuery { space }) => eng.send_kanban(id, space),
+        ClientFrame::Command(Cmd::CardNew { space, column, title }) => {
+            let project = space.and_then(|s| eng.session.space(s)).map(|s| s.name.clone());
+            match eng.kanban.add(&title, &column, project.as_deref()) {
+                Ok(_) => eng.touch(),
+                Err(e) => eng.notice(NoticeLevel::Warn, format!("could not add the card: {e}")),
+            }
+            eng.send_kanban(id, space);
+        }
+        ClientFrame::Command(Cmd::CardEdit { id: card, patch }) => {
+            if let Err(e) = eng.kanban.edit(card, &patch) {
+                eng.notice(NoticeLevel::Warn, format!("could not change the card: {e}"));
+            }
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::CardMove { id: card, column, after }) => {
+            if let Err(e) = eng.kanban.place(card, &column, after) {
+                eng.notice(NoticeLevel::Warn, format!("could not move the card: {e}"));
+            }
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::CardComment { id: card, body }) => {
+            let by = eng.local_user();
+            if let Err(e) = eng.kanban.comment(card, &by, &body) {
+                eng.notice(NoticeLevel::Warn, format!("could not add the comment: {e}"));
+            }
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::CardArchive { id: card, archived }) => {
+            if let Err(e) = eng.kanban.archive(card, archived) {
+                eng.notice(NoticeLevel::Warn, format!("could not archive the card: {e}"));
+            }
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::CardHandOff { id: card }) => {
+            match hand_over(eng, card) {
+                Ok(task) => eng.notice(
+                    NoticeLevel::Info,
+                    format!("card #{card} is on the agents' board as task #{task}"),
+                ),
+                Err(e) => eng.notice(NoticeLevel::Warn, format!("{e}")),
+            }
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+        ClientFrame::Command(Cmd::ColumnRename { from, to }) => {
+            eng.kanban.rename_column(&from, &to);
+            eng.touch();
+            eng.send_kanban(id, eng.session.focused_space);
+        }
+
+        // The project's own files. Answered to the asking client, like every other query.
+        ClientFrame::Command(Cmd::FileQuery { space }) => {
+            if let Some(reply) = eng.file_list(space) {
+                if let Some(c) = eng.clients.get(&id) {
+                    let _ = c.out.send(ServerFrame::Files(Box::new(reply)));
+                }
+            }
+        }
+        ClientFrame::Command(Cmd::FileRead { space, path }) => {
+            match eng.file_read(space, &path) {
+                Ok(reply) => {
+                    // Opening a file is the moment a language server becomes worth having, and
+                    // the last moment before you would notice it was not there.
+                    if let Some(body) = reply.body.as_deref() {
+                        eng.lsp_sync(space, &path, body);
+                    }
+                    if let Some(c) = eng.clients.get(&id) {
+                        let _ = c.out.send(ServerFrame::Files(Box::new(reply)));
+                    }
+                }
+                Err(e) => eng.notice(NoticeLevel::Warn, format!("could not open {path}: {e}")),
+            }
+        }
+        // What the editor's buffer says right now, which is not what is on disk and is not
+        // meant to be. The point of this arriving separately from a save is that a language
+        // server should be objecting to the line you are on, not to the last thing you wrote
+        // out.
+        ClientFrame::Command(Cmd::DocChanged { space, path, body, vault }) => {
+            eng.doc_changed(space, &path, &body, vault);
+            // Whatever is already known about it, straight back to the client that asked. A
+            // server answers a document it has already seen with silence, so a file opened a
+            // second time would otherwise look clean until the next edit.
+            let known = eng
+                .doc_path(space, &path, vault)
+                .and_then(|p| eng.lsp.diags_for(&p).cloned());
+            if let (Some(diags), Some(c)) = (known, eng.clients.get(&id)) {
+                let _ = c.out.send(ServerFrame::Diagnostics { path, diags });
+            }
+        }
+        ClientFrame::Command(Cmd::DocClosed { space, path, vault }) => {
+            eng.doc_closed(space, &path, vault);
+        }
+        ClientFrame::Command(Cmd::Attach { space, name, bytes }) => {
+            match eng.vault_attach(space, &name, &bytes) {
+                Ok(path) => log_line(&format!("attached {}", path.display())),
+                Err(e) => eng.notice(NoticeLevel::Warn, format!("could not attach {name}: {e}")),
+            }
+        }
+        ClientFrame::Command(Cmd::Complete { space, path, body, line, col, vault }) => {
+            // The buffer goes with the request rather than waiting for the debounce: an
+            // answer about text the server has not been shown yet is an answer about a
+            // different file.
+            eng.doc_changed(space, &path, &body, vault);
+            let Some(full) = eng.doc_path(space, &path, vault) else { return };
+            let Some(lang) = lsp::language_for(&eng.cfg, &full) else { return };
+            let Some(root) = eng.session.space(space).map(|s| s.cwd.clone()) else { return };
+            eng.lsp_asked = Some(id);
+            eng.lsp.complete(&root, &lang, &full, line, col);
+        }
+        ClientFrame::Command(Cmd::FileSave { space, path, body }) => {
+            match eng.file_write(space, &path, &body) {
+                Ok(()) => eng.lsp_sync(space, &path, &body),
+                Err(e) => eng.notice(NoticeLevel::Error, format!("could not save {path}: {e}")),
+            }
+        }
         ClientFrame::Command(cmd) => apply_cmd(eng, cmd),
     }
 }
@@ -780,6 +1500,23 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         Cmd::ClosePane => {
             if let Some(p) = eng.session.focused_pane() {
+                // A file pane closing is a document closing, and a server that is never told
+                // goes on analysing something nobody is looking at.
+                let doc = eng.session.panes.get(&p).and_then(|p| p.doc_path().map(|d| d.to_path_buf()));
+                if let Some(path) = doc {
+                    if let Some(lang) = lsp::language_for(&cfg, &path) {
+                        // The pane being closed is the focused one, so its project is the
+                        // focused project.
+                        let root = eng
+                            .session
+                            .focused_space
+                            .and_then(|s| eng.session.space(s))
+                            .map(|s| s.cwd.clone());
+                        if let Some(root) = root {
+                            eng.lsp.did_close(&root, &lang, &path);
+                        }
+                    }
+                }
                 let _ = eng.session.close_pane(&cfg, p);
             }
         }
@@ -837,6 +1574,51 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         Cmd::FocusSpace(id) => {
             eng.session.focus_space(id);
             eng.session.relayout(&cfg);
+        }
+        Cmd::OpenDocPane { space, path } => {
+            // Relative to the project, and jailed to it: this opens a pane on a path that
+            // arrived over a socket, so it gets the same treatment as writing one.
+            let root = eng.session.space(space).map(|s| s.cwd.clone());
+            let full = root.and_then(|r| vault::safe_join(&r, &path).ok()).or_else(|| {
+                // A note lives in the vault rather than the project, so try there too.
+                eng.vault_root(space).and_then(|r| vault::safe_join(&r, &path).ok())
+            });
+            match full.filter(|p| p.is_file()) {
+                Some(p) => {
+                    if let Err(e) = eng.session.split_doc(&cfg, None, Dir::Right, &p) {
+                        problems.push((NoticeLevel::Warn, e.to_string()));
+                    } else if let Some(lang) = lsp::language_for(&cfg, &p) {
+                        if let Ok(text) = std::fs::read_to_string(&p) {
+                            let root = eng.session.space(space).map(|s| s.cwd.clone());
+                            if let Some(root) = root {
+                                eng.lsp.did_open(&cfg, &root, &lang, &p, &text);
+                            }
+                        }
+                    }
+                }
+                None => problems.push((NoticeLevel::Warn, format!("no file at {path}"))),
+            }
+        }
+        Cmd::OpenProject { cwd } => {
+            let path = PathBuf::from(&cwd);
+            // A remembered directory can be gone by the time you pick it. Say so instead of
+            // opening a space whose cwd silently became wherever the daemon was started.
+            if !path.is_dir() {
+                problems.push((NoticeLevel::Warn, format!("{cwd} is no longer a directory")));
+            } else if let Some(existing) =
+                eng.session.spaces.iter().find(|s| s.cwd == path).map(|s| s.id)
+            {
+                // Already open: go there rather than starting a second copy of the project.
+                eng.session.focus_space(existing);
+            } else {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| cwd.clone());
+                if let Err(e) = eng.session.create_space(&cfg, Some(&name), &path) {
+                    problems.push((NoticeLevel::Error, e.to_string()));
+                }
+            }
         }
         Cmd::NextSpace => {
             eng.session.cycle_space(1);
@@ -923,7 +1705,29 @@ pub fn apply_cmd(eng: &mut Engine, cmd: Cmd) {
         }
         // Answered in `handle_client_frame`, which knows which client asked. Reaching here
         // means it came from the control API, where `digest` is the method to use.
-        Cmd::RequestDigest => {}
+        // Both handled per-client in `handle_client_frame`, where the asking client is
+        // known. Reaching them here means someone routed a question through a broadcast.
+        Cmd::RequestDigest
+        | Cmd::VaultQuery { .. }
+        | Cmd::VaultSave { .. }
+        | Cmd::VaultInit { .. }
+        | Cmd::FileQuery { .. }
+        | Cmd::FileRead { .. }
+        | Cmd::FileSave { .. }
+        | Cmd::DocChanged { .. }
+        | Cmd::DocClosed { .. }
+        | Cmd::Complete { .. }
+        | Cmd::Attach { .. }
+        // Every kanban command answers with the board, so all of them need to know which
+        // client asked. Reaching here means one was routed through the broadcast path.
+        | Cmd::KanbanQuery { .. }
+        | Cmd::CardNew { .. }
+        | Cmd::CardEdit { .. }
+        | Cmd::CardMove { .. }
+        | Cmd::CardComment { .. }
+        | Cmd::CardArchive { .. }
+        | Cmd::CardHandOff { .. }
+        | Cmd::ColumnRename { .. } => {}
         Cmd::ApplyLayout { preset } => {
             if let Err(e) = eng.session.apply_preset(&cfg, &preset) {
                 problems.push((NoticeLevel::Warn, e.to_string()));
@@ -972,11 +1776,28 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         }
     }
 
+    // Whatever project you are looking at is the most recent one. Done here rather than in
+    // the handful of commands that change spaces, because spaces are also created over the
+    // socket and by restore, and one funnel cannot forget a path the way five can.
+    eng.note_focused_project();
+
     // Git state, on detection's cadence but with its own much longer staleness window inside
     // the cache. Piggybacking on `detect_due` rather than taking a timer of its own keeps the
     // fork-per-directory work on one clock.
+    // Every tick, because a diagnostic is worth showing the moment it lands and draining a
+    // channel that is almost always empty costs nothing.
+    drain_lsp(eng);
+
     if detect_due {
         refresh_repos(eng);
+        refresh_vaults(eng);
+        // The half of a language server's lifecycle that is easy to leave for later: stop the
+        // ones nobody is using and the ones whose project has closed, and give the ones that
+        // died their next attempt.
+        let roots: Vec<PathBuf> = eng.session.spaces.iter().map(|s| s.cwd.clone()).collect();
+        eng.lsp.sweep(|root| roots.iter().any(|cwd| cwd.starts_with(root)));
+        let cfg = eng.cfg.clone();
+        eng.lsp.retry(&cfg);
         // On detection's cadence deliberately: exhaustion is read off the same screen snapshot
         // detection already takes, and a model that has just refused will still be refusing a
         // second later. Checking it every tick would buy nothing and cost a scan per pane.
@@ -996,6 +1817,9 @@ fn tick(eng: &mut Engine, detect_due: bool) {
         // Then, if anyone is free and the board is not empty, say so. A no-op while the board's
         // autonomous half is opt-in; see `agents.task_nudge` and `agents.board`.
         events.extend(eng.nudge_for_tasks());
+        // And hand over any card whose armed window has arrived. The same clock, because it
+        // is the same question — is there something an agent should be told about.
+        eng.hand_over_due_cards();
         let changed = !events.is_empty();
         for ev in events {
             eng.pending_events.push(ev);
@@ -1089,6 +1913,20 @@ fn tick(eng: &mut Engine, detect_due: bool) {
     }
 
     broadcast(eng);
+}
+
+/// One agent the nudge could wake, and everything the choice turns on.
+///
+/// Named rather than a tuple: the role made it a fourth field, and `(pane, name, role, since)`
+/// sorted on `.3` is a line that stays correct only until somebody inserts a field.
+struct Candidate {
+    pane: PaneId,
+    /// How the bus addresses it.
+    name: String,
+    /// What it is labelled as, which decides what it may be offered.
+    role: Option<String>,
+    /// When it entered its current state. Longest-idle is most available.
+    since: std::time::Instant,
 }
 
 /// Whether an agent's state means it is free to take board work.
@@ -1213,6 +2051,14 @@ fn succeed_exhausted(eng: &mut Engine) {
         p.succeeded = true;
     }
 
+    // Filed before the successor is told anything, so the note it is pointed at exists by
+    // the time it goes looking.
+    let filed = file_handoff(eng, dead, &name, &successor);
+    let brief = match &filed {
+        Some(path) => format!("{brief}\n\nThis handover is written up at {}.", path.display()),
+        None => brief,
+    };
+
     let by = format!("horde (for {name})");
     eng.bus.hold_for(&successor, &brief, &by);
     log_line(&format!("{name} ran out; started {successor} on {profile_name} to take over"));
@@ -1275,6 +2121,39 @@ fn compose_brief(eng: &mut Engine, pane: PaneId, name: &str) -> String {
     out
 }
 
+/// Put a handover in the vault, where it outlives the pane it came from.
+///
+/// The agent writes its own notes into `.horde/`, which is derived state horde is free to
+/// delete — fine for a brief read minutes later, wrong for the record of how a piece of work
+/// changed hands. So the note is copied into the vault, attributed to the agent that wrote it
+/// and linked to both ends of the succession, which is what makes it findable later by the
+/// only route anyone will actually use: the graph, or a search for the agent's name.
+///
+/// Nothing here is load-bearing for succession itself. A vault that cannot be written to is a
+/// reason to log and carry on, not a reason to leave an exhausted agent unsucceeded.
+fn file_handoff(eng: &mut Engine, pane: PaneId, name: &str, successor: &str) -> Option<PathBuf> {
+    let cwd = eng.session.panes.get(&pane)?.cwd.clone();
+    let space = eng.session.focused_space?;
+    let left = cwd.join(format!(".horde/handoff-{name}.md"));
+    let body = std::fs::read_to_string(&left).ok()?;
+    if body.trim().is_empty() {
+        return None;
+    }
+    let project = eng.session.space(space).map(|s| s.name.clone()).unwrap_or_default();
+    let note = format!(
+        "# Handoff — {name}\n\nProject: [[{project}]]\nTaken over by: [[{successor}]]\n\n{}",
+        body.trim()
+    );
+    let day = triggers::local_date(now_millis());
+    match eng.vault_put(space, &format!("Handoff — {name} {day}.md"), &note, Some(name), false) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            log_line(&format!("could not file {name}'s handover in the vault: {e}"));
+            None
+        }
+    }
+}
+
 /// Tell an agent that is nearly out of budget to hand over, while it still can.
 ///
 /// This is the half of succession the agent must do itself, because it is the only participant
@@ -1322,7 +2201,7 @@ fn nudge_handover(eng: &mut Engine) {
         let Engine { bus, session, .. } = eng;
         // Through the bus so it lands at the agent's prompt rather than mid-stream, and is
         // queued if it is busy — the same gating every other message gets.
-        if let Err(e) = bus.send(session, &cfg, None, &name, &body, false, false, None) {
+        if let Err(e) = bus.send(session, &cfg, bus::Outgoing::plain(None, &name, &body)) {
             log_line(&format!("{name}: could not send the handover instruction: {e}"));
         }
     }
@@ -1387,7 +2266,7 @@ fn advance_spent_models(eng: &mut Engine) {
         log_line(&format!("{name}: model spent, switching to {model}"));
         eng.journal.note(journal::Kind::Notified, &format!("{name} switched to {model}"));
         let Engine { bus, session, .. } = eng;
-        if let Err(e) = bus.send(session, &cfg, None, &name, &command, false, false, None) {
+        if let Err(e) = bus.send(session, &cfg, bus::Outgoing::plain(None, &name, &command)) {
             log_line(&format!("{name}: could not send the model switch: {e}"));
         }
     }
@@ -1409,6 +2288,112 @@ fn refresh_repos(eng: &mut Engine) {
         eng.repos.get(d);
     }
     eng.repos.retain(|k| dirs.iter().any(|d| d == k));
+}
+
+/// How many notes one pass may parse, across every vault.
+///
+/// This shares a tick with pane pumping, so a cold vault of five thousand notes has to
+/// arrive over several seconds rather than stalling the terminal to answer a question
+/// nobody has asked yet. Small enough to be invisible, large enough that a normal vault is
+/// fully indexed within a pass or two.
+const VAULT_BUDGET: usize = 40;
+
+/// Fold what the language servers have said into the session.
+///
+/// A server that started, died, or changed its mind about a file is something the person at
+/// the keyboard should be able to find out about without reading a log — especially the
+/// death, since the alternative symptom is diagnostics that simply never appear.
+fn drain_lsp(eng: &mut Engine) {
+    let events = eng.lsp.drain();
+    if events.is_empty() {
+        return;
+    }
+    let mut said = Vec::new();
+    let mut changed = false;
+    for ev in events {
+        match ev {
+            lsp::Event::Ready((root, lang)) => {
+                let _ = root;
+                said.push((NoticeLevel::Info, format!("{lang} language server ready")));
+            }
+            lsp::Event::Exited { key, why } => {
+                let (_, lang) = &key;
+                // Which of the two it is has already been decided by the registry, and the
+                // difference matters: one is "wait a moment", the other is "fix your config".
+                let text = match eng.lsp.get(&key).map(|s| s.state.clone()) {
+                    Some(lsp::State::Failed(_)) => {
+                        format!("{lang} language server keeps dying, giving up: {why}")
+                    }
+                    _ => format!("{lang} language server died, restarting: {why}"),
+                };
+                said.push((NoticeLevel::Warn, text));
+            }
+            // Straight back to whoever asked, and only to them: an unsolicited completion
+            // popup in somebody else's editor would be a haunting.
+            lsp::Event::Completions { path, items } => {
+                let named = eng.lsp_paths.get(&path).cloned();
+                if let (Some(rel), Some(c)) =
+                    (named, eng.lsp_asked.take().and_then(|id| eng.clients.get(&id)))
+                {
+                    let _ = c.out.send(ServerFrame::Completions { path: rel, items });
+                }
+            }
+            lsp::Event::Reply { .. } => {}
+            lsp::Event::Diagnostics { path, diags, .. } => {
+                changed = true;
+                // Only for files an editor actually has open, and named the way that editor
+                // named them. A server publishes diagnostics for whatever it feels like
+                // looking at — headers, generated code, the whole dependency tree — and none
+                // of that is on anybody's screen.
+                if let Some(rel) = eng.lsp_paths.get(&path).cloned() {
+                    for c in eng.clients.values() {
+                        let _ = c
+                            .out
+                            .send(ServerFrame::Diagnostics { path: rel.clone(), diags: diags.clone() });
+                    }
+                }
+            }
+        }
+    }
+    for (level, text) in said {
+        eng.notice(level, text);
+    }
+    // Diagnostic counts ride the snapshot, so a fresh set is a reason to send one.
+    if changed {
+        eng.dirty_shape = true;
+    }
+}
+
+/// Reindex each project's notes, and forget vaults no space is looking at any more.
+pub(super) fn refresh_vaults(eng: &mut Engine) {
+    if !eng.cfg.vault {
+        eng.vaults.clear();
+        return;
+    }
+    let mut roots: Vec<PathBuf> = eng
+        .session
+        .spaces
+        .iter()
+        .filter_map(|s| vault::locate(&s.cwd, &eng.cfg.vault_dir))
+        .collect();
+    // The home vault is indexed whether or not any project points at it, because notes are
+    // not a feature of whichever directory happens to be open.
+    if eng.cfg.vault_home.is_dir() {
+        roots.push(eng.cfg.vault_home.clone());
+    }
+    roots.sort();
+    roots.dedup();
+
+    let mut changed = false;
+    for root in &roots {
+        let idx = eng.vaults.entry(root.clone()).or_insert_with(|| vault::Index::new(root.clone()));
+        changed |= idx.refresh(VAULT_BUDGET);
+    }
+    eng.vaults.retain(|k, _| roots.iter().any(|r| r == k));
+    if changed {
+        // The note count rides the snapshot, so a changed index is a changed shape.
+        eng.touch();
+    }
 }
 
 /// Cheap summary of every agent, so a detection pass can tell whether anything the client
@@ -1451,14 +2436,9 @@ fn broadcast(eng: &mut Engine) {
         return;
     }
 
-    let cfg = eng.cfg.clone();
     let snapshot = if eng.dirty_shape {
         eng.dirty_shape = false;
-        let mut s = eng.session.snapshot(&cfg, &eng.repos);
-        s.tasks_open = eng.board.open_count();
-        s.tasks_claimed = eng.board.claimed_count();
-        s.triggers_armed = if eng.cfg.unattended { eng.triggers.armed_count() } else { 0 };
-        Some(Box::new(s))
+        Some(Box::new(eng.snapshot()))
     } else {
         None
     };
@@ -1607,10 +2587,26 @@ async fn serve_conn(
 
             if protocol != PROTOCOL_VERSION {
                 // Both halves ship in one binary, so this only bites across versions.
+                //
+                // Name the socket when it is not the default one. A daemon on its own
+                // socket is one somebody started deliberately — a sandbox, a second session,
+                // a build under test — and plain `horde stop` would walk past it and stop
+                // whichever daemon the environment points at instead, which is at best
+                // confusing and at worst somebody else's running work.
+                let fix = if std::env::var_os("HORDE_SOCKET").is_some()
+                    || std::env::var_os("HORDE_CONFIG_DIR").is_some()
+                {
+                    format!(
+                        "Stop this one with `HORDE_SOCKET={} horde stop`, then start it again.",
+                        crate::config::socket_path().display()
+                    )
+                } else {
+                    "Run `horde stop`, then `horde`.".to_string()
+                };
                 let bye = ServerFrame::Bye {
                     reason: format!(
                         "protocol mismatch: client speaks v{protocol}, daemon speaks \
-                         v{PROTOCOL_VERSION}. Run `horde stop`, then `horde`."
+                         v{PROTOCOL_VERSION}. {fix}"
                     ),
                 };
                 framing::write_frame(&mut write_half, &bye).await?;
@@ -1685,6 +2681,79 @@ fn clock_string() -> String {
     format!("{h:02}:{m:02}:{s:02}")
 }
 
+/// This machine's short name, lowercased, with a trailing `.local` taken off.
+///
+/// mDNS hands out `Joshs-MacBook-Pro.local`, and the suffix is a protocol detail rather than
+/// part of what anyone calls the machine. Falls back to `$HOSTNAME` because a login shell has
+/// usually set it even where the syscall is unhelpful.
+fn hostname() -> Option<String> {
+    let mut buf = [0i8; 256];
+    // SAFETY: `gethostname` writes at most `len` bytes into the buffer we hand it, and the
+    // result is only read up to the first NUL.
+    let raw = unsafe {
+        if libc::gethostname(buf.as_mut_ptr(), buf.len()) != 0 {
+            None
+        } else {
+            let bytes: Vec<u8> =
+                buf.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+            String::from_utf8(bytes).ok()
+        }
+    };
+    let name = raw.or_else(|| std::env::var("HOSTNAME").ok())?;
+    let name = name.trim().trim_end_matches(".local").to_lowercase();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Put a card's work on the agents' board, and record on the card that it went.
+///
+/// The one seam between the two boards, and deliberately the only one. It runs in this
+/// direction only: a card becomes a task, and the task's result comes back as a comment. The
+/// agents never see a card, never move one between columns, and never learn that columns
+/// exist — which is what stops the personal board's rules from having to make sense to them.
+///
+/// A free function rather than a method because it writes to two stores that are otherwise
+/// strangers, and a method on either one would make it look like that store's business.
+///
+/// The order matters: the task goes on the board first, and only a task that really landed
+/// gets marked on the card. The other order would leave a card claiming it had been handed
+/// over to a task that does not exist, which is worse than doing it twice.
+fn hand_over(eng: &mut Engine, card: u64) -> Result<u64> {
+    if !eng.cfg.board {
+        return Err(anyhow!(
+            "the agents' board is off — set agents.board = true in config.toml to hand a card over"
+        ));
+    }
+    let c = eng.kanban.get(card).ok_or_else(|| anyhow!("no card #{card}"))?.clone();
+    if let Some(task) = c.handed {
+        return Err(anyhow!("card #{card} is already task #{task}"));
+    }
+    let project = c
+        .project
+        .clone()
+        .ok_or_else(|| anyhow!("card #{card} names no project, so no agent could be told where to work"))?;
+    // Title and description together: the title alone is a label written for a column two
+    // dozen cells wide, and an agent handed only that has to guess at everything the card
+    // actually says.
+    let text = match c.body.trim() {
+        "" => c.title.clone(),
+        body => format!("{}\n\n{body}", c.title),
+    };
+    // A card carries no role of its own — it is written in a column on your board, not addressed
+    // to anybody. So it inherits the one role the config already names: where `task_authors` is
+    // set, whoever may write work is also who receives it, and an armed card lands on their plate
+    // to be read and broken up rather than in a pool where the nearest idle agent starts editing
+    // from a title and a due date. With no such role configured it is general work, which is what
+    // every card has always been.
+    let lead = eng.cfg.task_authors.first().cloned();
+    let task = eng.board.add(tasks::NewTask {
+        role: lead.as_deref(),
+        ..tasks::NewTask::new(&text, "kanban", Some(&project))
+    })?;
+    eng.kanban.mark_handed(card, task.id)?;
+    eng.touch();
+    Ok(task.id)
+}
+
 pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1707,8 +2776,214 @@ mod tests {
         std::env::temp_dir().join(format!("horde-test-{}-{name}", std::process::id()))
     }
 
+    /// The home vault is a promise that horde makes notes possible anywhere. It has to make
+    /// the directory too, or the promise only holds for people who already made it by hand —
+    /// which is every new user, told they have no vault the first time they write one.
+    #[test]
+    fn writing_the_first_note_makes_the_vault_that_holds_it() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        assert!(!home.exists(), "nothing is created before it is asked for");
+
+        let space = eng.session.focused_space.expect("a space");
+        let written = eng.vault_write(space, "First.md", "# First\n").expect("the write works");
+
+        assert!(written.starts_with(&home), "it landed in the home vault");
+        assert!(vault::is_vault(&home), "which is now a vault horde will find again");
+        assert!(eng.vault_for(space).is_some_and(|v| v.len() >= 1), "and it is indexed");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An agent's notes go somewhere of their own, always. Mixed in with your own writing
+    /// there is no undoing it — nothing recorded which was which.
+    #[test]
+    fn a_note_written_by_an_agent_is_kept_apart_and_signed() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-agentnote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        let space = eng.session.focused_space.expect("a space");
+
+        let written = eng
+            .vault_put(space, "Findings.md", "the thing I found", Some("reviewer"), false)
+            .expect("written");
+        assert!(
+            written.parent().is_some_and(|d| d.ends_with(vault::AGENT_DIR)),
+            "in its own folder: {}",
+            written.display()
+        );
+        let text = std::fs::read_to_string(&written).unwrap();
+        assert!(text.contains("by: reviewer"), "and signed: {text}");
+
+        // A path with a folder in it is the caller being specific, and is honoured.
+        let elsewhere = eng
+            .vault_put(space, "reviews/Deep.md", "body", Some("reviewer"), false)
+            .expect("written");
+        assert!(elsewhere.parent().is_some_and(|d| d.ends_with("reviews")));
+
+        // A person's own note is neither moved nor stamped.
+        let mine = eng.vault_write(space, "Mine.md", "just mine").expect("written");
+        assert_eq!(mine.parent(), Some(home.as_path()));
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "just mine");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Appending is what makes a dated note a log rather than the last thing that happened to
+    /// be written to it — and it must not re-stamp, or the file fills with frontmatter.
+    #[test]
+    fn appending_adds_to_a_note_without_stamping_it_again() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        let space = eng.session.focused_space.expect("a space");
+
+        eng.vault_put(space, "Log.md", "first", Some("builder"), false).unwrap();
+        let p = eng.vault_put(space, "Log.md", "second", Some("builder"), true).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.matches("source: horde").count(), 1, "stamped once: {text}");
+        assert!(text.contains("first") && text.contains("second"), "{text}");
+        assert!(text.find("first") < text.find("second"), "in order");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The thing that writes a megabyte of note is an agent that has gone wrong, and the
+    /// first symptom should be a refusal with a reason rather than a vault nobody can open.
+    #[test]
+    fn a_note_too_large_to_be_meant_is_refused_with_a_reason() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-huge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        let space = eng.session.focused_space.expect("a space");
+
+        let huge = "x".repeat(vault::MAX_NOTE + 1);
+        let err = eng.vault_put(space, "Huge.md", &huge, Some("runaway"), false).unwrap_err();
+        assert!(err.to_string().contains("loop"), "it says what it thinks happened: {err}");
+        assert!(!home.join(vault::AGENT_DIR).join("Huge.md").exists(), "and wrote nothing");
+
+        // And it cannot be got past by appending a little at a time.
+        eng.vault_put(space, "Slow.md", "start", Some("runaway"), false).unwrap();
+        let big = "y".repeat(vault::MAX_NOTE);
+        assert!(eng.vault_put(space, "Slow.md", &big, Some("runaway"), true).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+
+    /// A note written by horde has to be in horde's index immediately. Waiting for the next
+    /// scan would mean the daemon not knowing about a file it just wrote itself.
+    #[test]
+    fn a_note_written_is_indexed_at_once() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        vault::init(&home).unwrap();
+        eng.cfg.vault_home = home.clone();
+        refresh_vaults(&mut eng);
+
+        let space = eng.session.focused_space.expect("a space");
+        eng.vault_write(space, "Ideas/One.md", "# One\n\nsee [[Welcome]]\n").unwrap();
+
+        let idx = eng.vault_for(space).expect("the home vault answers");
+        let welcome = idx.resolve("Welcome").expect("the starter note");
+        assert_eq!(idx.backlinks(welcome).len(), 1, "the new note's link is already known");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The knowledge layer does not depend on which directory happens to be open. A project
+    /// with no vault of its own still has somewhere to put a thought.
+    #[test]
+    fn a_project_without_a_vault_falls_back_to_the_home_one() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        vault::init(&home).unwrap();
+        eng.cfg.vault_home = home.clone();
+        refresh_vaults(&mut eng);
+
+        let space = eng.session.focused_space.expect("a space");
+        assert_eq!(eng.vault_root(space).as_ref(), Some(&home), "the fallback is the home vault");
+        assert!(eng.vault_for(space).is_some(), "and it is indexed");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The recents list is keyed on the directory, not the name. A renamed space is the
+    /// same project, and remembering it twice would offer you a choice between two rows
+    /// that open the same thing.
+    #[test]
+    fn reopening_a_project_moves_it_up_rather_than_listing_it_twice() {
+        let mut eng = engine();
+        eng.remember_project("alpha", std::path::Path::new("/tmp/alpha"));
+        eng.remember_project("beta", std::path::Path::new("/tmp/beta"));
+        eng.remember_project("renamed-alpha", std::path::Path::new("/tmp/alpha"));
+
+        let cwds: Vec<&str> = eng.recents.iter().map(|r| r.cwd.as_str()).collect();
+        assert_eq!(cwds, vec!["/tmp/alpha", "/tmp/beta"], "one entry each, newest first");
+        assert_eq!(eng.recents[0].name, "renamed-alpha", "and it carries the current name");
+    }
+
+    /// A list you pick from by eye stops being useful long before it stops being possible.
+    #[test]
+    fn the_recents_list_is_capped() {
+        let mut eng = engine();
+        for i in 0..(Engine::MAX_RECENTS + 5) {
+            eng.remember_project(&format!("p{i}"), &std::path::PathBuf::from(format!("/tmp/p{i}")));
+        }
+        assert_eq!(eng.recents.len(), Engine::MAX_RECENTS);
+        assert_eq!(eng.recents[0].name, format!("p{}", Engine::MAX_RECENTS + 4), "newest first");
+    }
+
+    /// Opening a project you already have on screen goes *there*. Starting a second space on
+    /// the same directory would split one project's agents across two rows of the sidebar.
+    #[test]
+    fn opening_a_project_that_is_already_open_focuses_it_instead_of_duplicating_it() {
+        let mut eng = engine();
+        // A directory of its own: the test engine's first space already sits on the temp
+        // root, and matching that one would prove nothing about the one we opened.
+        let dir = std::env::temp_dir().join(format!("horde-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = eng.cfg.clone();
+        let first = eng.session.create_space(&cfg, Some("already-here"), &dir).unwrap();
+        let before = eng.session.spaces.len();
+
+        apply_cmd(&mut eng, Cmd::OpenProject { cwd: dir.to_string_lossy().to_string() });
+
+        assert_eq!(eng.session.spaces.len(), before, "no second space");
+        assert_eq!(eng.session.focused_space, Some(first), "and it went there");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A remembered directory can be deleted between sessions. Say so, rather than opening a
+    /// space whose cwd silently became wherever the daemon happened to start.
+    #[test]
+    fn opening_a_project_that_no_longer_exists_warns_instead_of_guessing() {
+        let mut eng = engine();
+        let before = eng.session.spaces.len();
+        apply_cmd(&mut eng, Cmd::OpenProject { cwd: "/tmp/horde-definitely-not-here".into() });
+        assert_eq!(eng.session.spaces.len(), before, "nothing opened");
+        assert!(
+            eng.pending_events.iter().any(|e| matches!(e, Event::Notice { .. })),
+            "and it said why"
+        );
+    }
+
     pub(super) fn engine() -> Engine {
         engine_with_shell(None)
+    }
+
+    /// An engine whose one pane prints `words` and then stays open.
+    ///
+    /// The way to give a pane a line for horde to detect. `echo` looks like the obvious choice
+    /// and is a race: it exits immediately, and macOS discards a tty's pending output when the
+    /// last descriptor on the slave side closes, so under suite-level load the reader thread can
+    /// find a closed pty with nothing in it. The test then reports that the feature did not fire,
+    /// when the truth is the line never arrived to fire it — a failure that blames the code for
+    /// the test's own timing. See `tests/support/say.py`.
+    pub(super) fn engine_saying(words: &str) -> Engine {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/say.py");
+        engine_with_shell(Some(&format!("python3 {script} {words}")))
     }
 
     /// An engine whose one pane runs `shell`, or the configured default when `None`.
@@ -1724,12 +2999,19 @@ mod tests {
         }
         // Present for every test engine so the env path is exercised rather than bypassed.
         cfg.env.insert("HORDE_ENV_TEST".into(), "sk-or-test".into());
+        // Point the home vault somewhere that does not exist, so tests never read the notes
+        // of whoever is running them. Without this the suite passes or fails depending on
+        // whether the developer happens to keep a `~/notes` — which is exactly the kind of
+        // difference between a laptop and CI that costs an afternoon to find.
+        cfg.vault_home = std::env::temp_dir()
+            .join(format!("horde-test-novault-{}", std::process::id()));
         let session = Session::new(&cfg);
         let agents = agents::Detector::new(&cfg);
         let mut eng = Engine {
             session,
             bus: bus::Bus::new(test_path("bus.jsonl")),
             board: tasks::Board::new(test_path("tasks.jsonl")),
+            kanban: kanban::Kanban::new(test_path("kanban.jsonl")),
             triggers: triggers::Store::new(
                 test_path("triggers.jsonl"),
             ),
@@ -1740,7 +3022,12 @@ mod tests {
             last_seen: 0,
             last_alert: 0,
             agents,
+            recents: Vec::new(),
             repos: repo::Cache::default(),
+            vaults: HashMap::new(),
+            lsp: lsp::Registry::new(),
+            lsp_paths: HashMap::new(),
+            lsp_asked: None,
             cfg,
             clients: HashMap::new(),
             dirty_shape: true,
@@ -1996,6 +3283,235 @@ mod tests {
         );
     }
 
+    // -- the kanban over the wire ------------------------------------------
+    //
+    // The store has its own tests and so does the view. These are the bit in between: that a
+    // command arriving from a client reaches the store and that the board comes back — to the
+    // client that asked, and to nobody else.
+
+    /// An engine whose two boards are its own.
+    ///
+    /// `test_path` is unique per *process*, and tests run in parallel threads inside one — so
+    /// two tests that each replay `kanban.jsonl` would be reading each other's cards. Both
+    /// logs get a name of their own here, which is the same fix commit `bf2287a` applied to
+    /// the task board's own tests and for the same reason.
+    fn engine_with_boards(tag: &str) -> Engine {
+        let mut eng = engine();
+        let path = |what: &str| {
+            std::env::temp_dir()
+                .join(format!("horde-kb-{tag}-{}-{what}.jsonl", std::process::id()))
+        };
+        for what in ["kanban", "tasks"] {
+            let _ = std::fs::remove_file(path(what));
+        }
+        eng.kanban = kanban::Kanban::new(path("kanban"));
+        eng.board = tasks::Board::new(path("tasks"));
+        eng
+    }
+
+    /// Every reply the daemon sent this client, drained.
+    fn kanban_replies(
+        rx: &mut mpsc::UnboundedReceiver<ServerFrame>,
+    ) -> Vec<crate::proto::KanbanReply> {
+        let mut out = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            if let ServerFrame::Kanban(r) = f {
+                out.push(*r);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_client_asking_for_the_board_gets_it_back() {
+        let mut eng = engine_with_boards("board-query");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
+
+        handle_client_frame(&mut eng, 1, ClientFrame::Command(Cmd::KanbanQuery { space: None }));
+        let reply = kanban_replies(&mut rx).pop().expect("the board came back");
+        assert!(reply.cards.is_empty());
+        // The columns travel with it rather than being read from the client's own config, so
+        // a client attached from another machine still agrees about what the columns are.
+        assert_eq!(reply.columns, eng.cfg.kanban_columns);
+        kill_all(&mut eng);
+    }
+
+    /// Every command that changes a card answers with the whole board, so the client never
+    /// has to patch its own copy and cannot end up showing a state that was never true.
+    #[test]
+    fn every_card_command_answers_with_the_whole_board() {
+        let mut eng = engine_with_boards("card-cmds");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
+        let send = |eng: &mut Engine, cmd: Cmd| handle_client_frame(eng, 1, ClientFrame::Command(cmd));
+
+        send(&mut eng, Cmd::CardNew { space: None, column: "Todo".into(), title: "write it".into() });
+        let after_new = kanban_replies(&mut rx).pop().expect("a reply");
+        assert_eq!(after_new.cards.len(), 1);
+        let id = after_new.cards[0].id;
+
+        send(
+            &mut eng,
+            Cmd::CardEdit {
+                id,
+                patch: crate::proto::CardPatch {
+                    body: Some("the long version".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(kanban_replies(&mut rx).pop().unwrap().cards[0].body, "the long version");
+
+        send(&mut eng, Cmd::CardComment { id, body: "parked".into() });
+        let commented = kanban_replies(&mut rx).pop().unwrap();
+        let last = commented.cards[0].comments.last().expect("the comment landed");
+        assert_eq!(last.body, "parked");
+        // The daemon stamps who said it. The client only ever sends the words, which is what
+        // stops a client claiming to be somebody else.
+        assert_eq!(last.by, eng.local_user());
+        assert!(last.by.contains('@') || last.by == "user", "a person, not a process: {}", last.by);
+
+        send(&mut eng, Cmd::CardMove { id, column: "Doing".into(), after: None });
+        assert_eq!(kanban_replies(&mut rx).pop().unwrap().cards[0].column, "Doing");
+
+        send(&mut eng, Cmd::CardArchive { id, archived: true });
+        assert!(kanban_replies(&mut rx).pop().unwrap().cards[0].archived);
+        kill_all(&mut eng);
+    }
+
+    /// A refused command still answers, or the view keeps showing the move it optimistically
+    /// drew. Staying quiet on failure is the one thing a board must not do.
+    #[test]
+    fn a_refused_card_command_still_sends_the_board_back() {
+        let mut eng = engine_with_boards("refused");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
+
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: None,
+                column: "Todo".into(),
+                title: "   ".into(),
+            }),
+        );
+        let reply = kanban_replies(&mut rx).pop().expect("it answered anyway");
+        assert!(reply.cards.is_empty(), "and refused the card");
+        kill_all(&mut eng);
+    }
+
+    /// The one seam between the two boards, driven from the client rather than the clock.
+    #[test]
+    fn handing_a_card_over_puts_a_real_task_on_the_agents_board() {
+        let mut eng = engine_with_boards("handoff");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
+        let space = eng.session.spaces[0].id;
+        let name = eng.session.spaces[0].name.clone();
+
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: Some(space),
+                column: "Todo".into(),
+                title: "wire up the importer".into(),
+            }),
+        );
+        let id = kanban_replies(&mut rx).pop().unwrap().cards[0].id;
+        handle_client_frame(&mut eng, 1, ClientFrame::Command(Cmd::CardHandOff { id }));
+
+        let task = eng.board.all().last().expect("a task on the agents' board").clone();
+        assert_eq!(task.text, "wire up the importer");
+        assert_eq!(task.space.as_deref(), Some(name.as_str()), "scoped to the card's project");
+        assert_eq!(task.by, "kanban", "and says where it came from");
+
+        let card = kanban_replies(&mut rx).pop().unwrap().cards[0].clone();
+        assert_eq!(card.handed, Some(task.id));
+        assert!(card.comments.iter().any(|c| c.by == "horde"), "the card records that it went");
+
+        // Handing it over twice would put the same work on the board again.
+        handle_client_frame(&mut eng, 1, ClientFrame::Command(Cmd::CardHandOff { id }));
+        assert_eq!(eng.board.all().len(), 1, "once only");
+        kill_all(&mut eng);
+    }
+
+    /// An agent has to be told which tree to work in, which is the same failure `tasks.rs`
+    /// scoping exists to prevent — in the other direction.
+    #[test]
+    fn a_card_with_no_project_is_never_handed_over() {
+        let mut eng = engine_with_boards("no-project");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: None,
+                column: "Todo".into(),
+                title: "not about a repo".into(),
+            }),
+        );
+        let id = kanban_replies(&mut rx).pop().unwrap().cards[0].id;
+        assert!(hand_over(&mut eng, id).is_err());
+        assert!(eng.board.all().is_empty());
+        kill_all(&mut eng);
+    }
+
+    /// The switch that closes the agents' board has to close everything that puts work on it,
+    /// or it is a promise honoured in one place and broken in another.
+    #[test]
+    fn closing_the_agents_board_closes_the_bridge_too() {
+        let mut eng = engine_with_boards("board-off");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
+        let space = eng.session.spaces[0].id;
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: Some(space),
+                column: "Todo".into(),
+                title: "work".into(),
+            }),
+        );
+        let id = kanban_replies(&mut rx).pop().unwrap().cards[0].id;
+
+        eng.cfg.board = false;
+        assert!(hand_over(&mut eng, id).is_err(), "the client-driven half refuses");
+        eng.hand_over_due_cards();
+        assert!(eng.board.all().is_empty(), "and so does the one on the clock");
+        kill_all(&mut eng);
+    }
+
+    /// Renaming a column carries its cards, which is what keeps an edit to the configured
+    /// list from orphaning work.
+    #[test]
+    fn renaming_a_column_over_the_wire_carries_its_cards() {
+        let mut eng = engine_with_boards("rename");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        eng.clients.insert(1, Client { out: tx, needs_full: Vec::new(), cols: 120, rows: 40 });
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::CardNew {
+                space: None,
+                column: "Todo".into(),
+                title: "work".into(),
+            }),
+        );
+        let _ = kanban_replies(&mut rx);
+        handle_client_frame(
+            &mut eng,
+            1,
+            ClientFrame::Command(Cmd::ColumnRename { from: "Todo".into(), to: "Next".into() }),
+        );
+        assert_eq!(kanban_replies(&mut rx).pop().unwrap().cards[0].column, "Next");
+        kill_all(&mut eng);
+    }
+
     /// A configured variable has to reach the program, not merely be stored.
     ///
     /// This is how a provider key gets to an agent, and the failure mode if it does not arrive is
@@ -2003,34 +3519,64 @@ mod tests {
     /// its own UI. So the assertion goes all the way through a real PTY to a real child.
     #[test]
     fn configured_env_reaches_the_program_in_the_pane() {
-        // `printenv VAR` rather than `env`: one variable, one line. A bare `env` prints more
-        // than a pane has rows, and the answer scrolls off the top before anything can read it.
-        // Neither can use `sh -c '...'` — `build_command` splits on whitespace and does not
-        // honour quotes, so an argument containing spaces cannot be expressed here at all.
-        let mut eng = engine_with_shell(Some("printenv HORDE_ENV_TEST"));
+        // One variable, one line. A bare `env` prints more than a pane has rows and the answer
+        // scrolls off the top before anything can read it.
+        let mut eng = engine_saying("--env HORDE_ENV_TEST");
         let pane = *eng.session.panes.keys().next().unwrap();
-        let theme = eng.cfg.theme.clone();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut seen = String::new();
-        while std::time::Instant::now() < deadline && !seen.contains("sk-or-test") {
-            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
-            seen = eng.session.panes[&pane].visible_text().join("");
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        // The value is printed alone, so the value is the whole assertion.
+        wait_for_text(&mut eng, pane, "sk-or-test");
         kill_all(&mut eng);
-        // `printenv VAR` prints the value alone, so the value is the whole assertion.
+    }
+
+
+    /// A handover written into `.horde/` is derived state horde may delete. The record of how
+    /// a piece of work changed hands should outlive the pane, which means the vault — and it
+    /// has to link both ends, because the only route anyone will actually use to find it later
+    /// is the graph or a search for the agent's name.
+    ///
+    /// Tests the filing rather than the succession around it: succession is covered above, and
+    /// driving it twice in one suite means two engines writing the same shared bus log.
+    #[test]
+    fn a_handover_is_filed_in_the_vault_and_links_both_ends() {
+        let mut eng = engine();
+        let home = std::env::temp_dir().join(format!("horde-handoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        eng.cfg.vault_home = home.clone();
+        let pane = *eng.session.panes.keys().next().unwrap();
+        give_agent_named(&mut eng.session, pane, "scribe");
+
+        // Named after an agent no other test uses: `.horde/handoff-{name}.md` lives in a cwd
+        // every test pane shares, so a common name is a failure two tests away from its cause.
+        let cwd = eng.session.panes[&pane].cwd.clone();
+        let left = cwd.join(".horde/handoff-scribe.md");
+        std::fs::create_dir_all(cwd.join(".horde")).unwrap();
+        std::fs::write(&left, "Half-done: the parser. Do not touch the lexer.").unwrap();
+
+        let filed = file_handoff(&mut eng, pane, "scribe", "scribe-next").expect("filed");
+        let text = std::fs::read_to_string(&filed).unwrap();
+
         assert!(
-            seen.contains("sk-or-test"),
-            "the pane never saw the configured value; screen was {seen:?}"
+            filed.parent().is_some_and(|d| d.ends_with(vault::AGENT_DIR)),
+            "with the rest of what horde wrote: {}",
+            filed.display()
         );
+        assert!(text.contains("by: scribe"), "credited to whoever wrote it: {text}");
+        assert!(text.contains("Do not touch the lexer"), "its own words survive: {text}");
+        assert!(text.contains("[[scribe-next]]"), "linked to who took over: {text}");
+        assert!(text.contains("Project: [["), "and to the project: {text}");
+
+        // An agent that left nothing has nothing to file, and that is not a failure.
+        std::fs::remove_file(&left).unwrap();
+        assert!(file_handoff(&mut eng, pane, "scribe", "scribe-next").is_none());
+        kill_all(&mut eng);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The silent-death path: no warning, no note, and a successor still appears — briefed with
     /// everything horde could see.
     #[test]
     fn an_agent_that_died_without_handing_over_gets_a_successor() {
-        let mut eng = engine_with_shell(Some("echo reached your usage limit"));
+        let mut eng = engine_saying("reached your usage limit");
         let dead = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: Vec::new(),
@@ -2050,15 +3596,7 @@ mod tests {
         );
         give_agent_named(&mut eng.session, dead, "builder");
 
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&dead).unwrap().pump(&theme);
-            if eng.session.panes[&dead].visible_text().join("").contains("usage limit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, dead, "usage limit");
 
         let before = eng.session.panes.len();
         succeed_exhausted(&mut eng);
@@ -2094,7 +3632,7 @@ mod tests {
     /// answer is not a fourth.
     #[test]
     fn a_succession_chain_stops_at_its_limit() {
-        let mut eng = engine_with_shell(Some("echo reached your usage limit"));
+        let mut eng = engine_saying("reached your usage limit");
         let dead = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: Vec::new(),
@@ -2116,15 +3654,7 @@ mod tests {
         // Already at the end of a chain.
         eng.session.panes.get_mut(&dead).unwrap().succession_depth = 2;
 
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&dead).unwrap().pump(&theme);
-            if eng.session.panes[&dead].visible_text().join("").contains("usage limit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, dead, "usage limit");
 
         let before = eng.session.panes.len();
         succeed_exhausted(&mut eng);
@@ -2186,7 +3716,7 @@ mod tests {
     /// what to write, where, and the exact command to start its successor.
     #[test]
     fn an_agent_running_out_is_told_to_hand_over_while_it_still_can() {
-        let mut eng = engine_with_shell(Some("echo Approaching usage limit"));
+        let mut eng = engine_saying("Approaching usage limit");
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: vec!["Approaching usage limit".into()],
@@ -2197,15 +3727,7 @@ mod tests {
         };
         give_agent_named(&mut eng.session, pane, "builder");
 
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
-            if eng.session.panes[&pane].visible_text().join("").contains("Approaching") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, pane, "Approaching");
 
         nudge_handover(&mut eng);
         assert!(eng.session.panes[&pane].handover_told, "it should have been told");
@@ -2229,7 +3751,7 @@ mod tests {
     /// spend an agent's last turn telling it to run a command that cannot work.
     #[test]
     fn a_handover_warning_without_a_profile_does_nothing() {
-        let mut eng = engine_with_shell(Some("echo Approaching usage limit"));
+        let mut eng = engine_saying("Approaching usage limit");
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.handover = crate::config::Handover {
             warning: vec!["Approaching usage limit".into()],
@@ -2252,7 +3774,7 @@ mod tests {
     #[test]
     fn an_exhausted_model_moves_the_agent_to_the_next_one() {
         // `echo` so the pane's screen carries OpenRouter's real refusal wording.
-        let mut eng = engine_with_shell(Some("echo Rate limit exceeded"));
+        let mut eng = engine_saying("Rate limit exceeded");
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.models.insert(
             "free".into(),
@@ -2267,16 +3789,7 @@ mod tests {
             Some(crate::daemon::pane::ModelRun { profile: "free".into(), index: 0, switched: None });
         give_agent_named(&mut eng.session, pane, "builder");
 
-        // Let the refusal reach the screen.
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
-            if eng.session.panes[&pane].visible_text().join("").contains("Rate limit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, pane, "Rate limit");
 
         advance_spent_models(&mut eng);
         let run = eng.session.panes[&pane].model.clone().expect("still on a profile");
@@ -2294,7 +3807,7 @@ mod tests {
     /// A profile with nowhere left to go stops rather than wrapping.
     #[test]
     fn a_spent_profile_stops_instead_of_starting_over() {
-        let mut eng = engine_with_shell(Some("echo Rate limit exceeded"));
+        let mut eng = engine_saying("Rate limit exceeded");
         let pane = *eng.session.panes.keys().next().unwrap();
         eng.cfg.models.insert(
             "free".into(),
@@ -2309,15 +3822,7 @@ mod tests {
             Some(crate::daemon::pane::ModelRun { profile: "free".into(), index: 0, switched: None });
         give_agent_named(&mut eng.session, pane, "builder");
 
-        let theme = eng.cfg.theme.clone();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
-            if eng.session.panes[&pane].visible_text().join("").contains("Rate limit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for_text(&mut eng, pane, "Rate limit");
 
         advance_spent_models(&mut eng);
         // Still on the last model, not back at the start.
@@ -2350,6 +3855,32 @@ mod tests {
         for p in eng.session.panes.values_mut() {
             p.kill();
         }
+    }
+
+    /// Pump `pane` until its screen contains `needle`, and fail saying so if it never does.
+    ///
+    /// Every handover and model test needs the same thing first: a real process has to get far
+    /// enough to print the line the feature triggers on. Five of them spelled that out inline as
+    /// "loop until the deadline, then carry on regardless", which made two of them flaky and one
+    /// of them worse than flaky — the test that asserts *no* successor appears passed for the
+    /// wrong reason whenever the process was slow, because a screen that never showed the
+    /// message also produces no successor.
+    ///
+    /// So the wait asserts. The deadline is generous because the cost is asymmetric: too short
+    /// fails a good build, and too long only matters on a build that is already failing.
+    fn wait_for_text(eng: &mut Engine, pane: PaneId, needle: &str) {
+        let theme = eng.cfg.theme.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            eng.session.panes.get_mut(&pane).unwrap().pump(&theme);
+            if eng.session.panes[&pane].visible_text().join("").contains(needle) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let screen = eng.session.panes[&pane].visible_text().join("");
+        kill_all(eng);
+        panic!("the pane never printed {needle:?} — nothing was triggered. Screen was {screen:?}");
     }
 
     /// The bug this guards: agent state, names, and elapsed timers all reach the client
@@ -2514,7 +4045,7 @@ mod tests {
     /// Add work to the fixture's own project.
     fn add_task(eng: &mut Engine, text: &str) {
         let space = fixture_space(eng);
-        eng.board.add(text, "user", Some(&space)).unwrap();
+        eng.board.add(tasks::NewTask::new(text, "user", Some(&space))).unwrap();
     }
 
     fn nudge_bodies(events: &[Event]) -> Vec<(String, String)> {
@@ -2535,6 +4066,117 @@ mod tests {
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].0, "worker0");
         assert!(sent[0].1.contains("horde task claim"), "it must name the command: {sent:?}");
+        kill_all(&mut eng);
+    }
+
+    /// Give an enlisted agent a role, the way `spawn --role` does.
+    fn label(eng: &mut Engine, worker: &str, role: &str) {
+        let pane = *eng
+            .session
+            .panes
+            .iter()
+            .find(|(_, p)| p.agent.as_ref().is_some_and(|a| a.name == worker))
+            .map(|(id, _)| id)
+            .expect("that worker exists");
+        eng.session.set_pane_role(pane, role);
+    }
+
+    /// Add role-tagged work to the fixture's own project.
+    fn add_task_for(eng: &mut Engine, text: &str, role: &str) {
+        let space = fixture_space(eng);
+        eng.board
+            .add(tasks::NewTask {
+                role: Some(role),
+                ..tasks::NewTask::new(text, "pm", Some(&space))
+            })
+            .unwrap();
+    }
+
+    /// The dispatcher wakes the agent the work is *for*.
+    ///
+    /// Not the one that has been idle longest, which is the rule for general work and would here
+    /// mean a builder woken for a task it cannot claim: a turn spent finding out, and a reviewer
+    /// still sitting idle beside it.
+    #[test]
+    fn role_tagged_work_wakes_the_role_it_names() {
+        let mut eng = engine_with_idle_agents("role-nudge", 2);
+        label(&mut eng, "worker0", "builder");
+        label(&mut eng, "worker1", "reviewer");
+        add_task_for(&mut eng, "review the diff", "reviewer");
+
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "worker1", "the reviewer, not whoever was idle longest");
+        assert!(sent[0].1.contains("for reviewer"), "and it says whose work it is: {sent:?}");
+        kill_all(&mut eng);
+    }
+
+    /// Nobody is woken for work they could not claim if they tried.
+    ///
+    /// The failure this prevents is the expensive kind: a nudge costs the recipient a whole turn,
+    /// and a turn that ends in `horde task claim` printing nothing is a turn spent on nothing.
+    #[test]
+    fn an_agent_is_never_woken_for_work_its_role_cannot_take() {
+        let mut eng = engine_with_idle_agents("role-wrong", 1);
+        label(&mut eng, "worker0", "builder");
+        add_task_for(&mut eng, "review the diff", "reviewer");
+
+        for _ in 0..3 {
+            assert!(
+                nudge_bodies(&eng.nudge_for_tasks()).is_empty(),
+                "a builder must not be woken for a reviewer's task"
+            );
+        }
+        // And the work is visibly stuck rather than quietly waiting.
+        let space = fixture_space(&eng);
+        let present = eng.roles_enlisted_in(&space);
+        assert_eq!(present, ["builder"], "{present:?}");
+        assert_eq!(eng.board.stranded(&space, &present).len(), 1);
+        kill_all(&mut eng);
+    }
+
+    /// General work goes to a general hand before it goes to a specialist.
+    ///
+    /// Spending the reviewer on work that named nobody is how the one task only the reviewer
+    /// could have taken ends up waiting for the reviewer.
+    #[test]
+    fn general_work_prefers_an_unlabelled_agent_over_a_specialist() {
+        let mut eng = engine_with_idle_agents("role-general", 2);
+        // worker0 has been idle longest and is the specialist, so "longest idle" alone would
+        // pick it. The role is what makes worker1 the right answer.
+        label(&mut eng, "worker0", "reviewer");
+        add_task(&mut eng, "anything");
+
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "worker1", "the unlabelled one: {sent:?}");
+        kill_all(&mut eng);
+    }
+
+    /// Work is accounted per role, not in one pool.
+    ///
+    /// Two reviewer tasks and one reviewer means one nudge; the builder beside it is not woken to
+    /// make up the number, and is not held back either when its own work arrives.
+    #[test]
+    fn the_wake_cap_counts_each_roles_work_separately() {
+        let mut eng = engine_with_idle_agents("role-cap", 2);
+        label(&mut eng, "worker0", "reviewer");
+        label(&mut eng, "worker1", "builder");
+        add_task_for(&mut eng, "review one", "reviewer");
+        add_task_for(&mut eng, "review two", "reviewer");
+
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "two reviewer tasks, one reviewer: {sent:?}");
+        assert_eq!(sent[0].0, "worker0");
+        // The builder stays asleep however many reviewer tasks pile up.
+        add_task_for(&mut eng, "review three", "reviewer");
+        assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty(), "not the builder's work");
+
+        // Its own work still reaches it, unblocked by the reviewer's backlog.
+        add_task_for(&mut eng, "build one", "builder");
+        let sent = nudge_bodies(&eng.nudge_for_tasks());
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "worker1");
         kill_all(&mut eng);
     }
 
@@ -2649,7 +4291,7 @@ mod tests {
     fn a_task_old_enough_to_be_forgotten_stops_being_offered() {
         let mut eng = engine_with_idle_agents("stale", 1);
         let space = fixture_space(&eng);
-        eng.board.add("from last week", "user", Some(&space)).unwrap();
+        eng.board.add(tasks::NewTask::new("from last week", "user", Some(&space))).unwrap();
         // Wind it back past the threshold.
         let id = eng.board.all()[0].id;
         eng.board.backdate_for_test(id, tasks::STALE_AFTER.as_millis() as u64 + 60_000);
@@ -2658,7 +4300,7 @@ mod tests {
         assert!(nudge_bodies(&eng.nudge_for_tasks()).is_empty());
         // Still on the board, still readable, still claimable by name. Stale is not deleted.
         assert_eq!(eng.board.open_count(), 1);
-        assert!(eng.board.claim("worker0", Some(id), Some(&space)).unwrap().is_some());
+        assert!(eng.board.claim("worker0", Some(id), tasks::Claimant { space: Some(&space), role: None }).unwrap().is_some());
         kill_all(&mut eng);
     }
 
@@ -2719,7 +4361,7 @@ mod tests {
         let mut eng = engine_with_idle_agents("done-worker", 1);
         add_task(&mut eng, "first");
         add_task(&mut eng, "second");
-        eng.board.claim("worker0", Some(1), None).unwrap();
+        eng.board.claim("worker0", Some(1), Default::default()).unwrap();
         eng.board.done("worker0", Some(1), Some("finished")).unwrap();
 
         // It finished unfocused, so detection calls that `done`.
@@ -2737,7 +4379,7 @@ mod tests {
         let mut eng = engine_with_idle_agents("holding", 1);
         add_task(&mut eng, "job one");
         add_task(&mut eng, "job two");
-        eng.board.claim("worker0", Some(1), None).unwrap();
+        eng.board.claim("worker0", Some(1), Default::default()).unwrap();
         assert!(
             nudge_bodies(&eng.nudge_for_tasks()).is_empty(),
             "it has work; a second task can wait for someone free"

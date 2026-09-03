@@ -32,6 +32,7 @@ settings screen.
 
 ```toml
 prefix = "ctrl+b"
+leader = "ctrl+space"       # opens the multi-key leader table
 scrollback = 10000
 shell = "/bin/zsh"          # defaults to $SHELL
 
@@ -72,6 +73,7 @@ pane_titles = true
 tab_bar = true
 status_bar = true
 animate = true              # spinners for working agents
+zombie = true               # something crosses the start screen now and then
 
 [agents]
 restore = true              # resume agents after a daemon restart
@@ -87,13 +89,46 @@ command = "~/bin/horde-ping"  # run when something needs you and nothing is atta
 unattended = false          # master switch: no rule fires until this is on
 max_spawned = 2             # agents horde may run that it started itself (0–16)
 
+[vault]
+home = "~/notes"            # the vault that is always there, whatever project you are in
+dir = "notes"               # a project's own notes directory, when it has one
+enabled = true
+
 [keys]
 zoom = "prefix+f"
 detach = "ctrl+alt+q"       # a modified chord binds directly
+leader_window_zoom = "leader w f"   # a leader sequence, keys separated by spaces
 close_pane = "none"         # unbind
 ```
 
 Run `horde keys` for every rebindable action name.
+
+## Languages
+
+Syntax colouring is compiled in rather than configured, because a tree-sitter grammar is C
+that has to be built with the binary. `horde status` reports which languages a build has.
+
+| Build | Knows |
+|---|---|
+| default | markdown, rust, typescript, tsx, javascript, python, json, toml, bash |
+| `--no-default-features` | nothing — every file is plain text |
+| `--no-default-features --features lang-rust,lang-markdown` | just those two |
+
+The full set costs roughly 6.6 MB of binary, unevenly: typescript and tsx are 2.8 MiB of it
+and json is 8 KiB. Colours come from the theme, so nothing needs setting per language.
+
+Three binding forms, and which one you get depends on the spec:
+
+| Spec | Reached by |
+|---|---|
+| `prefix+x` | the prefix, then `x` |
+| `ctrl+alt+q` | the chord on its own, no prefix |
+| `leader w f` | the leader, then `w`, then `f` — up to three keys |
+
+A bare printable like `"f"` is refused as a direct binding, because it would shadow ordinary
+typing. After the leader it is fine, and expected: nothing typed there was going to reach a
+program. Leader sequences stop at three keys — past that a binding is a menu, and a menu
+should be something you read rather than something you memorise.
 
 ## Project colours
 
@@ -143,14 +178,15 @@ through untouched, so panes look exactly as they would outside horde.
 
 ## `agents.force_inject`
 
-The bus is on. `bus.send`, `bus.reply` and `bus.broadcast` all deliver, by hand, from a trigger,
-or from the board's nudge.
+Off by default, and worth leaving off. On, it removes the *state* gate that holds messages
+destined for a busy or blocked agent. Against a `blocked` agent that means your message answers
+its open permission prompt — whatever that prompt was asking. See
+[orchestration §4](orchestration.md).
 
-The rest of this section is how it behaves when the bus is back on.
-
-Off by default, and worth leaving off. On, it removes the state gate that holds messages
-destined for a busy or blocked agent. Against a `blocked` agent that means your message
-answers its open permission prompt. See [orchestration §4](orchestration.md).
+It does not remove the two checks below it, and cannot: a canonical tty silently discards a line
+past about a kilobyte, and a target that has stopped reading its input would block the write.
+Forcing those does not deliver the message, it loses it or freezes the daemon, so a message is
+still held when the terminal itself cannot take it.
 
 ## `agents.task_nudge`
 
@@ -286,6 +322,89 @@ board you had closed.
 Deliberately separate from the bus. Messaging is agents talking to each other; the board is
 agents *taking work* nobody watched them take. Wanting the first without the second is a coherent
 position, and before this switch the only way to hold it was to hope nobody tried.
+
+## `agents.task_authors` — who may add work
+
+```toml
+[agents]
+task_authors = ["pm"]
+```
+
+Empty by default, meaning anyone may add. Naming roles restricts `horde task add` to agents
+labelled with one of them; everyone else is refused, and the error names the roles that may and
+suggests `horde send` instead.
+
+This is the lead-agent shape. One agent per project — usually your most capable one — turns what
+you want into work the others can pick up, and a worker that finds something worth doing proposes
+it rather than writing it. Without that, a fleet with a board it can write to has a way to
+generate its own next job, and the honest description of the result is that it does not finish.
+
+Two things it composes with:
+
+- **The human is never gated.** A `task.add` from outside a pane is a person at a keyboard.
+- **An armed kanban card goes to the first role named here** rather than into the general pool, so
+  a card you armed lands on the lead's plate to be read and broken into real tasks, instead of the
+  nearest idle agent starting work from a title and a due date.
+
+Names are normalised the same way pane roles are, so `["Project Manager"]` and a pane labelled
+`Project Manager` both become `project-manager` and match.
+
+### Roles as a scheduling filter
+
+A task may name the role that takes it (`horde task add "..." --role reviewer`), and a blind
+`horde task claim` only ever returns general work plus work matching the claimant's own role. See
+[orchestration §8](orchestration.md) for the whole rule.
+
+Two consequences that live in config rather than in the board:
+
+- **A role is no longer only cosmetic.** `[[roles]]` still just styles a name — declaring one is
+  not what permits it — but the *value* now decides what work an agent is offered and, with
+  `task_authors` set, whether it may add any. A typo in a role is therefore a real mistake:
+  `horde task list` marks work no present role can take, and the digest reports it.
+- **An agent cannot set a role.** `pane.role` is refused when the calling pane has an agent in it,
+  because otherwise an agent could label itself into whichever role had the work or the authority.
+  Roles come from `horde spawn --role`, from the right-click menu, or from a shell with no agent
+  in it.
+
+## `kanban`
+
+Your own board — the one with columns, due dates and a comment thread — as distinct from the
+agents' task board above. See [kanban](kanban.md).
+
+```toml
+[kanban]
+columns = ["Backlog", "Todo", "Doing", "Done"]
+author = "josh@joshmacbook"
+assist = "2d"
+```
+
+### `kanban.columns`
+
+The columns, in order. Four to start with. Editing this cannot orphan a card: a card holds a
+column *name*, so one naming a column that is no longer here still shows, in a column of its
+own at the end of the board.
+
+You do not have to edit this by hand — `C`, `R`, `D`, `<` and `>` on the board add, rename,
+remove and reorder columns, and write the result back here keeping your comments and key
+order. A list that comes out empty after trimming is treated as a typo and the defaults are
+kept, with a warning: a board with no columns has nowhere to put a card.
+
+### `kanban.author`
+
+The name that goes on comments you write. Defaults to `$USER@hostname`, lowercased with a
+trailing `.local` taken off — `josh@joshmacbook`. Set it when your machine's real hostname is
+uglier than what you want signing your own notes.
+
+Agents' comments are always signed with the agent's own name, and horde signs its own `horde`;
+neither is affected by this.
+
+### `kanban.assist`
+
+How close to its due date a card is handed to the agents, when you arm one without saying.
+Two days by default. Same format as everywhere else: `30m`, `12h`, `2d`.
+
+Arming is per card and off unless you ask for it. It also needs `agents.board = true` — the
+switch that closes the agents' board closes everything that puts work on it.
 
 ## `agents.max_fleet`
 
@@ -458,10 +577,44 @@ The sidebar footer shows `◈ 2 triggers armed` whenever anything could fire, be
 allowed to act on its own should be visible rather than remembered. Full reference:
 [unattended](unattended.md).
 
+## `setup.done` — the walkthrough happened
+
+```toml
+[setup]
+done = true
+```
+
+Written by the first-run walkthrough, when you finish it *or* skip it with `esc`. Its absence is
+what makes horde offer the walkthrough, so deleting the line is how you ask for it again from
+outside horde. Settings → Agents does the same from inside.
+
+Nothing else writes it, and it is deliberately **not** in
+[config.example.toml](../config.example.toml). Whether a person has been walked through setup is
+its own fact and horde used to guess at it from whether `config.toml` existed, which is a
+different fact wearing the same clothes: copy the example config, restore your dotfiles, or set
+one key on the settings page, and the walkthrough was skipped forever without anything saying so.
+The other direction was just as wrong — `esc` wrote nothing, so a skip was re-offered on every
+single launch.
+
 ## Bad values do not stop startup
 
-A malformed key spec, an unknown theme, an unparseable file — each produces a warning toast
-and falls back to the default. horde starting with a complaint beats horde not starting.
+A malformed key spec, an unknown theme, a misspelled key — each produces a warning toast and
+falls back to the default. horde starting with a complaint beats horde not starting.
+
+**A mistake costs the section it is in, and nothing else.** The file is read one section at a
+time, so `sidbar` in `[ui]` loses `[ui]` while your theme, keybindings and model profiles apply
+as written. The warning names the section and the word:
+
+```
+[ui] was ignored: unknown field `sidbar`, expected one of `sidebar`, `sidebar_width`, …
+```
+
+Named blocks are read one block at a time too, so a broken `[models.experimental]` does not cost
+you `[models.free]`. An unknown top-level name is reported with the list of real ones.
+
+The exception is a file that is not valid TOML at all — an unclosed quote or bracket. Nothing can
+be salvaged from it, because the parser cannot tell where one section ends and the next begins,
+so horde starts on defaults and says so. That is the one case worth fixing before carrying on.
 
 ## Detection overrides
 

@@ -101,6 +101,11 @@ horde broadcast "pausing for a deploy, hold off on migrations"
 horde broadcast --space api-refactor "same, but only this project"
 ```
 
+Each copy takes the same gate as a single message, so the reply says how many heard it now and
+how many are queued — `delivered to 2, queued for 3`. A broadcast is recorded as one: the drawer
+and `horde bus tail` show it as `→ all` rather than as several private messages that happen to
+share a body.
+
 ### What the recipient actually sees
 
 horde writes this into the target's terminal, then presses Enter for it:
@@ -169,6 +174,22 @@ horde roster --json | grep queued
 
 Held messages also show as `⧗ queued` in the bus drawer (`ctrl+b b`), so a human watching
 can see a message waiting rather than wondering why nothing happened.
+
+### The queue has a ceiling
+
+Twenty messages per agent. Past that a send is refused, naming who is backed up and how deep:
+
+```
+builder already has 20 messages waiting — nothing more is queued until it has worked
+through them, because each one costs it a turn
+```
+
+This is the one refusal that is not about the terminal. A queue is a promise that the message
+will arrive; an unbounded one turns that promise into a different problem — an agent held at a
+permission prompt for an hour, with a fleet talking to it, comes back to dozens of messages
+delivered one per turn, and spends its next dozen turns on conversations whose moment has
+passed. Hitting the ceiling means something needs a person, not another message: it is the
+signal to look at that pane, not to retry.
 
 **A held message survives the daemon restarting.** The queue itself lives in memory and
 cannot, so it is recovered from the log instead: a message whose newest log entry still says
@@ -331,6 +352,66 @@ horde task release <id> --drop    # abandon it; the attempt stays on the record
 
 **You never have to release on exit.** If your pane goes away while holding a task, horde
 puts it back on the board automatically and tells the human why.
+
+### Work for a role
+
+Scope answers *where* work belongs. A role answers *who* it is for:
+
+```sh
+horde task add "review the parser diff" --role reviewer
+horde task add "update the changelog"                      # anyone free
+```
+
+A blind `horde task claim` returns general work plus work tagged with the claimant's own role,
+oldest first. It never returns another role's task, which is the point: handing a reviewer's task
+to the nearest idle builder means both agents doing the wrong thing while the reviewer sits idle.
+
+Three consequences worth knowing:
+
+- **An unlabelled agent gets general work only.** "No role" is not a wildcard. If it were, the
+  moment you started naming roles every unlabelled pane would become eligible for all of it.
+- **Naming an id overrides the filter**, exactly as it overrides scope and staleness.
+  `horde task claim 7` takes task 7 whatever you are labelled, because an agent that has read a
+  task and decided it is theirs is a better judge than a filter. The log records who took it.
+- **A role is not self-assigned.** `horde pane role` from an agent is refused: a role decides what
+  work is offered to whom, so an agent that could set its own could promote itself into whichever
+  role it wanted the work of. Roles come from `spawn --role` or from your human.
+
+`horde task add --role <r>` warns when nobody enlisted in that project has role `r`, because such
+a task is never offered to anyone and would otherwise read afterwards as a board with nothing
+happening on it. `horde task list` marks it `<reviewer: nobody here>`, and the digest reports it.
+Fix it by starting one (`horde spawn --role reviewer --board`) or by leaving the work untagged.
+
+### Who may add work
+
+By default anyone may. Naming roles in `agents.task_authors` restricts it:
+
+```toml
+[agents]
+task_authors = ["pm"]
+```
+
+Now only an agent labelled `pm` may `horde task add`; everyone else is refused with the list of
+roles that may. This is the lead-agent shape — work is proposed to whoever leads the project
+rather than written by whoever thought of it — and it is the guardrail against a fleet writing its
+own next job and waking each other up to do it.
+
+The human is never subject to it: a call from outside a pane is a person at a keyboard, and a
+board its owner cannot add to is not a feature. Cards handed over from your own board go to the
+first role named here, so an armed card lands on the lead's plate to be read and broken up.
+
+### Who decides who runs next
+
+The daemon does, and deliberately not an agent. When work is waiting it picks the agent to wake
+from what it knows: who is enlisted in that project, who is not already holding a task, who has no
+message queued, which roles can take what is open, and who has been idle longest. General work
+prefers an unlabelled agent over a specialist, so the one task only the specialist could take is
+not waiting on them. It never wakes more agents than there is work for, counted per role.
+
+A dispatcher agent would concentrate all of that in the least reliable component in the system:
+one held at a permission prompt stalls the whole board, two of them hand the same task to the same
+worker, and every task costs an extra turn. The board's exclusive claim is a compare-and-set in a
+single-threaded engine — an agent saying "I will give this to Bob" is not.
 
 ### Enlisting, and being told when there is work
 
@@ -554,9 +635,10 @@ horde ask <name> "question"        # send and block until they answer
 # the shared board — one per project
 horde task work                    # enlist: I will take board work
 horde task add "text"              # put work up for whoever is free here
+horde task add "text" --role r     # ...for an agent labelled r, and nobody else
 horde task clear                   # drop every open task in this project
-horde task claim                   # take the oldest open task (exclusive)
-horde task claim <id>              # take a specific one
+horde task claim                   # take the oldest open task for you (exclusive)
+horde task claim <id>              # take a specific one, whatever your role
 horde task done --result "text"    # finish the one you hold
 horde task release <id>            # give it back  (--drop to abandon)
 horde task list                    # outstanding  (--all for finished too)
@@ -567,6 +649,7 @@ horde digest --since 2h --keep     # a wider window, without advancing it
 
 # build a team
 horde spawn --cmd claude --name reviewer --split right
+horde spawn --cmd claude --name parser --role builder --worktree --board
 horde pane rename <name-or-id> <new-name>
 horde layout quad                  # solo · duo · trio · dev · quad
 

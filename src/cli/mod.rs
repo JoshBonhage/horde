@@ -2,7 +2,9 @@
 //! an agent orchestrate horde with nothing but a shell.
 
 pub mod docs;
-mod integration;
+/// Public because the client drives the install directly: the settings page and the setup
+/// walkthrough do the same work as `horde integration install claude` without its printing.
+pub mod integration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -161,8 +163,44 @@ pub enum Command {
         /// Do not advance the window.
         #[arg(long)]
         keep: bool,
+        /// File it in the vault too, on today's dated note.
+        #[arg(long)]
+        note: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Check whether this terminal can draw real images, by drawing one.
+    ///
+    /// Detecting the protocol by name is easy and being wrong is not symmetrical: a terminal
+    /// wrongly believed capable reserves rows and draws nothing in them, so a picture that
+    /// worked becomes a blank gap. This makes the answer evidence.
+    Images,
+    /// Write a note into the vault.
+    ///
+    /// The way an agent records something worth keeping. Notes written this way are
+    /// attributed, size-capped, and land in their own folder — so what a fleet wrote down is
+    /// always separable from what you did.
+    ///
+    ///   horde note "Auth findings" --body "…"
+    ///   somecommand | horde note "Build log" --append
+    Note {
+        /// The note's title, which is also its filename. `[[Auth findings]]` finds it.
+        title: String,
+        /// The body. Read from stdin when not given, so output can be piped in.
+        #[arg(long)]
+        body: Option<String>,
+        /// Add to the note rather than replacing it.
+        #[arg(long)]
+        append: bool,
+        /// Write it somewhere other than the agent folder.
+        #[arg(long)]
+        path: Option<String>,
+        /// Credit someone other than the calling pane's agent.
+        #[arg(long)]
+        by: Option<String>,
+        /// Which project's vault. Defaults to the focused one.
+        #[arg(long)]
+        space: Option<String>,
     },
     /// Show recent bus messages.
     Bus {
@@ -245,6 +283,9 @@ pub enum TriggerCmd {
         /// Work to put on the board.
         #[arg(long, conflicts_with = "to")]
         task: Option<String>,
+        /// Only an agent with this role may take the work, with --task.
+        #[arg(long, requires = "task")]
+        role: Option<String>,
         /// Agent to push a line at instead of using the board.
         #[arg(long, requires = "body")]
         to: Option<String>,
@@ -289,6 +330,9 @@ pub enum TaskCmd {
         /// Put it on another project's board, by space name.
         #[arg(long)]
         space: Option<String>,
+        /// Only an agent with this role may take it. Omit for work anyone free can do.
+        #[arg(long)]
+        role: Option<String>,
     },
     /// Take board work in this project from now on. Without this, nothing is ever offered.
     Work {
@@ -693,8 +737,22 @@ pub fn run(cmd: Command) -> Result<()> {
                 "bus.broadcast",
                 json!({ "body": body, "from": self_pane(), "space": space }),
             )?;
-            let n = v.as_array().map(|a| a.len()).unwrap_or(0);
-            println!("sent to {n} agent(s)");
+            // Broken out, because "sent to 4 agents" reads as four agents having heard it when
+            // three of them were mid-turn. Queued is a normal outcome and worth naming as one.
+            let msgs = v.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            fn delivery(m: &Value) -> &str {
+                m.get("delivery").and_then(|d| d.as_str()).unwrap_or("")
+            }
+            let now = msgs.iter().filter(|m| delivery(m) == "delivered").count();
+            let queued = msgs.iter().filter(|m| delivery(m) == "queued").count();
+            match (msgs.len(), queued) {
+                (0, _) => println!("nobody to send it to — `horde roster` shows who is here"),
+                (n, 0) => println!("delivered to {n} agent(s)"),
+                (_, q) if q == msgs.len() => {
+                    println!("queued for {q} agent(s) — they are busy; horde delivers as they free up")
+                }
+                (_, q) => println!("delivered to {now}, queued for {q}"),
+            }
         }
 
         Command::Spawn { cmd, profile, brief, name, split, worktree, role, board, task } => {
@@ -800,16 +858,25 @@ pub fn run(cmd: Command) -> Result<()> {
         }
 
         Command::Task { cmd } => match cmd {
-            TaskCmd::Add { text, space } => {
+            TaskCmd::Add { text, space, role } => {
                 let text = text.join(" ");
-                let t =
-                    call("task.add", json!({ "text": text, "from": self_pane(), "space": space }))?;
+                let t = call(
+                    "task.add",
+                    json!({ "text": text, "from": self_pane(), "space": space, "role": role }),
+                )?;
                 let where_ = t.get("space").and_then(|s| s.as_str()).unwrap_or("");
+                let for_ = t.get("role").and_then(|s| s.as_str()).unwrap_or("");
                 println!(
-                    "#{} added{}",
+                    "#{} added{}{}",
                     t.get("id").and_then(|x| x.as_u64()).unwrap_or(0),
-                    if where_.is_empty() { String::new() } else { format!(" to {where_}") }
+                    if where_.is_empty() { String::new() } else { format!(" to {where_}") },
+                    if for_.is_empty() { String::new() } else { format!(" for {for_}") }
                 );
+                // Said here because here is where it can still be changed. Work for a role
+                // nobody has is not offered to anyone and reads afterwards as a quiet board.
+                if let Some(w) = t.get("warning").and_then(|w| w.as_str()) {
+                    eprintln!("note: {w}");
+                }
             }
             TaskCmd::Work { off } => {
                 let v = call("task.work", json!({ "from": self_pane(), "on": !off }))?;
@@ -876,6 +943,13 @@ pub fn run(cmd: Command) -> Result<()> {
                     println!("board is empty — add work with `horde task add \"...\"`");
                     return Ok(());
                 }
+                // Which roles could actually take something here, so work that will sit can be
+                // marked as such. Asked once for the whole listing rather than per row.
+                let covered: Vec<String> = call("task.roles", json!({ "from": self_pane() }))
+                    .ok()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                let mut stranded = 0usize;
                 for t in shown {
                     let owner =
                         t.owner.as_ref().map(|o| format!("  [{o}]")).unwrap_or_default();
@@ -885,21 +959,40 @@ pub fn run(cmd: Command) -> Result<()> {
                         (true, Some(sp)) => format!("  ({sp})"),
                         _ => String::new(),
                     };
-                    println!("{} #{:<4} {}{where_}{owner}", t.state.glyph(), t.id, t.text);
+                    // Who it is for, and whether anybody here is that. An open task naming a
+                    // role no enlisted agent has is never offered and never claimed, so it says
+                    // so rather than looking like the next thing to be picked up.
+                    let for_ = match &t.role {
+                        None => String::new(),
+                        Some(r) if !t.is_open() => format!("  <{r}>"),
+                        Some(r) if covered.iter().any(|c| c == r) => format!("  <{r}>"),
+                        Some(r) => {
+                            stranded += 1;
+                            format!("  <{r}: nobody here>")
+                        }
+                    };
+                    println!("{} #{:<4} {}{for_}{where_}{owner}", t.state.glyph(), t.id, t.text);
                     if let Some(r) = &t.result {
                         println!("       → {r}");
                     }
+                }
+                if stranded > 0 {
+                    println!(
+                        "\n{stranded} task{} waiting on a role nobody enlisted here has — \
+                         `horde spawn --role <role> --board`, or claim it by number to override",
+                        if stranded == 1 { "" } else { "s" }
+                    );
                 }
             }
         },
 
         Command::Trigger { cmd } => match cmd {
-            TriggerCmd::Add { every, at, days, when, task, to, body, spawn, name } => {
+            TriggerCmd::Add { every, at, days, when, task, role, to, body, spawn, name } => {
                 let v = call(
                     "trigger.add",
                     json!({
                         "every": every, "at": at, "days": days, "when": when,
-                        "task": task, "to": to, "body": body,
+                        "task": task, "role": role, "to": to, "body": body,
                         "spawn": spawn, "name": name,
                         "from": self_pane(),
                     }),
@@ -980,8 +1073,8 @@ pub fn run(cmd: Command) -> Result<()> {
             }
         },
 
-        Command::Digest { since, keep, json: as_json } => {
-            let mut params = json!({ "keep": keep });
+        Command::Digest { since, keep, note, json: as_json } => {
+            let mut params = json!({ "keep": keep, "note": note });
             if let Some(spec) = &since {
                 params["since"] = json!(parse_duration(spec)?);
             }
@@ -990,7 +1083,94 @@ pub fn run(cmd: Command) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&v)?);
                 return Ok(());
             }
+            let filed = v.get("note").and_then(|p| p.as_str()).map(String::from);
             print_digest(&serde_json::from_value(v)?);
+            if let Some(path) = filed {
+                println!("\nfiled in {path}");
+            }
+        }
+
+        Command::Images => {
+            use std::io::Write;
+            let looks = crate::client::kitty::looks_capable();
+            let on = crate::client::kitty::supported();
+            println!("terminal:  {}", std::env::var("TERM").unwrap_or_default());
+            println!("           {}", std::env::var("TERM_PROGRAM").unwrap_or_default());
+            println!("looks capable: {}", if looks { "yes" } else { "no" });
+            println!("images on:     {}", if on { "yes (HORDE_IMAGES)" } else { "no" });
+            println!();
+
+            // Four coloured squares, big enough to be unmistakable and small enough to be
+            // obviously not a rendering artefact.
+            let mut img = image::RgbaImage::new(64, 64);
+            for (x, y, p) in img.enumerate_pixels_mut() {
+                *p = match (x < 32, y < 32) {
+                    (true, true) => image::Rgba([220, 40, 40, 255]),
+                    (false, true) => image::Rgba([40, 200, 80, 255]),
+                    (true, false) => image::Rgba([60, 90, 230, 255]),
+                    (false, false) => image::Rgba([240, 200, 40, 255]),
+                };
+            }
+            let dir = std::env::temp_dir().join(format!("horde-imgtest-{}.png", std::process::id()));
+            img.save(&dir)?;
+
+            println!("A red/green/blue/yellow square should appear below.");
+            println!();
+            let place = crate::client::kitty::Place {
+                path: dir.clone(),
+                // Wherever the cursor is; the escape moves it, so put it just below here.
+                x: 0,
+                y: 0,
+                cols: 20,
+                rows: 10,
+                crop: None,
+            };
+            let mut out = std::io::stdout();
+            if let Some((png, _, _)) = crate::client::kitty::encode(&dir) {
+                // Placed relative to the cursor rather than the screen, so it lands under
+                // this text instead of at the top of the window.
+                out.write_all(&crate::client::kitty::place_here(1, &png, &place))?;
+                out.flush()?;
+            }
+            for _ in 0..place.rows {
+                println!();
+            }
+            let _ = std::fs::remove_file(&dir);
+            println!();
+            println!("Saw it?  run horde with HORDE_IMAGES=1 for full-resolution pictures.");
+            println!("Did not? leave it unset — notes fall back to coloured half blocks,");
+            println!("         which are lower resolution but work in every terminal.");
+        }
+        Command::Note { title, body, append, path, by, space } => {
+            // Piped input is the point: `cargo test | horde note "Test run" --append` is the
+            // shape this verb exists for, and asking for `--body` there would mean shelling
+            // out to read a file back.
+            let body = match body {
+                Some(b) => b,
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                }
+            };
+            if body.trim().is_empty() {
+                return Err(anyhow!("nothing to write — give --body or pipe something in"));
+            }
+            let mut params = json!({ "title": title, "body": body, "append": append });
+            if let Some(p) = &path {
+                params["path"] = json!(p);
+            }
+            if let Some(b) = &by {
+                params["by"] = json!(b);
+            }
+            if let Some(s) = &space {
+                params["space"] = json!(s);
+            }
+            if let Some(p) = self_pane() {
+                params["pane"] = json!(p);
+            }
+            let v = call("vault.write", params)?;
+            println!("{}", v.get("path").and_then(|p| p.as_str()).unwrap_or("written"));
         }
 
         Command::Bus { cmd } => match cmd {
@@ -1147,8 +1327,16 @@ pub fn run(cmd: Command) -> Result<()> {
                 println!("renamed");
             }
             PaneCmd::Role { pane, role } => {
-                let v =
-                    call("pane.role", json!({ "pane": pane, "role": role.unwrap_or_default() }))?;
+                // `from` is sent so the daemon can tell an agent relabelling itself from a person
+                // at a shell doing the labelling. See the `pane.role` handler.
+                let v = call(
+                    "pane.role",
+                    json!({
+                        "pane": pane,
+                        "role": role.unwrap_or_default(),
+                        "from": self_pane(),
+                    }),
+                )?;
                 // The normalised form, so a script that filters on what it just set matches.
                 match v.get("role").and_then(|v| v.as_str()) {
                     Some(r) => println!("{r}"),
@@ -1199,11 +1387,13 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::Keys => {
             let (cfg, _) = crate::config::Config::load();
             let prefix = cfg.prefix.describe();
-            println!("prefix: {prefix}\n");
+            let leader = cfg.leader.describe();
+            println!("prefix: {prefix}\nleader: {leader}\n");
             for (name, trigger, _) in cfg.keys.described() {
                 let key = match trigger {
                     crate::config::Trigger::Prefix(c) => format!("{prefix} {}", c.describe()),
                     crate::config::Trigger::Direct(c) => c.describe(),
+                    crate::config::Trigger::Leader(s) => format!("{leader} {}", s.describe()),
                 };
                 println!("  {key:<18} {name}");
             }

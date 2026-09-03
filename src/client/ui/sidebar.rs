@@ -23,7 +23,7 @@ use ratatui::widgets::Widget;
 use super::pane_widget::fmt_elapsed;
 use super::{color, fill, logo, put_line, state_look, truncate, width};
 use crate::client::roster::{filtered_rows, Density, Roll, RowKind};
-use crate::proto::{AgentState, PaneId, Rgb, Snapshot, SpaceId};
+use crate::proto::{AgentState, LspState, PaneId, Rgb, Snapshot, SpaceId};
 use crate::theme::Theme;
 
 /// A clickable row, so the client can map a mouse position back to what it represents.
@@ -86,6 +86,12 @@ impl Widget for Sidebar<'_> {
                 (0, c) => summary.push(("◇", c, "tasks claimed", AgentState::Unknown)),
                 (o, _) => summary.push(("◇", o, "tasks open", AgentState::Unknown)),
             }
+        }
+        // Your own board's deadline, beside the agents'. Only what is due or already late —
+        // a count of everything on it would be a number that never changes and so never
+        // means anything, which is the failure of every badge that counts a whole inbox.
+        if self.snap.cards_due > 0 {
+            summary.push(("◈", self.snap.cards_due, "cards due", AgentState::Blocked));
         }
         // That horde is allowed to act on its own should never be something you have to
         // remember rather than see. Counted, not a bare word, because "which rules" is the
@@ -177,6 +183,65 @@ impl Widget for Sidebar<'_> {
                 );
                 self.hits.push((y, Hit::Space(space.id)));
                 y += 1;
+
+                // Language servers, under the project they serve.
+                //
+                // Here rather than folded into the badge because this is a child process
+                // holding hundreds of megabytes that horde started on your behalf, and the
+                // rule is that nothing horde runs is invisible. A diamond for the same reason
+                // a dev server gets one: it is up and holding rather than mid-turn.
+                for l in &space.lsp {
+                    if y >= end {
+                        break;
+                    }
+                    let (glyph, colour) = match l.state {
+                        LspState::Ready => ("◆", t.ui.serving),
+                        LspState::Starting => ("◌", t.ui.working),
+                        LspState::Waiting => ("◍", t.ui.blocked),
+                        LspState::Failed => ("✕", t.ui.blocked),
+                    };
+                    // Counts when it is working, the reason when it is not. Both at once
+                    // would not fit, and a server that is down has no counts worth reading.
+                    let badge = match l.state {
+                        LspState::Ready if l.errors > 0 || l.warnings > 0 => {
+                            let mut b = String::new();
+                            if l.errors > 0 {
+                                b.push_str(&format!("{}◍", l.errors));
+                            }
+                            if l.warnings > 0 {
+                                b.push_str(&format!(" {}△", l.warnings));
+                            }
+                            b
+                        }
+                        LspState::Ready => String::new(),
+                        _ => {
+                            let budget = (inner_w as usize / 2).clamp(4, 18);
+                            truncate(l.detail.as_deref().unwrap_or("down"), budget)
+                        }
+                    };
+                    row(
+                        buf,
+                        area.x,
+                        y,
+                        area.width,
+                        RowSpec {
+                            marker: " ",
+                            indent: 1,
+                            glyph,
+                            glyph_color: colour,
+                            label: &l.lang,
+                            label_color: t.ui.text_faint,
+                            bold: false,
+                            detail: plain(&badge, t.ui.text_faint),
+                            bg: t.ui.panel_bg,
+                        },
+                        t,
+                    );
+                    // Clicking it selects the project, which is the only thing there is to do
+                    // with a language server from here.
+                    self.hits.push((y, Hit::Space(space.id)));
+                    y += 1;
+                }
             }
             y = end;
         }

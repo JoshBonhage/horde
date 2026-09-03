@@ -179,6 +179,10 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             "socket": crate::config::socket_path().to_string_lossy(),
             "theme": eng.cfg.theme.name,
             "agent_manifests": eng.agents.manifest_names(),
+            // Which languages this binary can colour. Grammars are compile-time features,
+            // so "why is my Rust not highlighted" is answerable without guessing at how it
+            // was built.
+            "languages": crate::client::syntax::available(),
             // The clock triggers actually fire on. `--at 09:00` means nine *here*, and a distro
             // whose timezone was never set sits on UTC while the person setting the trigger does
             // not — which looks like triggers firing at random rather than like a wrong clock.
@@ -193,8 +197,7 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
 
         // -- session -----------------------------------------------------
         "session.snapshot" => {
-            let cfg = eng.cfg.clone();
-            serde_json::to_value(eng.session.snapshot(&cfg, &eng.repos)).map_err(|e| failed(e.to_string()))
+            serde_json::to_value(eng.snapshot()).map_err(|e| failed(e.to_string()))
         }
 
         // -- spaces ------------------------------------------------------
@@ -318,6 +321,8 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         }
 
         // -- panes -------------------------------------------------------
+        // A pane showing a file reports the file, so `pane.list` answers "what is this"
+        // for both kinds rather than only for programs.
         "pane.list" => {
             let cfg = eng.cfg.clone();
             Ok(json!(eng.session.snapshot(&cfg, &eng.repos).panes))
@@ -371,6 +376,28 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             let p = pane_arg(eng, req, "pane")
                 .or_else(|| eng.session.focused_pane())
                 .ok_or_else(|| bad("no pane"))?;
+
+            // An agent may not relabel anything, including itself.
+            //
+            // A role decides what work the board offers you and, where `agents.task_authors` is
+            // set, whether you may put work on it at all. The moment it decides either of those,
+            // an agent that can run `horde pane role` can promote itself into the role that
+            // decides — and it would have been *right* to, from inside its own reasoning, which
+            // is what makes it a hole rather than a bug.
+            //
+            // Assignment therefore happens at creation (`spawn --role`) or from the human's own
+            // UI, which reaches this through a different path entirely. The test is "is there an
+            // agent in the calling pane", the same distinction horde draws everywhere else: a
+            // person at a shell inside horde is still a person.
+            if let Some(caller) = pane_arg(eng, req, "from") {
+                if eng.session.panes.get(&caller).is_some_and(|c| c.agent.is_some()) {
+                    return Err(failed(
+                        "an agent cannot set a role — a role decides what work is offered to \
+                         whom. Give one at spawn (`horde spawn --role <role>`), or ask your human",
+                    ));
+                }
+            }
+
             let role = str_arg(req, "role").unwrap_or("");
             let now = eng.session.set_pane_role(p, role).ok_or_else(|| not_found("no such pane"))?;
             eng.touch();
@@ -670,9 +697,17 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                         .and_then(|p| eng.session.space(p.space))
                         .map(|s| s.name.clone());
                     let by = super::bus::Bus::sender_name(&eng.session, from);
+                    // Tagged with the role the new agent was given, so the work it was spawned
+                    // for is *its* work. Leaving it general would mean spawning a reviewer with a
+                    // first job that the nearest idle builder can take instead — which is both
+                    // agents doing the wrong thing, and the pane you just made sitting idle.
+                    let role = eng.session.panes.get(&id).and_then(|p| p.role.clone());
                     Some(
                         eng.board
-                            .add(text, &by, space.as_deref())
+                            .add(super::tasks::NewTask {
+                                role: role.as_deref(),
+                                ..super::tasks::NewTask::new(text, &by, space.as_deref())
+                            })
                             .map_err(|e| failed(e.to_string()))?,
                     )
                 }
@@ -769,7 +804,15 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             let cfg = eng.cfg.clone();
             let Engine { bus, session, .. } = eng;
             let msg = bus
-                .send(session, &cfg, from, to, body, force, expects_reply, None)
+                .send(
+                    session,
+                    &cfg,
+                    super::bus::Outgoing {
+                        force,
+                        expects_reply,
+                        ..super::bus::Outgoing::plain(from, to, body)
+                    },
+                )
                 .map_err(|e| failed(e.to_string()))?;
             eng.emit(crate::proto::Event::BusMessage(msg.clone()));
             serde_json::to_value(msg).map_err(|e| failed(e.to_string()))
@@ -798,7 +841,14 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             let Engine { bus, session, .. } = eng;
             let msg = match crate::daemon::bus::Bus::resolve(session, &original.from) {
                 Some(_) => bus
-                    .send(session, &cfg, from, &original.from, body, false, false, Some(id))
+                    .send(
+                        session,
+                        &cfg,
+                        super::bus::Outgoing {
+                            reply_to: Some(id),
+                            ..super::bus::Outgoing::plain(from, &original.from, body)
+                        },
+                    )
                     .map_err(|e| failed(e.to_string()))?,
                 // The asker has no pane to type into — a `horde ask` from a plain shell. It
                 // is polling for the answer, so recording it is what delivers it.
@@ -841,17 +891,68 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
         // A board agents pull from, rather than a queue you push to. See daemon/tasks.rs.
         "task.add" => {
             let text = str_arg(req, "text").ok_or_else(|| bad("text required"))?;
-            let by = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
+            let from = pane_arg(eng, req, "from");
+            let by = super::bus::Bus::sender_name(&eng.session, from);
             // An explicit `space` overrides, so a lead agent can stage work for a project it
             // is not sitting in. Otherwise the caller's own.
             let space =
                 str_arg(req, "space").map(|s| s.to_string()).or_else(|| caller_space(eng, req));
+            let role = str_arg(req, "role").and_then(crate::config::normalise_role);
+
+            // Who may put work on the board at all. Empty means anyone, which is the default and
+            // how the board has always worked. Naming roles is how you say "agents propose work
+            // to their lead, and the lead decides" — the guardrail against a fleet writing its
+            // own next job and waking each other up to do it.
+            //
+            // The human is never gated: a call from outside a pane is a person at a keyboard, and
+            // a board its owner cannot add to is not a feature.
+            if let Some(pane) = from {
+                let allowed = &eng.cfg.task_authors;
+                if !allowed.is_empty() {
+                    let mine = eng.session.panes.get(&pane).and_then(|p| p.role.clone());
+                    if !mine.as_ref().is_some_and(|r| allowed.contains(r)) {
+                        return Err(failed(format!(
+                            "only {} may add tasks here (agents.task_authors){} — ask one of them, \
+                             or say what you need with `horde send`",
+                            allowed.join(", "),
+                            match &mine {
+                                Some(r) => format!(", and you are {r}"),
+                                None => ", and you have no role".to_string(),
+                            }
+                        )));
+                    }
+                }
+            }
+
             let t = eng
                 .board
-                .add(text, &by, space.as_deref())
+                .add(super::tasks::NewTask {
+                    role: role.as_deref(),
+                    ..super::tasks::NewTask::new(text, &by, space.as_deref())
+                })
                 .map_err(|e| failed(e.to_string()))?;
             eng.touch();
-            serde_json::to_value(t).map_err(|e| failed(e.to_string()))
+
+            // Said at the moment the work is written, because that is when it can still be
+            // changed. A task naming a role nobody here has is not offered to anyone and reads
+            // afterwards as a quiet board rather than as a mistake.
+            let mut out = serde_json::to_value(&t).map_err(|e| failed(e.to_string()))?;
+            if let (Some(want), Some(space)) = (&t.role, &t.space) {
+                if !eng.roles_enlisted_in(space).iter().any(|r| r == want) {
+                    out["warning"] = Value::from(format!(
+                        "nobody enlisted in {space} has the role {want}, so this will sit until \
+                         one does — `horde spawn --role {want} --board` starts one"
+                    ));
+                }
+            }
+            Ok(out)
+        }
+        // Which roles could take work in the caller's project right now. What a listing needs to
+        // tell "waiting for a reviewer" from "waiting for a reviewer who does not exist".
+        "task.roles" => {
+            let space = caller_space(eng, req);
+            let roles = space.map(|s| eng.roles_enlisted_in(&s)).unwrap_or_default();
+            serde_json::to_value(roles).map_err(|e| failed(e.to_string()))
         }
         "task.clear" => {
             // Scoped like everything else, so clearing one project's board does not wipe the
@@ -875,10 +976,15 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             Ok(json!({ "pane": pane, "board": on }))
         }
         "task.claim" => {
-            let owner = super::bus::Bus::sender_name(&eng.session, pane_arg(eng, req, "from"));
+            let from = pane_arg(eng, req, "from");
+            let owner = super::bus::Bus::sender_name(&eng.session, from);
             let id = req.params.get("task").and_then(|v| v.as_u64());
             let space = caller_space(eng, req);
-            match eng.board.claim(&owner, id, space.as_deref()).map_err(|e| failed(e.to_string()))? {
+            // The claimant's own label, from the pane rather than the request: a role that could
+            // be asserted in the call would be a filter an agent could talk its way past.
+            let role = from.and_then(|p| eng.session.panes.get(&p)).and_then(|p| p.role.clone());
+            let who = super::tasks::Claimant { space: space.as_deref(), role: role.as_deref() };
+            match eng.board.claim(&owner, id, who).map_err(|e| failed(e.to_string()))? {
                 Some(t) => {
                     eng.touch();
                     serde_json::to_value(t).map_err(|e| failed(e.to_string()))
@@ -895,6 +1001,10 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 .board
                 .done(&owner, id, str_arg(req, "result"))
                 .map_err(|e| failed(e.to_string()))?;
+            // If this task came off a kanban card, the card wants to hear about it. The
+            // agent said something worth reading and the person who wrote the card is the
+            // one who needs to read it — see `hand_over`.
+            eng.kanban.on_task_settled(t.id, &owner, t.result.as_deref(), false);
             eng.touch();
             serde_json::to_value(t).map_err(|e| failed(e.to_string()))
         }
@@ -904,10 +1014,15 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 .get("task")
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| bad("task id required"))?;
-            let t = eng
-                .board
-                .release(id, bool_arg(req, "drop"))
-                .map_err(|e| failed(e.to_string()))?;
+            let dropped = bool_arg(req, "drop");
+            let t = eng.board.release(id, dropped).map_err(|e| failed(e.to_string()))?;
+            // Only a dropped task is settled. Putting one back on the board is the middle of
+            // its life, and a card that announced "gave up on it" every time an agent handed
+            // work back would be lying about the most common case.
+            if dropped {
+                let by = t.owner.clone().unwrap_or_else(|| "horde".into());
+                eng.kanban.on_task_settled(t.id, &by, None, true);
+            }
             eng.touch();
             serde_json::to_value(t).map_err(|e| failed(e.to_string()))
         }
@@ -950,7 +1065,10 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 return Err(bad("days only applies to at — an interval has no day to land on"));
             }
             let what = match (str_arg(req, "task"), str_arg(req, "to"), str_arg(req, "spawn")) {
-                (Some(text), None, None) => super::triggers::What::Task { text: text.to_string() },
+                (Some(text), None, None) => super::triggers::What::Task {
+                    text: text.to_string(),
+                    role: str_arg(req, "role").and_then(crate::config::normalise_role),
+                },
                 (None, Some(to), None) => {
                     let body = str_arg(req, "body").ok_or_else(|| bad("body required with to"))?;
                     super::triggers::What::Send { to: to.to_string(), body: body.to_string() }
@@ -1025,6 +1143,83 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             Ok(json!({ "trigger": id, "did": what }))
         }
 
+        // -- vault -------------------------------------------------------
+        // The read side of a project's notes, for agents. JSON rather than the render
+        // channel because this is the surface an agent drives, and `nc` has to be enough to
+        // debug it. `space` defaults to the focused one, like every other space argument.
+        "vault.list" | "vault.search" | "vault.read" => {
+            let space = match str_arg(req, "space") {
+                Some(name) => eng
+                    .session
+                    .find_space_by_name(name)
+                    .ok_or_else(|| not_found(format!("no space called {name:?}")))?,
+                None => eng.session.focused_space.ok_or_else(|| bad("no focused space"))?,
+            };
+            let kind = match req.method.as_str() {
+                "vault.search" => crate::proto::VaultQuery::Search {
+                    q: str_arg(req, "q").ok_or_else(|| bad("q required"))?.to_string(),
+                },
+                "vault.read" => crate::proto::VaultQuery::Note {
+                    path: str_arg(req, "path").ok_or_else(|| bad("path required"))?.to_string(),
+                },
+                _ => crate::proto::VaultQuery::List,
+            };
+            let reply = eng.vault_answer(space, &kind).ok_or_else(|| {
+                not_found("this project has no vault — see `vault.dir` in the config")
+            })?;
+            // `vault.read` on a path that is not in the index answers with an empty list
+            // rather than a body, which would be a confusing way to say "no such note".
+            if matches!(kind, crate::proto::VaultQuery::Note { .. }) && reply.body.is_none() {
+                return Err(not_found("no such note in this vault"));
+            }
+            serde_json::to_value(reply).map_err(|e| failed(e.to_string()))
+        }
+
+        // Setting one up, and writing to it. Separate from the read verbs because these
+        // are the ones that touch a disk: everything they take is jailed to the vault, and
+        // "write a note" must never be a way to write anything else.
+        "vault.init" => {
+            let root = match str_arg(req, "path") {
+                Some(p) => std::path::PathBuf::from(p),
+                None => {
+                    let space = eng.session.focused_space.ok_or_else(|| bad("no focused space"))?;
+                    eng.session
+                        .space(space)
+                        .map(|s| s.cwd.join(&eng.cfg.vault_dir))
+                        .unwrap_or_else(|| eng.cfg.vault_home.clone())
+                }
+            };
+            let fresh = super::vault::init(&root).map_err(|e| failed(e.to_string()))?;
+            super::refresh_vaults(eng);
+            Ok(json!({ "root": root.to_string_lossy(), "created": fresh }))
+        }
+        // Writing a note by path. `title` is the friendlier way in — Obsidian's rule is that
+        // the title is the filename, so a note written by title is one a `[[link]]` finds.
+        "vault.write" => {
+            let path = match (str_arg(req, "path"), str_arg(req, "title")) {
+                (Some(p), _) => p.to_string(),
+                (None, Some(t)) => super::vault::note_filename(t),
+                (None, None) => return Err(bad("path or title required")),
+            };
+            let body = str_arg(req, "body").ok_or_else(|| bad("body required"))?.to_string();
+            let space = match str_arg(req, "space") {
+                Some(name) => eng
+                    .session
+                    .find_space_by_name(name)
+                    .ok_or_else(|| not_found(format!("no space called {name:?}")))?,
+                None => eng.session.focused_space.ok_or_else(|| bad("no focused space"))?,
+            };
+            // Who to credit: whoever the caller says, else the agent in the pane the call
+            // came from. A note nobody signed is one you cannot decide how much to trust.
+            let by = str_arg(req, "by").map(|s| s.to_string()).or_else(|| {
+                pane_arg(eng, req, "pane").map(|p| super::bus::Bus::sender_name(&eng.session, Some(p)))
+            });
+            let written = eng
+                .vault_put(space, &path, &body, by.as_deref(), bool_arg(req, "append"))
+                .map_err(|e| failed(e.to_string()))?;
+            Ok(json!({ "path": written.to_string_lossy() }))
+        }
+
         // -- digest ------------------------------------------------------
         // What happened while nobody was watching. Reading it advances the watermark, so
         // the window is always "since you last looked" — `keep` leaves it where it was, for
@@ -1044,7 +1239,19 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
                 eng.last_seen = super::now_millis();
                 eng.touch();
             }
-            serde_json::to_value(d).map_err(|e| failed(e.to_string()))
+            // Filed as well as answered. A digest read and closed is a thing that happened to
+            // you; a digest in the vault is a thing you can go back to, search, and link from
+            // — which is the whole point of horde having a vault at all.
+            let mut value = serde_json::to_value(&d).map_err(|e| failed(e.to_string()))?;
+            if bool_arg(req, "note") {
+                let space = eng.session.focused_space.ok_or_else(|| bad("no focused space"))?;
+                let day = super::triggers::local_date(super::now_millis());
+                let written = eng
+                    .vault_put(space, &format!("{day}.md"), &super::digest::markdown(&d), Some("horde"), true)
+                    .map_err(|e| failed(e.to_string()))?;
+                value["note"] = json!(written.to_string_lossy());
+            }
+            Ok(value)
         }
 
         // -- commands ----------------------------------------------------
@@ -1488,6 +1695,100 @@ mod tests {
         // And an empty role clears it rather than naming nothing.
         let v = handle(&mut eng, &req("pane.role", json!({ "pane": pane, "role": "" }))).unwrap();
         assert!(v["role"].is_null());
+    }
+
+    /// An agent must not be able to relabel itself.
+    ///
+    /// The moment a role decides what work is offered and who may add it, `horde pane role` is a
+    /// promotion, and an agent taking it would be acting reasonably from inside its own
+    /// reasoning. The pane the call came *from* is what decides: an agent is refused, a person at
+    /// a shell inside horde is not.
+    #[test]
+    fn an_agent_cannot_set_a_role_but_a_person_at_a_shell_can() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-role-self", 2);
+        let panes: Vec<u32> = eng.session.panes.keys().copied().collect();
+        let (agent_pane, target) = (panes[0], panes[1]);
+
+        // From the agent's own pane, at itself: refused, and the error says where roles come from.
+        let e = handle(
+            &mut eng,
+            &req("pane.role", json!({ "pane": agent_pane, "role": "pm", "from": agent_pane })),
+        )
+        .unwrap_err();
+        assert!(e.message.contains("cannot set a role"), "{}", e.message);
+        assert!(e.message.contains("--role"), "it names the way roles are given: {}", e.message);
+        assert!(eng.session.panes[&agent_pane].role.is_none(), "and nothing changed");
+
+        // At somebody else, too: the hole is not only self-promotion — labelling a neighbour
+        // decides what work that neighbour is handed.
+        assert!(handle(
+            &mut eng,
+            &req("pane.role", json!({ "pane": target, "role": "pm", "from": agent_pane })),
+        )
+        .is_err());
+
+        // A pane with no agent in it is a person. Emptying it is the whole difference.
+        eng.session.panes.get_mut(&agent_pane).unwrap().agent = None;
+        let v = handle(
+            &mut eng,
+            &req("pane.role", json!({ "pane": target, "role": "pm", "from": agent_pane })),
+        )
+        .unwrap();
+        assert_eq!(v["role"], "pm");
+    }
+
+    /// `agents.task_authors` is the lead-agent pattern: workers propose, the lead writes.
+    #[test]
+    fn only_a_named_role_may_add_tasks_when_authors_are_configured() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-authors", 2);
+        eng.cfg.task_authors = vec!["pm".to_string()];
+        let panes: Vec<u32> = eng.session.panes.keys().copied().collect();
+        let (worker, lead) = (panes[0], panes[1]);
+        eng.session.set_pane_role(lead, "pm");
+
+        // A worker is refused, and told what would work instead.
+        let e = handle(&mut eng, &req("task.add", json!({ "text": "extra work", "from": worker })))
+            .unwrap_err();
+        assert!(e.message.contains("task_authors"), "{}", e.message);
+        assert!(e.message.contains("pm"), "it names who may: {}", e.message);
+        assert!(e.message.contains("horde send"), "and what to do instead: {}", e.message);
+        assert_eq!(eng.board.open_count(), 0, "and nothing was written");
+
+        // The lead may.
+        handle(&mut eng, &req("task.add", json!({ "text": "real work", "from": lead }))).unwrap();
+        assert_eq!(eng.board.open_count(), 1);
+
+        // And the human is never gated: a call from outside a pane is a person at a keyboard, and
+        // a board its owner cannot add to is not a feature.
+        handle(&mut eng, &req("task.add", json!({ "text": "mine", "from": Value::Null }))).unwrap();
+        assert_eq!(eng.board.open_count(), 2);
+    }
+
+    /// Work for a role nobody has is said at the moment it is written, because that is when it
+    /// can still be changed. Afterwards it reads as a board with nothing happening on it.
+    #[test]
+    fn adding_work_for_a_role_nobody_has_says_so() {
+        let mut eng = super::super::tests::engine_with_idle_agents("rpc-strand", 1);
+        let pane = *eng.session.panes.keys().next().unwrap();
+
+        let v = handle(
+            &mut eng,
+            &req("task.add", json!({ "text": "review it", "role": "reviewer", "from": pane })),
+        )
+        .unwrap();
+        assert_eq!(v["role"], "reviewer");
+        let warning = v["warning"].as_str().expect("it must warn");
+        assert!(warning.contains("reviewer"), "{warning}");
+        assert!(warning.contains("--role reviewer"), "and how to fix it: {warning}");
+
+        // With a reviewer enlisted there is nothing to warn about.
+        eng.session.set_pane_role(pane, "reviewer");
+        let v = handle(
+            &mut eng,
+            &req("task.add", json!({ "text": "review this too", "role": "reviewer", "from": pane })),
+        )
+        .unwrap();
+        assert!(v.get("warning").is_none(), "somebody can take it: {v}");
     }
 
     #[test]

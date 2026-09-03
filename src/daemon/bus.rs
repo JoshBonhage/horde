@@ -53,6 +53,18 @@ use super::state::Session;
 /// Messages kept in memory for the bus drawer.
 const RING: usize = 500;
 
+/// How many messages may wait for one agent before the bus stops taking more.
+///
+/// A queue is how the bus keeps a promise — "it is busy, this will arrive" — and an unbounded
+/// one turns that promise into a different problem. An agent blocked at a permission prompt
+/// for an hour, with a fleet talking to it, comes back to a queue that is drained one message
+/// per idle pass: dozens of turns spent on messages whose moment has passed, before it gets to
+/// whatever you actually wanted it to do.
+///
+/// So there is a ceiling, and hitting it is an error the sender sees rather than growth nobody
+/// sees. Twenty is well past any real conversation and well short of a flood.
+const QUEUE_DEPTH: usize = 20;
+
 /// How long after the text to send Enter.
 ///
 /// Agents detect a paste by noticing several bytes arriving in one read, and a trailing
@@ -74,6 +86,47 @@ pub struct Bus {
     /// once an agent answering to it exists again, which is the same addressing the bus uses
     /// everywhere else.
     orphaned: Vec<Message>,
+}
+
+/// One message on its way out, before the bus has decided how it travels.
+///
+/// A struct rather than a row of positional flags, because the flags are not interchangeable and
+/// used to read as though they were: `send(session, cfg, from, to, body, false, false, None)` says
+/// nothing about whether that is a plain message, a forced one, or a reply. That cost something
+/// real — [`Bus::broadcast`] set `broadcast` on its own copy *after* `send` had already written the
+/// message to the log, so every broadcast was recorded as an ordinary one-to-one message and read
+/// back that way in the drawer and in `horde bus tail`. Naming the field at the call site is what
+/// makes that class of mistake visible.
+pub struct Outgoing<'a> {
+    /// Which pane is sending, or `None` for the human at the keyboard.
+    pub from_pane: Option<PaneId>,
+    /// Agent name, pane name, pane id, or `space:pane` coordinates. See [`Bus::resolve`].
+    pub to: &'a str,
+    pub body: &'a str,
+    /// Skip the *state* gate. Never skips the terminal checks — those are physics, not policy.
+    pub force: bool,
+    /// The sender is blocked on an answer, so the recipient is told exactly how to reply.
+    pub expects_reply: bool,
+    /// Set on a reply, naming the request it answers.
+    pub reply_to: Option<u64>,
+    /// One of many copies of the same body, so the log can say `→ all` rather than name one
+    /// recipient and lose the fact that everyone got it.
+    pub broadcast: bool,
+}
+
+impl<'a> Outgoing<'a> {
+    /// An ordinary message: not forced, not a question, not a reply, not a broadcast.
+    pub fn plain(from_pane: Option<PaneId>, to: &'a str, body: &'a str) -> Outgoing<'a> {
+        Outgoing {
+            from_pane,
+            to,
+            body,
+            force: false,
+            expects_reply: false,
+            reply_to: None,
+            broadcast: false,
+        }
+    }
 }
 
 /// Whether a message can be written into a pane right now.
@@ -278,39 +331,45 @@ impl Bus {
     }
 
     /// Route one message. Delivers now if the target is at its prompt, else queues it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn send(
-        &mut self,
-        session: &mut Session,
-        cfg: &Config,
-        from_pane: Option<PaneId>,
-        to: &str,
-        body: &str,
-        force: bool,
-        expects_reply: bool,
-        reply_to: Option<u64>,
-    ) -> Result<Message> {
-        let target = Self::resolve(session, to)
-            .ok_or_else(|| anyhow!("no agent or pane called {to:?} (try `horde roster`)"))?;
-        if Some(target) == from_pane {
+    pub fn send(&mut self, session: &mut Session, cfg: &Config, out: Outgoing) -> Result<Message> {
+        let target = Self::resolve(session, out.to).ok_or_else(|| {
+            anyhow!("no agent or pane called {:?} (try `horde roster`)", out.to)
+        })?;
+        if Some(target) == out.from_pane {
             return Err(anyhow!("refusing to send a message to yourself"));
         }
-        let from = Self::sender_name(session, from_pane);
+        // Refused before the message exists, so a flood leaves no trace in the log either. The
+        // depth is named because it is the one number that makes the error actionable: the
+        // sender can see this is a backlog rather than a broken address.
+        let waiting = session
+            .panes
+            .get(&target)
+            .and_then(|p| p.agent.as_ref())
+            .map(|a| a.queued.len())
+            .unwrap_or(0);
+        if waiting >= QUEUE_DEPTH {
+            return Err(anyhow!(
+                "{} already has {waiting} messages waiting — nothing more is queued until it \
+                 has worked through them, because each one costs it a turn",
+                Self::sender_name(session, Some(target))
+            ));
+        }
+        let from = Self::sender_name(session, out.from_pane);
 
         let mut msg = Message {
             id: self.next_id,
             ts: super::now_millis(),
             from,
             to: Self::sender_name(session, Some(target)),
-            body: body.to_string(),
+            body: out.body.to_string(),
             delivery: Delivery::Queued,
-            broadcast: false,
-            expects_reply,
-            reply_to,
+            broadcast: out.broadcast,
+            expects_reply: out.expects_reply,
+            reply_to: out.reply_to,
         };
         self.next_id += 1;
 
-        let force = force || cfg.force_inject;
+        let force = out.force || cfg.force_inject;
         // Measure what will actually be typed, not the raw body: the `[horde] request …`
         // envelope is part of the line the tty has to accept.
         let len = format_for(&msg).len();
@@ -381,12 +440,18 @@ impl Bus {
         let mut out = Vec::new();
         for t in targets {
             let name = Self::sender_name(session, Some(t));
-            match self.send(session, cfg, from_pane, &name, body, false, false, None) {
-                Ok(mut m) => {
-                    m.broadcast = true;
-                    out.push(m);
+            // `broadcast` is set here, on the way in, so the copy that reaches the log and the
+            // ring carries it too. Setting it on the returned message instead told the truth to
+            // whoever was attached at that second and lied to every later reader.
+            let msg = Outgoing { broadcast: true, ..Outgoing::plain(from_pane, &name, body) };
+            match self.send(session, cfg, msg) {
+                Ok(m) => out.push(m),
+                // One unreachable or backed-up agent must not stop the rest of the room hearing
+                // it. Logged, because a broadcast that reached four of five is worth knowing.
+                Err(e) => {
+                    super::log_line(&format!("bus: broadcast not taken by {name}: {e}"));
+                    continue;
                 }
-                Err(_) => continue,
             }
         }
         out
@@ -513,13 +578,9 @@ impl Bus {
 /// turning a single message into several half-messages. The `[horde]` prefix is the
 /// recipient's signal that this is another agent rather than the human.
 ///
-/// A request additionally spells out the command to answer with. Without that the sender has
-/// to embed instructions by hand and hope they are followed, which is the difference between
-/// a delegation that returns a value and one that returns nothing.
-///
-/// A request spells out the exact command to run. Without that the sender has to embed
-/// instructions by hand and hope they are followed, which is the difference between a
-/// delegation that returns a value and one that returns nothing.
+/// A request additionally spells out the exact command to answer with. Without that the sender
+/// has to embed instructions by hand and hope they are followed, which is the difference
+/// between a delegation that returns a value and one that returns nothing.
 pub fn format_for(msg: &Message) -> String {
     let body = msg.body.trim().replace(['\r', '\n'], " ");
     match msg.kind() {
@@ -784,6 +845,78 @@ mod tests {
         }
     }
 
+    /// A broadcast has to *read back* as a broadcast.
+    ///
+    /// The bug: `broadcast` set the flag on the copy it returned, after `send` had already
+    /// written the message to the log and the ring. Whoever was attached at that moment saw
+    /// `→ all`; the drawer after a restart, `horde bus tail`, and the delivery event for a
+    /// broadcast that had to be queued all saw an ordinary one-to-one message.
+    #[test]
+    fn a_broadcast_is_recorded_as_one_not_as_a_private_message() {
+        let (cfg, mut session) = session_with_cat();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Working);
+
+        let p = std::env::temp_dir().join("horde-bus-broadcast-flag.jsonl");
+        let _ = std::fs::remove_file(&p);
+        let mut bus = Bus::new(p.clone());
+        // Working, so it is queued — the case where the flag used to be lost on the way to
+        // the recipient as well as in the log.
+        let sent = bus.broadcast(&mut session, &cfg, None, None, "standup in five");
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].broadcast, "the returned copy says so");
+        assert_eq!(sent[0].delivery, Delivery::Queued);
+
+        assert!(bus.recent(1)[0].broadcast, "and so does the ring the drawer reads");
+        assert!(read_tail(&p, 1)[0].broadcast, "and so does the log");
+
+        // Delivered later, it is still a broadcast. The state is moved rather than the agent
+        // replaced, because replacing it would throw away the queue this is about.
+        session.panes.get_mut(&pane).unwrap().agent.as_mut().unwrap().state = AgentState::Idle;
+        let events = bus.flush_queued(&mut session, &cfg);
+        match &events[0] {
+            Event::BusMessage(m) => {
+                assert!(m.broadcast, "the delivery event must not downgrade it to a private one");
+                assert_eq!(m.delivery, Delivery::Delivered);
+            }
+            other => panic!("expected a bus message, got {other:?}"),
+        }
+
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A queue is a promise that the message will arrive, not a place to pile up without limit.
+    ///
+    /// Past the ceiling the sender is told, because the alternative is an agent that comes back
+    /// from a permission prompt to fifty stale messages and spends its next fifty turns on them.
+    #[test]
+    fn a_target_that_is_already_backed_up_refuses_more_rather_than_growing() {
+        let (cfg, mut session) = session_with_cat();
+        let pane = *session.panes.keys().next().unwrap();
+        give_agent(&mut session, pane, AgentState::Blocked);
+        {
+            let agent = session.panes.get_mut(&pane).unwrap().agent.as_mut().unwrap();
+            agent.queued = (0..QUEUE_DEPTH as u64).map(|i| msg(i, "waiting")).collect();
+        }
+
+        let mut bus = Bus::new(super::super::tests::test_path("depth.jsonl"));
+        let err = bus
+            .send(&mut session, &cfg, Outgoing::plain(None, "target", "one more"))
+            .expect_err("the ceiling should refuse it");
+        let text = err.to_string();
+        assert!(text.contains("target"), "it names who is backed up: {text}");
+        assert!(text.contains(&QUEUE_DEPTH.to_string()), "and how deep it is: {text}");
+        // Refused before the message existed, so nothing was written to the log either.
+        assert!(bus.recent(10).is_empty(), "a refusal leaves no record of a message");
+
+        for p in session.panes.values_mut() {
+            p.kill();
+        }
+    }
+
     #[test]
     fn read_tail_of_a_missing_log_is_empty() {
         assert!(read_tail(&PathBuf::from("/nonexistent/horde/bus.jsonl"), 10).is_empty());
@@ -925,8 +1058,13 @@ mod tests {
 
         // And it queues rather than being reported as delivered.
         let mut bus = Bus::new(super::super::tests::test_path("canon.jsonl"));
+        let long = "y".repeat(4000);
         let m = bus
-            .send(&mut session, &cfg, None, "target", &"y".repeat(4000), true, false, None)
+            .send(
+                &mut session,
+                &cfg,
+                Outgoing { force: true, ..Outgoing::plain(None, "target", &long) },
+            )
             .unwrap();
         assert_eq!(m.delivery, Delivery::Queued, "a doomed write must not read as delivered");
 
@@ -971,7 +1109,7 @@ mod tests {
         let mut bus = Bus::new(super::super::tests::test_path("deaf.jsonl"));
         let started = std::time::Instant::now();
         let m = bus
-            .send(&mut session, &cfg, None, "target", "are you there?", false, false, None)
+            .send(&mut session, &cfg, Outgoing::plain(None, "target", "are you there?"))
             .unwrap();
         let took = started.elapsed();
 

@@ -534,6 +534,8 @@ pub mod tests {
                     accent: 0,
                     collapsed: false,
                     repo: None,
+                    notes: None,
+            lsp: Vec::new(),
                 },
                 SpaceInfo {
                     id: 2,
@@ -546,6 +548,8 @@ pub mod tests {
                     accent: 1,
                     collapsed: false,
                     repo: None,
+                    notes: None,
+            lsp: Vec::new(),
                 },
             ],
             tabs: vec![
@@ -563,7 +567,9 @@ pub mod tests {
             tabbar: Rect::default(),
             tasks_open: 0,
             tasks_claimed: 0,
+            cards_due: 0,
             triggers_armed: 0,
+            recents: Vec::new(),
         }
     }
 

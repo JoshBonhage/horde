@@ -279,6 +279,50 @@ impl Session {
         self.split_in(cfg, target, dir, cmd, None)
     }
 
+    /// Split, putting a file in the new pane instead of a program.
+    ///
+    /// Shares every line of the split path with the version that spawns a shell: the layout
+    /// tree, the room check, the focus move and the relayout do not know or care which of
+    /// the two they just made room for. That is the whole return on the content split.
+    pub fn split_doc(
+        &mut self,
+        cfg: &Config,
+        target: Option<PaneId>,
+        dir: Dir,
+        path: &Path,
+    ) -> Result<PaneId> {
+        let target = target.or_else(|| self.focused_pane()).ok_or_else(|| anyhow!("no pane"))?;
+        let pane = self.panes.get(&target).ok_or_else(|| anyhow!("no such pane"))?;
+        let (space, tab) = (pane.space, pane.tab);
+
+        if self.view.zoom.is_some() {
+            self.view.zoom = None;
+            self.relayout(cfg);
+        }
+        let area = self.chrome.panes;
+        let new_id = self.next_pane;
+        let fits = self
+            .tab(tab)
+            .map(|t| {
+                let mut probe = t.layout.clone();
+                probe.split(target, dir, new_id, area)
+            })
+            .unwrap_or(false);
+        if !fits {
+            return Err(anyhow!("not enough room to split — try zooming out or closing a pane"));
+        }
+
+        let doc = Pane::open_doc(new_id, tab, space, path, 80, 24)?;
+        self.next_pane += 1;
+        self.panes.insert(new_id, doc);
+        if let Some(t) = self.tab_mut(tab) {
+            t.layout.split(target, dir, new_id, area);
+            t.focused_pane = Some(new_id);
+        }
+        self.relayout(cfg);
+        Ok(new_id)
+    }
+
     /// Split, with somewhere else to start.
     ///
     /// `cwd` exists for worktrees: an agent given its own tree has to *start* in it, because
@@ -1045,6 +1089,11 @@ impl Session {
                     accent: s.accent,
                     collapsed: s.collapsed,
                     repo: repo_info(repos, &s.cwd),
+                    // Both filled in by the daemon, which owns the indexes and the child
+                    // processes. The session knows where a project is, not what is written
+                    // down about it or what is reading it.
+                    notes: None,
+                    lsp: Vec::new(),
                 }
             })
             .collect();
@@ -1064,8 +1113,12 @@ impl Session {
             status: self.chrome.status,
             tabbar: self.chrome.tabbar,
             // Filled in by the engine, which owns the board and the trigger set.
+            // Filled in by the daemon, which owns the history. The session knows where a
+            // project is, not which ones have been visited.
+            recents: Vec::new(),
             tasks_open: 0,
             tasks_claimed: 0,
+            cards_due: 0,
             triggers_armed: 0,
         }
     }
@@ -1204,6 +1257,65 @@ impl AgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The return on the whole refactor, stated as a test: a pane showing a file is a pane.
+    /// It takes a slot in the layout tree, it resizes with everything else, and the code that
+    /// arranges panes never learns there are two kinds.
+    #[test]
+    fn a_file_pane_lives_in_the_layout_like_any_other() {
+        let cfg = Config::default();
+        let mut s = Session::new(&cfg);
+        s.set_client_size(&cfg, 120, 40);
+        let space = s.create_space(&cfg, Some("p"), &std::env::temp_dir()).unwrap();
+        let _ = space;
+        let first = s.focused_pane().expect("the space came with a pane");
+
+        let file = std::env::temp_dir().join(format!("horde-docpane-{}.md", std::process::id()));
+        std::fs::write(&file, "# Title\n\nsome text\n").unwrap();
+
+        let doc = s.split_doc(&cfg, Some(first), Dir::Right, &file).expect("it splits");
+        assert_ne!(doc, first);
+        assert!(s.panes.get(&doc).is_some_and(|p| p.is_doc()), "and it is a doc");
+
+        // Both panes are laid out, side by side, with real width each.
+        let tab = s.focused_tab().unwrap();
+        let panes = s.tab(tab).unwrap().layout.panes();
+        assert!(panes.contains(&doc) && panes.contains(&first), "{panes:?}");
+        let w = |id: PaneId| s.panes.get(&id).map(|p| p.cols).unwrap_or(0);
+        assert!(w(doc) > 0 && w(first) > 0, "both got room: {} and {}", w(first), w(doc));
+
+        // And it renders: pumping fills the mirror with the file's first line.
+        let theme = crate::theme::Theme::horde();
+        if let Some(p) = s.panes.get_mut(&doc) {
+            assert!(p.pump(&theme), "the first pump has something to show");
+            let text: String =
+                p.row(0).map(|r| r.runs.iter().map(|x| x.text.clone()).collect()).unwrap_or_default();
+            assert!(text.contains("# Title"), "the file is on screen: {text:?}");
+        }
+
+        // Closing it is the same path as any other pane.
+        s.close_pane(&cfg, doc).expect("closing a doc pane is the ordinary path");
+        assert!(!s.tab(tab).unwrap().layout.panes().contains(&doc));
+        let _ = std::fs::remove_file(file);
+    }
+
+    /// A doc is not a program, and everything that assumes one has to say so rather than
+    /// guess: nothing may type into it, no agent may be detected in it, and the bus must
+    /// never resolve a message to one.
+    #[test]
+    fn a_file_pane_refuses_everything_that_belongs_to_a_program() {
+        let file = std::env::temp_dir().join(format!("horde-docrefuse-{}.md", std::process::id()));
+        std::fs::write(&file, "text\n").unwrap();
+        let mut p = Pane::open_doc(1, 1, 1, &file, 40, 10).unwrap();
+
+        assert!(!p.accepts_input(), "nothing may write into it");
+        assert!(p.foreground_pgid().is_none(), "there is no process to ask about");
+        assert!(!p.cursor().visible, "and no cursor to draw");
+        assert!(p.write(b"hello").is_ok(), "a stray write is dropped rather than failing");
+        assert!(p.export().is_err(), "and it cannot be handed to a successor daemon");
+        let _ = std::fs::remove_file(file);
+    }
+
 
     fn session() -> (Config, Session) {
         let mut cfg = Config::default();

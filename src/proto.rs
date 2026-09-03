@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -435,6 +435,46 @@ pub struct SpaceInfo {
     /// different question from what any one agent is working on: see `PaneInfo::repo`.
     #[serde(default)]
     pub repo: Option<RepoInfo>,
+    /// Notes indexed for this project, or `None` when it has no vault at all.
+    ///
+    /// A count rather than the notes: this struct is broadcast on every shape change, and a
+    /// vault's contents are unbounded. The notes themselves come back from a query.
+    #[serde(default)]
+    pub notes: Option<usize>,
+    /// Language servers horde has started for this project.
+    ///
+    /// Empty unless `config.toml` declares one and a file that needs it has been opened.
+    /// Present on the wire at all because a language server is a child process holding real
+    /// memory, and nothing horde starts is allowed to be invisible — least of all in a daemon
+    /// you are detached from.
+    #[serde(default)]
+    pub lsp: Vec<LspInfo>,
+}
+
+/// One language server, as the chrome shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LspInfo {
+    /// The name from `[lsp.<name>]`, which is also what it is called on screen.
+    pub lang: String,
+    pub state: LspState,
+    /// Files it is currently watching.
+    pub open: usize,
+    pub errors: usize,
+    pub warnings: usize,
+    /// Why it is not running, when it is not.
+    pub detail: Option<String>,
+}
+
+/// What a language server is doing, for the sidebar.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LspState {
+    /// Spawned, waiting on its answer to `initialize`. rust-analyzer sits here for seconds.
+    Starting,
+    Ready,
+    /// Died, and waiting out a backoff before trying again.
+    Waiting,
+    /// Died too often, or never started at all. Nothing more will happen without a change.
+    Failed,
 }
 
 /// Everything the client needs to draw a frame apart from cell contents.
@@ -462,12 +502,40 @@ pub struct Snapshot {
     pub tasks_open: usize,
     #[serde(default)]
     pub tasks_claimed: usize,
+    /// Cards on your own board that are due today or already late.
+    ///
+    /// Only the ones with a deadline that has arrived. A count of everything on the board
+    /// would be a number that never changes, and a badge that never changes is a badge nobody
+    /// reads. See `daemon::kanban`.
+    #[serde(default)]
+    pub cards_due: usize,
     /// Triggers that could fire right now — enabled, with the master switch on.
     ///
     /// Zero when `unattended` is off, however many rules exist: the question the sidebar is
     /// answering is "can this thing act on its own", and a disarmed switch means no.
     #[serde(default)]
     pub triggers_armed: usize,
+    /// Projects opened before, most recent first — the dashboard's memory.
+    ///
+    /// Kept by the daemon rather than the client because the daemon is the thing that
+    /// outlives every attach, and because a client on another machine has no business
+    /// deciding what this session has been working on.
+    #[serde(default)]
+    pub recents: Vec<RecentProject>,
+}
+
+/// A project the session has opened before.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentProject {
+    /// The space's name when it was last open, which is usually the directory's.
+    pub name: String,
+    pub cwd: String,
+    /// Unix millis, for ordering and for "3 days ago".
+    pub last_used: u64,
+    /// True while a space is open on it, so the dashboard can say "3 agents" instead of
+    /// offering to reopen something already on screen.
+    #[serde(default)]
+    pub live: bool,
 }
 
 /// Panel visibility. Lives in the daemon so geometry has exactly one owner.
@@ -610,6 +678,71 @@ pub enum Cmd {
     ToggleSpaceCollapsed(SpaceId),
     /// Hold a pane at the top of the sidebar's agent list.
     TogglePanePinned(PaneId),
+    /// Ask what is in a project's vault. Answered with [`ServerFrame::Vault`] to the asking
+    /// client only — the second command with a result rather than an effect, after
+    /// `RequestDigest`, and for the same reason: note lists are unbounded and change often,
+    /// so they have no business riding a snapshot everyone gets.
+    VaultQuery { space: SpaceId, kind: VaultQuery },
+    /// Write a note, creating it if it is not there. Answered with the saved note, so the
+    /// view it came from can show what is now on disk rather than what it hoped was.
+    VaultSave { space: SpaceId, path: String, body: String },
+    /// Set up a vault where there is not one yet: the directory, its marker, a first note.
+    VaultInit { space: SpaceId },
+    /// What is in a project: its files, so opening one shows the project rather than a
+    /// terminal that happens to be sitting in it.
+    FileQuery { space: SpaceId },
+    /// Write a project file. Relative to the project root, and jailed to it.
+    FileSave { space: SpaceId, path: String, body: String },
+    /// One project file's text, for editing.
+    FileRead { space: SpaceId, path: String },
+    /// Show a file in a pane of its own, beside whatever is already there.
+    OpenDocPane { space: SpaceId, path: String },
+    /// Open a project directory: focus the space already on it, or make one if there is none.
+    ///
+    /// Focus-or-create rather than always-create, because the dashboard offers live projects
+    /// and remembered ones in the same list, and pressing enter on the one you are already
+    /// running should take you there rather than start a second copy of it.
+    OpenProject { cwd: String },
+    /// What the editor's buffer currently says, without writing it anywhere.
+    ///
+    /// Separate from [`Cmd::FileSave`] on purpose: diagnostics have to follow what you are
+    /// typing rather than what you last saved, and the file on disk is not horde's to change
+    /// until you ask. `vault` says which root the path is relative to — a note lives in the
+    /// vault, a file lives in the project, and only the client knows which one it opened.
+    DocChanged { space: SpaceId, path: String, body: String, vault: bool },
+    /// The editor closed. Whatever was analysing it can stop.
+    DocClosed { space: SpaceId, path: String, vault: bool },
+    /// What could go here. Carries the buffer with it, because an answer computed against
+    /// text a debounce has not sent yet would be an answer about a different file.
+    Complete { space: SpaceId, path: String, body: String, line: u32, col: u32, vault: bool },
+    /// A picture pasted into a note, on its way to the vault's attachment folder.
+    ///
+    /// The bytes travel because the clipboard belongs to the machine somebody is sitting at
+    /// and the vault belongs to the daemon. A client attached from another host pastes its
+    /// own clipboard, which is the only answer that is ever right.
+    Attach { space: SpaceId, name: String, bytes: Vec<u8> },
+
+    // -- the kanban ----------------------------------------------------------
+    // The personal board. Its own verbs rather than a reuse of the `task.*` ones, because
+    // they are a different board with different rules — see `daemon/kanban.rs`.
+    /// Read the board. `space` of `None` asks for every project, not for none.
+    KanbanQuery { space: Option<SpaceId> },
+    CardNew { space: Option<SpaceId>, column: String, title: String },
+    CardEdit { id: u64, patch: CardPatch },
+    /// Move a card, landing behind `after`, or at the top when that is `None`.
+    ///
+    /// Behind a *card* rather than at an index, because the client may be looking at a
+    /// filtered board: an index into the three cards it is showing is not an index into the
+    /// eleven that are there, and translating it client-side would mean the client keeping
+    /// track of the cards it deliberately is not showing.
+    CardMove { id: u64, column: String, after: Option<u64> },
+    CardComment { id: u64, body: String },
+    CardArchive { id: u64, archived: bool },
+    /// Hand this card to the agents now, without waiting for its armed window.
+    CardHandOff { id: u64 },
+    /// Rename a column, carrying its cards. The configured list is the client's to edit; this
+    /// is the daemon-side half that keeps the cards from being orphaned by that edit.
+    ColumnRename { from: String, to: String },
 }
 
 // Add new `Cmd` variants at the end of the enum, never in the middle. Frames travel as postcard,
@@ -618,6 +751,136 @@ pub enum Cmd {
 // other variant, reads a field that is not there, and drops the connection. Found the hard way:
 // clicking a pane killed the session while every keybinding above the inserted variant still
 // worked.
+
+/// What to ask a vault. Append new kinds at the end, like every other wire enum.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum VaultQuery {
+    /// Every note, newest first.
+    List,
+    /// Notes matching a query, best first.
+    Search { q: String },
+    /// One note in full, with its backlinks.
+    Note { path: String },
+    /// The whole link graph: what to draw, not where to draw it.
+    ///
+    /// Positions are the client's business. The daemon knows which notes link to which, and
+    /// a layout is a property of the terminal it is being drawn in — sending coordinates
+    /// would mean the daemon owning a screen it cannot see.
+    Graph,
+}
+
+/// One note in the graph.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphNode {
+    /// Empty for a ghost — a link target nobody has written yet.
+    pub path: String,
+    pub label: String,
+    /// Links in plus links out, which is what decides how big a node draws.
+    pub degree: u16,
+    /// Groups nodes by their first tag, else their folder, so a cluster has a colour.
+    pub group: String,
+    /// A link target with no note behind it. Drawn hollow: it is a note somebody meant to
+    /// write, and that is worth seeing rather than hiding.
+    pub ghost: bool,
+    /// Whoever signed this note, when it was not a person.
+    ///
+    /// The graph is the one view that shows the vault as a whole, so it is the one place
+    /// where "how much of this did I write" is answerable at a glance. Colouring rather than
+    /// hiding: an agent's notes are part of the vault, and pretending otherwise is how you
+    /// end up surprised by what is in it.
+    #[serde(default)]
+    pub by: Option<String>,
+    /// Unix millis of the last write, for showing what has just changed.
+    #[serde(default)]
+    pub mtime: u64,
+}
+
+/// A project's files, as the file browser shows them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FileList {
+    pub space: SpaceId,
+    pub root: String,
+    /// Relative paths, sorted.
+    pub files: Vec<String>,
+    /// True when there were more than the daemon was willing to list.
+    pub truncated: bool,
+    /// Set by `FileRead` and `FileSave`: the file's text and which file it is.
+    pub body: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VaultGraph {
+    pub nodes: Vec<GraphNode>,
+    /// Indices into `nodes`.
+    pub edges: Vec<(u16, u16)>,
+}
+
+/// A note as a list shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoteLine {
+    /// Relative to the vault root, and the identity a `Note` query takes.
+    pub path: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    /// Unix millis.
+    pub mtime: u64,
+    /// How many notes point at this one.
+    pub backlinks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VaultReply {
+    pub space: SpaceId,
+    /// Absolute path of the vault root, so a client can show where it is reading from.
+    pub root: String,
+    pub notes: Vec<NoteLine>,
+    /// Set for a `Note` query: the note's own text.
+    pub body: Option<String>,
+    /// Set for a `Note` query: what links here.
+    pub backlinks: Vec<NoteLine>,
+    /// Set for a `Graph` query.
+    #[serde(default)]
+    pub graph: Option<VaultGraph>,
+    /// Set for a `Note` query: board tasks that name this note.
+    ///
+    /// The other half of a wikilink written in a task. What is left to do about a note is
+    /// worth knowing while you are reading it, which is the one moment you would otherwise
+    /// have to remember to go and ask somewhere else.
+    #[serde(default)]
+    pub tasks: Vec<TaskLine>,
+}
+
+// ---------------------------------------------------------------------------
+// The kanban
+//
+// The personal board, as distinct from the agents' one — see `daemon/kanban.rs`. Its cards
+// travel whole rather than as a summary line: a card *is* its description, dates and thread,
+// and a `CardLine` that dropped them would only mean a second round trip to read one.
+// ---------------------------------------------------------------------------
+
+/// What to change about a card, and nothing else.
+///
+/// Every field is "leave it alone" when `None`. The doubled options are how "clear this" is
+/// said apart from "do not touch this" — `Some(None)` unsets, `Some(Some(x))` sets. Ugly to
+/// read and unambiguous to apply, which is the right way round for a patch: the alternative
+/// is a parallel set of `clear_due`-style booleans that can contradict the value beside them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CardPatch {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub due: Option<Option<u64>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub project: Option<Option<String>>,
+    /// The armed window, in millis. See `daemon::kanban::Card::assist`.
+    #[serde(default)]
+    pub assist: Option<Option<u64>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Dir {
@@ -644,6 +907,158 @@ pub enum ServerFrame {
     Digest(Box<Digest>),
     /// Protocol mismatch or daemon shutting down.
     Bye { reason: String },
+    /// Answer to [`Cmd::VaultQuery`], for the note browser.
+    Vault(Box<VaultReply>),
+    /// Answer to [`Cmd::FileQuery`] and friends, for the file browser and editor.
+    Files(Box<FileList>),
+    /// What a language server thinks of one file, as the client last named it.
+    ///
+    /// Unsolicited: diagnostics arrive when the server has something to say, which is some
+    /// time after the typing that prompted them and never in reply to a request.
+    Diagnostics { path: String, diags: Vec<Diag> },
+    /// Answer to [`Cmd::Complete`]. Late by definition — the cursor has usually moved on.
+    Completions { path: String, items: Vec<Completion> },
+    /// Answer to [`Cmd::KanbanQuery`], and to every command that changes a card.
+    ///
+    /// Re-sent after each mutation rather than the client patching its own copy, for the
+    /// reason the whole client works this way: one authoritative picture, replaced wholesale,
+    /// so a dropped or reordered update cannot leave the board showing something that was
+    /// never true. A board is a few hundred cards at most.
+    Kanban(Box<KanbanReply>),
+}
+
+/// One entry in a card's thread.
+///
+/// Authored and timestamped, which almost nothing else in this space does: of a dozen
+/// terminal kanbans surveyed, most store comments as bare strings and the rest store a
+/// timestamp without a name. That is fine for a board only you write to, and useless the
+/// moment an agent writes to it — "done, tests green" means nothing without knowing who said
+/// it and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Comment {
+    /// `josh@joshmacbook` for the person at the keyboard, the agent's own name for an agent,
+    /// and `horde` for the daemon reporting on itself.
+    pub by: String,
+    /// Unix millis.
+    pub at: u64,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Card {
+    pub id: u64,
+    pub title: String,
+    /// Which column, by name. Matched case-insensitively against the configured list.
+    pub column: String,
+    /// Dense position within the column, renumbered on every move.
+    pub pos: u32,
+    /// The description. Multi-line, empty rather than absent when unset.
+    #[serde(default)]
+    pub body: String,
+    /// Unix millis at local noon of the due day.
+    ///
+    /// Noon rather than midnight so that neither a timezone change nor a daylight-saving
+    /// boundary can move the date by a day, which is the entire class of bug that dates
+    /// stored as instants produce.
+    #[serde(default)]
+    pub due: Option<u64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Which project, by space *name*.
+    ///
+    /// The same rule as [`crate::daemon::tasks::Task::space`] and for the same reason: ids are
+    /// persisted by position and are not stable across a restart, so a card holding one would
+    /// point at a different project the next morning. `None` is work that is not about a
+    /// repository, which a personal board has plenty of.
+    #[serde(default)]
+    pub project: Option<String>,
+    pub created: u64,
+    #[serde(default)]
+    pub updated: u64,
+    /// Kept rather than deleted, so the record of the work survives. Hidden by default.
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub comments: Vec<Comment>,
+    /// Armed: hand this to the agents once the due date is this close, in millis.
+    #[serde(default)]
+    pub assist: Option<u64>,
+    /// The board task it was handed to, once it has been.
+    #[serde(default)]
+    pub handed: Option<u64>,
+}
+
+/// The personal board, as of now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KanbanReply {
+    /// Every card, archived ones included — hiding them is the view's decision, and a client
+    /// that had to ask again to show them would flicker on a keypress that should not.
+    pub cards: Vec<Card>,
+    /// The configured columns, in order, as the daemon has them.
+    ///
+    /// Sent rather than read from the client's own config so that both halves agree even when
+    /// a client is attached from another machine with its own `config.toml`. Columns are a
+    /// property of the board, not of whoever is looking at it.
+    pub columns: Vec<String>,
+    /// The project the query was scoped to, if any — echoed back so a reply that arrives
+    /// after you changed projects can be told apart from one that did not.
+    pub project: Option<String>,
+}
+
+/// One thing that could be typed here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Completion {
+    /// What the list shows.
+    pub label: String,
+    /// What goes in, which is not always what is shown — a server may list `println!(…)` and
+    /// mean `println!`.
+    pub insert: String,
+    /// The columns on the cursor's line this replaces, when the server was specific about
+    /// it. `None` means the word the cursor is in, worked out by whoever holds the buffer.
+    pub replace: Option<(u32, u32)>,
+    /// A word for what it is — `function`, `field`, `keyword`.
+    pub kind: Option<String>,
+    /// One line of detail. A type signature, usually.
+    pub detail: Option<String>,
+}
+
+// -- diagnostics ----------------------------------------------------------
+// Shared because both halves need them: the daemon parses them out of a language server, and
+// the client draws them in the margin.
+
+/// How bad a diagnostic is. Mirrors LSP's numbering, which is error-first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+impl Severity {
+    /// The margin mark. Plain Unicode geometrics, like every other glyph horde draws.
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            Severity::Error => "◍",
+            Severity::Warning => "△",
+            Severity::Info => "·",
+            Severity::Hint => "·",
+        }
+    }
+}
+
+/// One thing a language server has to say about a line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diag {
+    /// Zero-based, as LSP counts and as the editor's buffer counts.
+    pub line: u32,
+    pub col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+    pub severity: Severity,
+    pub message: String,
+    /// Which tool said so — `rustc`, `clippy`, `typescript`. Servers that front several.
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -707,7 +1122,7 @@ pub struct AgentLine {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskLine {
     pub id: u64,
     pub text: String,
@@ -715,6 +1130,12 @@ pub struct TaskLine {
     pub result: Option<String>,
     /// True for a task that was dropped rather than completed.
     pub dropped: bool,
+    /// True once it is off the board, however it got there.
+    ///
+    /// Separate from `result`, which a finished task need not have left behind — "done with
+    /// nothing to say" and "still open" are different states and must not draw the same.
+    #[serde(default)]
+    pub done: bool,
 }
 
 impl Digest {
@@ -842,6 +1263,7 @@ mod digest_tests {
             owner: None,
             result: None,
             dropped: false,
+            done: true,
         });
         d.needs_you.push(line("reviewer", AgentState::Blocked, 90));
         let h = d.headline().unwrap();
@@ -857,6 +1279,7 @@ mod digest_tests {
             owner: None,
             result: None,
             dropped: false,
+            done: true,
         });
         assert_eq!(d.headline().unwrap(), "while you were away: 1 task done");
         d.needs_you.push(line("a", AgentState::Blocked, 1));
@@ -875,6 +1298,7 @@ mod digest_tests {
             owner: None,
             result: None,
             dropped: false,
+            done: true,
         });
         d.gone.push("c".into());
         let h = d.headline().unwrap();
@@ -908,6 +1332,181 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 7, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 20, "bump this whenever a wire struct or enum changes");
+    }
+
+    /// The assert above is a reminder, not a detector. It fires when you *do* bump the
+    /// version, never when you *should have*: appending a variant or adding a field leaves
+    /// every test in this file green, and the change ships silently. A newer client then
+    /// sends a shape the running daemon cannot decode, and the handshake built to catch
+    /// exactly that stays quiet, because the number it compares never moved.
+    ///
+    /// These functions close that hole, and they are the reason to keep them ugly. Every
+    /// `match` is exhaustive with no `_` arm; every struct is destructured with no `..`. So
+    /// **adding a variant or a field stops the build right here**, in the one place that
+    /// says what to do about it: append (never insert), then bump `PROTOCOL_VERSION` and the
+    /// assert above.
+    ///
+    /// They are never called, and must not be. Being forced to edit them is the whole test.
+    #[test]
+    fn a_new_variant_or_field_cannot_reach_the_wire_unnoticed() {
+        #[allow(dead_code)]
+        fn every_cmd(c: Cmd) {
+            match c {
+                Cmd::SplitRight
+                | Cmd::SplitDown
+                | Cmd::ClosePane
+                | Cmd::FocusDir(..)
+                | Cmd::Resize { .. }
+                | Cmd::ToggleZoom
+                | Cmd::SwapDir(..)
+                | Cmd::NewTab
+                | Cmd::NextTab
+                | Cmd::PrevTab
+                | Cmd::GotoTab(..)
+                | Cmd::CloseTab
+                | Cmd::NewSpace { .. }
+                | Cmd::FocusSpace(..)
+                | Cmd::NextSpace
+                | Cmd::PrevSpace
+                | Cmd::ToggleSidebar
+                | Cmd::ToggleBus
+                | Cmd::JumpAttention
+                | Cmd::Scroll { .. }
+                | Cmd::ScrollBottom { .. }
+                | Cmd::FocusPane(..)
+                | Cmd::RenamePane { .. }
+                | Cmd::SpawnAgent { .. }
+                | Cmd::ApplyLayout { .. }
+                | Cmd::RenameSpace { .. }
+                | Cmd::RenameTab { .. }
+                | Cmd::CloseSpace(..)
+                | Cmd::FocusTab(..)
+                | Cmd::NewTabIn(..)
+                | Cmd::RequestDigest
+                | Cmd::Redraw
+                | Cmd::SetSpaceAccent { .. }
+                | Cmd::SetPaneRole { .. }
+                | Cmd::ToggleSpaceCollapsed(..)
+                | Cmd::TogglePanePinned(..)
+                | Cmd::VaultQuery { .. }
+                | Cmd::VaultSave { .. }
+                | Cmd::VaultInit { .. }
+                | Cmd::FileQuery { .. }
+                | Cmd::FileSave { .. }
+                | Cmd::FileRead { .. }
+                | Cmd::OpenDocPane { .. }
+                | Cmd::OpenProject { .. }
+                | Cmd::DocChanged { .. }
+                | Cmd::DocClosed { .. }
+                | Cmd::Complete { .. }
+                | Cmd::Attach { .. }
+                | Cmd::KanbanQuery { .. }
+                | Cmd::CardNew { .. }
+                | Cmd::CardEdit { .. }
+                | Cmd::CardMove { .. }
+                | Cmd::CardComment { .. }
+                | Cmd::CardArchive { .. }
+                | Cmd::CardHandOff { .. }
+                | Cmd::ColumnRename { .. } => {}
+            }
+        }
+
+        #[allow(dead_code)]
+        fn every_frame(c: ClientFrame, s: ServerFrame, e: Event) {
+            match c {
+                ClientFrame::Input { .. }
+                | ClientFrame::Resize { .. }
+                | ClientFrame::Focus { .. }
+                | ClientFrame::Command(..)
+                | ClientFrame::Ping
+                | ClientFrame::Detach => {}
+            }
+            match s {
+                ServerFrame::Snapshot(..)
+                | ServerFrame::Rows { .. }
+                | ServerFrame::Event(..)
+                | ServerFrame::Digest(..)
+                | ServerFrame::Bye { .. }
+                | ServerFrame::Vault(..)
+                | ServerFrame::Files(..)
+                | ServerFrame::Diagnostics { .. }
+                | ServerFrame::Completions { .. }
+                | ServerFrame::Kanban(..) => {}
+            }
+            match e {
+                Event::AgentStateChanged { .. }
+                | Event::BusMessage(..)
+                | Event::PaneExited { .. }
+                | Event::Notice { .. } => {}
+            }
+        }
+
+        #[allow(dead_code)]
+        fn every_field(snap: &Snapshot, pane: &PaneInfo, space: &SpaceInfo, tab: &TabInfo, view: &ViewState) {
+            let Snapshot {
+                protocol: _,
+                daemon_version: _,
+                spaces: _,
+                tabs: _,
+                panes: _,
+                focused_space: _,
+                focused_tab: _,
+                focused_pane: _,
+                view: _,
+                sidebar: _,
+                bus: _,
+                status: _,
+                tabbar: _,
+                tasks_open: _,
+                tasks_claimed: _,
+                cards_due: _,
+                triggers_armed: _,
+                recents: _,
+            } = snap;
+            let PaneInfo {
+                id: _,
+                tab: _,
+                space: _,
+                title: _,
+                cwd: _,
+                cell: _,
+                content: _,
+                cols: _,
+                rows: _,
+                agent: _,
+                spawned_by: _,
+                exited: _,
+                scroll_offset: _,
+                wants_mouse: _,
+                bracketed_paste: _,
+                role: _,
+                pinned: _,
+                board: _,
+                repo: _,
+            } = pane;
+            let SpaceInfo {
+                id: _,
+                name: _,
+                cwd: _,
+                tabs: _,
+                focused_tab: _,
+                agent_count: _,
+                attention_count: _,
+                accent: _,
+                collapsed: _,
+                repo: _,
+                notes: _,
+                lsp: _,
+            } = space;
+            let TabInfo { id: _, space: _, name: _, panes: _, focused_pane: _ } = tab;
+            let ViewState {
+                sidebar_open: _,
+                bus_open: _,
+                sidebar_width: _,
+                bus_width: _,
+                zoom: _,
+            } = view;
+        }
     }
 }
