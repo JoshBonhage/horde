@@ -717,9 +717,12 @@ mod tests {
             session_id: None,
             queued: Vec::new(),
             question: None,
+            endpoint: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                memory_nudged: None,
+                context_low: false,
                 alerted_since: None,
         });
     }

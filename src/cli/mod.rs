@@ -170,6 +170,16 @@ pub enum Command {
         #[command(subcommand)]
         cmd: TaskCmd,
     },
+    /// Notes a project keeps for its agents, at `.horde/memory/`.
+    ///
+    /// What to write into one: the things that took the session to work out and that a fresh
+    /// agent would have to rediscover — where a subsystem lives, what you already ruled out,
+    /// which of two plausible designs the code actually uses. Not a summary of what you did;
+    /// git has that.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Scheduled rules that put work on the board while nobody is watching.
     ///
     /// Nothing fires until `triggers.unattended = true` is set in config.toml: acting on its
@@ -405,6 +415,36 @@ pub enum TaskCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum MemoryCmd {
+    /// Save a note for this project. Body from stdin, or `--text`.
+    ///
+    /// Reads stdin by default because that is what an agent has: it can pipe a heredoc in one
+    /// call rather than escaping a paragraph onto a command line.
+    Save {
+        /// Letters, digits, dashes, dots and underscores. `.md` is added for you.
+        name: String,
+        /// The note, instead of reading stdin.
+        #[arg(long)]
+        text: Option<String>,
+    },
+    /// List this project's notes, newest first.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a note.
+    Show { name: String },
+    /// Hand a note to an agent: it is told where to read it, not given the text.
+    Give {
+        name: String,
+        /// Agent name, as `horde roster` lists it.
+        to: String,
+    },
+    /// Delete a note.
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -882,6 +922,55 @@ pub fn run(cmd: Command) -> Result<()> {
             call("layout.apply", json!({ "preset": preset }))?;
             println!("applied layout {preset}");
         }
+
+        Command::Memory { cmd } => match cmd {
+            MemoryCmd::Save { name, text } => {
+                let body = match text {
+                    Some(t) => t,
+                    None => {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf)?;
+                        buf
+                    }
+                };
+                if body.trim().is_empty() {
+                    return Err(anyhow!("nothing to save (pipe the note in, or use --text)"));
+                }
+                let r = call(
+                    "memory.save",
+                    json!({ "name": name, "body": body, "from": self_pane() }),
+                )?;
+                println!(
+                    "saved {}",
+                    r.get("path").and_then(|x| x.as_str()).unwrap_or(&name)
+                );
+            }
+            MemoryCmd::List { json } => {
+                let v = call("memory.list", json!({ "from": self_pane() }))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    print_memories(&v);
+                }
+            }
+            MemoryCmd::Show { name } => {
+                let v = call("memory.show", json!({ "name": name, "from": self_pane() }))?;
+                print!("{}", v.get("body").and_then(|x| x.as_str()).unwrap_or(""));
+            }
+            MemoryCmd::Give { name, to } => {
+                let v = call(
+                    "memory.give",
+                    json!({ "name": name, "to": to, "from": self_pane() }),
+                )?;
+                let queued = v.get("queued").and_then(|x| x.as_bool()).unwrap_or(false);
+                println!("{name} → {to}{}", if queued { " (queued)" } else { "" });
+            }
+            MemoryCmd::Rm { name } => {
+                call("memory.rm", json!({ "name": name, "from": self_pane() }))?;
+                println!("removed {name}");
+            }
+        },
 
         Command::Task { cmd } => match cmd {
             TaskCmd::Add { text, space, role } => {
@@ -1458,6 +1547,24 @@ fn print_kv(v: &Value) {
     }
 }
 
+fn print_memories(v: &Value) {
+    let items = v.as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        println!("no memories yet — save one with `horde memory save <name>`");
+        return;
+    }
+    println!("{:<20} {:<8} TITLE", "NAME", "AGE");
+    for m in items {
+        let name = m.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+        let title = m.get("title").and_then(|x| x.as_str()).unwrap_or("");
+        let age = m.get("age").and_then(|x| x.as_u64()).unwrap_or(0);
+        println!(
+            "{name:<20} {:<8} {title}",
+            crate::client::ui::pane_widget::fmt_elapsed(age)
+        );
+    }
+}
+
 fn print_roster(v: &Value) {
     let items = v.as_array().cloned().unwrap_or_default();
     if items.is_empty() {
@@ -1475,6 +1582,11 @@ fn print_roster(v: &Value) {
         let mut why = reason.to_string();
         if queued > 0 {
             why.push_str(&format!(" (+{queued} queued)"));
+        }
+        // A service's address, volunteered for the same reason `spawned_by` is below: it is
+        // the one thing about the row you would otherwise go to the pane to find out.
+        if let Some(e) = a.get("endpoint").and_then(|x| x.as_str()) {
+            why = format!("{e} · {why}");
         }
         // An agent you did not start is the one fact about a roster row you would most want
         // volunteered rather than discovered.

@@ -996,9 +996,12 @@ impl Pane {
                 session_id: a.session_id.clone(),
                 queued: a.queued.clone(),
                 question: None,
+                endpoint: None,
                 activity: Default::default(),
                 touched: Default::default(),
                 nudged_since: None,
+                memory_nudged: None,
+                context_low: false,
                 alerted_since: None,
             }),
             content: Content::Pty(Box::new(PtyContent {
@@ -1395,4 +1398,3 @@ mod tests {
         );
     }
 }
-

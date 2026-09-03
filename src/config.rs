@@ -242,6 +242,8 @@ struct RawAgents {
     force_inject: Option<bool>,
     /// Tell an idle agent when work is waiting on the task board.
     task_nudge: Option<bool>,
+    /// Tell an agent that is running out of context to save a memory first.
+    memory_nudge: Option<bool>,
     /// Live panes agents may have started between them.
     max_fleet: Option<usize>,
     /// Whether the shared task board accepts anything at all.
@@ -625,6 +627,13 @@ pub struct Config {
     pub force_inject: bool,
     /// Tell an idle agent when the board has work. Needs `board = true` to do anything.
     pub task_nudge: bool,
+    /// Tell an agent that is nearly out of context to save a memory before it compacts.
+    ///
+    /// The one thing in this feature that horde does on its own, so it is opt-in like every
+    /// other such thing here. What it costs when wrong is a paragraph in an agent's context
+    /// that it did not ask for; what it buys when right is the session's hard-won detail
+    /// surviving into the next one. See [`daemon::compaction`](crate::daemon::compaction).
+    pub memory_nudge: bool,
     /// Whether the shared task board is open.
     ///
     /// Separate from the bus on purpose. Messaging is agents talking to each other; the board is
@@ -799,6 +808,10 @@ impl Default for Config {
             // Off by default: this is the half that acts without being asked, and it is worth
             // watching the board behave for a day before switching it on. Needs `board = true`.
             task_nudge: false,
+            // Off by default for the same reason `task_nudge` is: this is the half that types
+            // into an agent's conversation without being asked, and that is worth opting into
+            // deliberately rather than discovering.
+            memory_nudge: false,
             max_fleet: 6,
             setup_done: false,
             kit: cfg!(feature = "full"),
@@ -1065,6 +1078,7 @@ impl Config {
         cfg.detection_lines = raw.agents.detection_lines.unwrap_or(cfg.detection_lines).clamp(5, 200);
         cfg.force_inject = raw.agents.force_inject.unwrap_or(cfg.force_inject);
         cfg.task_nudge = raw.agents.task_nudge.unwrap_or(cfg.task_nudge);
+        cfg.memory_nudge = raw.agents.memory_nudge.unwrap_or(cfg.memory_nudge);
         cfg.max_fleet = raw.agents.max_fleet.unwrap_or(cfg.max_fleet);
         cfg.setup_done = raw.setup.done.unwrap_or(cfg.setup_done);
         cfg.board = raw.agents.board.unwrap_or(cfg.board);

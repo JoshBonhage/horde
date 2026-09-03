@@ -184,6 +184,27 @@ filter, as it already ignores scope and staleness.
 
 A task whose owner is no longer a live pane is returned to the board automatically.
 
+### Memory
+
+Notes a project keeps for its agents, at `<project>/.horde/memory/*.md`. Scoped to the
+*caller's project* — the space, not the pane, so an agent in a worktree still reads and writes
+the project's notes rather than its checkout's. See [memory](memory.md).
+
+| Method | Params | Returns |
+|---|---|---|
+| `memory.save` | `name`, `body`, `from` | `{ name, path, bytes }` |
+| `memory.list` | `from` | `[{ id, name, title, path, bytes, age }]`, newest first |
+| `memory.show` | `name`, `from` | `{ name, body }` |
+| `memory.give` | `name`, `to`, `from` | `{ name, to, queued }` |
+| `memory.rm` | `name`, `from` | `{ removed }` |
+
+`memory.give` sends the recipient a **path**, never the body — the point of a note is to spend
+less context, not to spend it again — and routes through the bus, so it queues behind a turn
+and is never injected at a blocked agent.
+
+`name` must be a single path component: letters, digits, dashes, dots and underscores. `.md`
+is optional and added for you.
+
 ### Digest
 
 | Method | Params | Notes |

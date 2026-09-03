@@ -32,8 +32,9 @@ A service uses two states and no others — `serving` when it is up, `blocked` w
 you (the port is taken, the build is broken) — and horde treats it differently in the places
 where agent behaviour would be nonsense:
 
-- it is **counted separately**, so three panes of `npm run dev` cannot make a quiet session
-  read as a busy one, and it does not appear in a project's agent count
+- it gets **its own sidebar section**, below the agents, so three panes of `npm run dev`
+  cannot make a quiet session read as a busy one, and it does not appear in a project's
+  agent count
 - it **never becomes `done`**: `done` means "you have not read this yet", and nobody is going
   to read a page-load log
 - it is **never handed board work** and never receives a bus message
@@ -45,6 +46,57 @@ cannot read rather than a signal you can.
 The colour is its own — `theme.custom.serving` — for the same reason: a dev server is
 background texture you want to be able to *not* look at, which it cannot be while it shares a
 colour with an agent mid-turn.
+
+### The SERVICES section, and the strand that ties it back
+
+```
+ AGENTS
+ ▾ api-refactor    ◍1 ◐1
+ ├─◐ builder        2m18s
+ ╰─◍ reviewer     blocked
+ ▾ docs                ○1
+ ╰─○ writer          idle
+────────────────────────
+ SERVICES               3
+ ▾ api-refactor        ◆2
+ ├─◆ vite           :5173
+ ╰─◆ tsc          serving
+ ▾ docs                ◆1
+ ╰─◆ hugo           :1313
+```
+
+Splitting the two lists raises the question the split created — *which* servers belong to the
+work you are looking at. So both lists draw a connector down their indent column in the
+project's own accent, the same hue as that project's dot up in SPACES. One project is one
+coloured strand running the height of the panel, through two section rules, and the servers on
+that strand are the ones serving those agents.
+
+The glyphs only say where in the strand you are; the **colour** is what carries the tie. A
+`╰─` is where a group ends, a `│` is a group carrying on past an agent's activity line, and
+at a sidebar narrow enough to drop the indent (`ui.sidebar_width` below 20) the connector goes
+with it — there is no column left to draw it in.
+
+The section appears only when something is running in it. Most sessions never start a dev
+server, and a rule and a label announcing that would be three rows spent on a non-event. When
+the panel is short the block yields before the agent list does: the agents are what you are
+actually watching.
+
+### Where it is answering
+
+A service's row shows its address rather than the word `serving` — `:5173`, `:3000`,
+`api.local:8080` — read off its screen at startup and kept until the service goes. "Serving"
+is a fact the glyph already carried; the port is the thing you actually wanted. It is also on
+`horde agent list`, in the `WHY` column.
+
+Like the question parser, it will not guess: a screen that never printed an address leaves the
+row saying `serving`, which is what it said before. A loopback host is dropped —
+`http://localhost:5173/` is `:5173`, because `localhost` in a twenty-column panel is four
+times the width for none of the information — and a *named* host is kept in full, since a
+server answering on something other than localhost is the whole point of the line.
+
+`blocked` outranks the address, and it is the only thing that does. A port that cannot be
+bound is still a port, so the row would read as perfectly healthy in the one state where it
+is not.
 
 ### A shell prompt is neither
 

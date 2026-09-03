@@ -89,6 +89,16 @@ max_fleet = 6
 # How close to its due date an armed card is handed to the agents, when you do not say.
 # assist = "2d"
 
+# Tell an agent that is nearly out of context to save a memory before it compacts.
+#
+# Off, deliberately. This is the half of the memory feature that types into an agent's
+# conversation without being asked — everything else about it (the sidebar section, the drag,
+# `horde memory`) works with this off. It fires once per fill-up, only under 25% remaining, and
+# goes through the bus so it lands at the agent's next prompt rather than mid-turn.
+#
+# See `horde docs memory`.
+# memory_nudge = true
+
 [triggers]
 # Off, deliberately. On, scheduled rules act while nobody is watching, which is the one switch
 # that changes what horde *is*. Turn it on once you have watched the rules behave.

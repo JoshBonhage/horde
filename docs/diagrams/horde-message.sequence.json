@@ -1,0 +1,296 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "horde send — one message, end to end",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1560,
+      800
+    ],
+    "views": [
+      {
+        "id": "the-refusal",
+        "label": "The refusal",
+        "focus": [
+          "bus",
+          "pane"
+        ],
+        "note": "The gate reads the target's state and its terminal before it writes anything."
+      },
+      {
+        "id": "back-to-the-sender",
+        "label": "Back to the sender",
+        "focus": [
+          "engine",
+          "cli",
+          "sender"
+        ],
+        "note": "queued is a successful outcome, and the sender is told why."
+      },
+      {
+        "id": "the-flush",
+        "label": "The flush",
+        "focus": [
+          "engine",
+          "bus",
+          "pane",
+          "target"
+        ],
+        "note": "A detection pass finds the agent idle, and one held message goes out."
+      }
+    ],
+    "column_fit": "spread"
+  },
+  "participants": [
+    {
+      "id": "sender",
+      "type": "external",
+      "label": "Agent A"
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "horde send"
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "Engine (rpc)"
+    },
+    {
+      "id": "bus",
+      "type": "messagebus",
+      "label": "Bus"
+    },
+    {
+      "id": "pane",
+      "type": "backend",
+      "label": "Target pane"
+    },
+    {
+      "id": "target",
+      "type": "external",
+      "label": "Agent B (reviewer)"
+    }
+  ],
+  "segments": [
+    {
+      "from": 168,
+      "to": 462,
+      "label": "Send, and refuse to type"
+    },
+    {
+      "from": 478,
+      "to": 730,
+      "label": "Flush when it is free"
+    }
+  ],
+  "messages": [
+    {
+      "id": "invoke",
+      "from": "sender",
+      "to": "cli",
+      "y": 190,
+      "label": "horde send reviewer \"take a look\"",
+      "variant": "default"
+    },
+    {
+      "id": "rpc",
+      "from": "cli",
+      "to": "engine",
+      "y": 226,
+      "label": "bus.send over the control socket",
+      "variant": "emphasis"
+    },
+    {
+      "id": "route",
+      "from": "engine",
+      "to": "bus",
+      "y": 262,
+      "label": "Bus::send",
+      "variant": "default"
+    },
+    {
+      "id": "resolve",
+      "from": "bus",
+      "to": "pane",
+      "y": 298,
+      "label": "resolve \"reviewer\", then gate",
+      "variant": "default"
+    },
+    {
+      "id": "state",
+      "from": "pane",
+      "to": "bus",
+      "y": 334,
+      "label": "blocked at a permission prompt",
+      "variant": "return"
+    },
+    {
+      "id": "hold",
+      "from": "bus",
+      "to": "engine",
+      "y": 370,
+      "label": "hold — a newline would answer it",
+      "variant": "security"
+    },
+    {
+      "id": "reply-rpc",
+      "from": "engine",
+      "to": "cli",
+      "y": 406,
+      "label": "delivery: queued",
+      "variant": "return"
+    },
+    {
+      "id": "reply-user",
+      "from": "cli",
+      "to": "sender",
+      "y": 442,
+      "label": "queued for reviewer — it is busy",
+      "variant": "return"
+    },
+    {
+      "id": "detect",
+      "from": "engine",
+      "to": "pane",
+      "y": 492,
+      "label": "detection reads the visible grid",
+      "variant": "default"
+    },
+    {
+      "id": "idle",
+      "from": "pane",
+      "to": "engine",
+      "y": 528,
+      "label": "idle, at its prompt",
+      "variant": "return"
+    },
+    {
+      "id": "flush",
+      "from": "engine",
+      "to": "bus",
+      "y": 564,
+      "label": "flush_queued — one per pass",
+      "variant": "default"
+    },
+    {
+      "id": "write-text",
+      "from": "bus",
+      "to": "pane",
+      "y": 600,
+      "label": "write \"[horde] message from …\"",
+      "variant": "emphasis"
+    },
+    {
+      "id": "arrives",
+      "from": "pane",
+      "to": "target",
+      "y": 636,
+      "label": "text lands in the raw-mode tty",
+      "variant": "emphasis"
+    },
+    {
+      "id": "write-cr",
+      "from": "bus",
+      "to": "pane",
+      "y": 672,
+      "label": "CR as its own write, 120 ms later",
+      "variant": "dashed"
+    },
+    {
+      "id": "submits",
+      "from": "pane",
+      "to": "target",
+      "y": 708,
+      "label": "reads as a keypress, not a paste",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "cli",
+      "from": 185,
+      "to": 447,
+      "type": "frontend"
+    },
+    {
+      "participant": "engine",
+      "from": 222,
+      "to": 411,
+      "type": "backend"
+    },
+    {
+      "participant": "engine",
+      "from": 487,
+      "to": 578,
+      "type": "backend"
+    },
+    {
+      "participant": "bus",
+      "from": 258,
+      "to": 375,
+      "type": "messagebus"
+    },
+    {
+      "participant": "bus",
+      "from": 559,
+      "to": 690,
+      "type": "messagebus"
+    },
+    {
+      "participant": "pane",
+      "from": 294,
+      "to": 339,
+      "type": "backend"
+    },
+    {
+      "participant": "pane",
+      "from": 487,
+      "to": 533,
+      "type": "backend"
+    },
+    {
+      "participant": "pane",
+      "from": 596,
+      "to": 713,
+      "type": "backend"
+    },
+    {
+      "participant": "target",
+      "from": 631,
+      "to": 713,
+      "type": "external"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Why it queues",
+      "items": [
+        "idle and done inject and submit — the agent is at its prompt",
+        "blocked queues: text plus a newline would answer the pending question",
+        "A pane with no agent gets the text without a newline, so it cannot execute"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "The terminal decides too",
+      "items": [
+        "A canonical tty silently discards a line past 1024 bytes on macOS",
+        "A pty master blocks on write, so one stalled agent would freeze every pane",
+        "Neither is overridable by --now; forcing the write loses the message"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "Why Enter is a separate write",
+      "items": [
+        "Bytes arriving in one read look like a paste, and the CR becomes a newline",
+        "Sent on its own 120 ms later, it reads as a keypress instead",
+        "Verified against Claude Code, which otherwise leaves the message unsent"
+      ]
+    }
+  ]
+}

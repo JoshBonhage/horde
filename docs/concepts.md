@@ -142,8 +142,16 @@ and others. horde does not launch them any differently; it watches them.
 
 What it adds is **state**: `working`, `blocked`, `done`, `idle`, `unknown`. A pane running a
 dev server or a watcher is recognised too, as a *service* rather than an agent, and rests at
-`serving`. See [agents](agents.md) for how that is determined and
-[orchestration](orchestration.md) for what you can do with it.
+`serving`. Services get their own sidebar section below the agents, tied back to the projects
+they serve by a connector in each project's own colour. See [agents](agents.md) for how that
+is determined and [orchestration](orchestration.md) for what you can do with it.
+
+### What a project remembers
+
+An agent's context does not survive a compaction, and the detail it loses is usually the part
+that took the session to earn. A project can keep **memories** — markdown notes at
+`.horde/memory/`, listed in the sidebar under the project they belong to, handed to an agent by
+dragging one onto it. See [memory](memory.md).
 
 ### Three names, one pane
 

@@ -1,0 +1,316 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "horde — daemon and client",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "attach-path",
+        "label": "Attaching a client",
+        "focus": [
+          "client",
+          "sock",
+          "engine",
+          "session",
+          "agent"
+        ],
+        "note": "The client draws frames and forwards keys; everything it shows is owned by the daemon."
+      },
+      {
+        "id": "agent-loop",
+        "label": "Agents drive horde",
+        "focus": [
+          "agent",
+          "cli",
+          "sock",
+          "engine",
+          "bus",
+          "board"
+        ],
+        "note": "An agent in a pane runs the same CLI you do, so the session is an API it can reach."
+      },
+      {
+        "id": "watching",
+        "label": "Watching the screens",
+        "focus": [
+          "session",
+          "detector",
+          "agent",
+          "memory"
+        ],
+        "note": "Detection reads the daemon's own mirror of each pane — and notices an agent about to compact."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "board",
+      "type": "backend",
+      "label": "Task board",
+      "sublabel": "compare-and-set claim",
+      "pos": [
+        400,
+        150
+      ],
+      "size": [
+        170,
+        72
+      ],
+      "tag": "per project"
+    },
+    {
+      "id": "bus",
+      "type": "messagebus",
+      "label": "Message bus",
+      "sublabel": "route, gate, inject",
+      "pos": [
+        760,
+        150
+      ],
+      "size": [
+        170,
+        72
+      ]
+    },
+    {
+      "id": "detector",
+      "type": "backend",
+      "label": "Detector",
+      "sublabel": "manifests + hooks",
+      "pos": [
+        1120,
+        150
+      ],
+      "size": [
+        170,
+        72
+      ],
+      "tag": "context-low too"
+    },
+    {
+      "id": "client",
+      "type": "frontend",
+      "label": "horde client",
+      "sublabel": "draws frames only",
+      "pos": [
+        40,
+        340
+      ],
+      "size": [
+        170,
+        72
+      ]
+    },
+    {
+      "id": "sock",
+      "type": "backend",
+      "label": "Control socket",
+      "sublabel": "one line of JSON",
+      "pos": [
+        400,
+        340
+      ],
+      "size": [
+        170,
+        72
+      ],
+      "tag": "horde.sock"
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "Engine loop",
+      "sublabel": "sole owner of Session",
+      "pos": [
+        760,
+        340
+      ],
+      "size": [
+        170,
+        72
+      ],
+      "tag": "16 ms / 150 ms"
+    },
+    {
+      "id": "session",
+      "type": "backend",
+      "label": "Panes + emulators",
+      "sublabel": "spaces → tabs → panes",
+      "pos": [
+        1120,
+        340
+      ],
+      "size": [
+        170,
+        72
+      ]
+    },
+    {
+      "id": "cli",
+      "type": "frontend",
+      "label": "horde CLI",
+      "sublabel": "horde send, task claim",
+      "pos": [
+        400,
+        530
+      ],
+      "size": [
+        170,
+        72
+      ]
+    },
+    {
+      "id": "memory",
+      "type": "database",
+      "label": "Project memory",
+      "sublabel": ".horde/memory/*.md",
+      "pos": [
+        760,
+        530
+      ],
+      "size": [
+        170,
+        72
+      ]
+    },
+    {
+      "id": "agent",
+      "type": "external",
+      "label": "Agent processes",
+      "sublabel": "Claude Code and shells",
+      "pos": [
+        1120,
+        530
+      ],
+      "size": [
+        170,
+        72
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "horde daemon — one process, no controlling terminal",
+      "wraps": [
+        "board",
+        "bus",
+        "detector",
+        "sock",
+        "engine",
+        "session"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "client-attach",
+      "from": "client",
+      "to": "sock",
+      "label": "frames + keystrokes",
+      "variant": "emphasis"
+    },
+    {
+      "id": "sock-engine",
+      "from": "sock",
+      "to": "engine",
+      "label": "one request channel",
+      "variant": "emphasis"
+    },
+    {
+      "id": "engine-session",
+      "from": "engine",
+      "to": "session",
+      "label": "apply_cmd, then tick",
+      "variant": "emphasis"
+    },
+    {
+      "id": "session-agent",
+      "from": "session",
+      "to": "agent",
+      "label": "pty master ↔ slave",
+      "variant": "emphasis",
+      "labelDy": 70
+    },
+    {
+      "id": "agent-cli",
+      "from": "agent",
+      "to": "cli",
+      "label": "agents run horde themselves",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "bottom"
+    },
+    {
+      "id": "cli-call",
+      "from": "cli",
+      "to": "sock",
+      "label": "one line per call",
+      "variant": "emphasis"
+    },
+    {
+      "id": "engine-bus",
+      "from": "engine",
+      "to": "bus",
+      "label": "route + gate",
+      "labelDy": -100
+    },
+    {
+      "id": "bus-inject",
+      "from": "bus",
+      "to": "session",
+      "label": "inject into the target pty",
+      "toSide": "top"
+    },
+    {
+      "id": "engine-board",
+      "from": "engine",
+      "to": "board",
+      "label": "claim, nudge when idle",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "session-detect",
+      "from": "session",
+      "to": "detector",
+      "label": "screen mirror, 640 ms",
+      "labelDy": -50
+    },
+    {
+      "id": "agent-memory",
+      "from": "agent",
+      "to": "memory",
+      "label": "writes what it would be sorry to lose",
+      "variant": "dashed",
+      "labelDy": 60
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "The client is disposable",
+      "items": [
+        "Emulation, layout and geometry all live in the daemon",
+        "Close the window and every pane, process and agent keeps running"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "One owner, one tick",
+      "items": [
+        "A single task owns the Session; everything else uses a channel",
+        "16 ms attached, 150 ms detached, detection every 640 ms"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Agents are clients too",
+      "items": [
+        "Every horde <noun> <verb> is one method on the same socket",
+        "So an agent can message another, claim board work, or write a note"
+      ]
+    }
+  ]
+}

@@ -1007,7 +1007,12 @@ impl Session {
     /// `repos` is read rather than refreshed: probing git costs a fork per directory, so it
     /// happens once per tick on its own slow cadence and every snapshot in that tick reports
     /// the same answer.
-    pub fn snapshot(&self, cfg: &Config, repos: &super::repo::Cache) -> Snapshot {
+    pub fn snapshot(
+        &self,
+        cfg: &Config,
+        repos: &super::repo::Cache,
+        notes: &super::memory::Store,
+    ) -> Snapshot {
         let rects: HashMap<PaneId, (Rect, Rect)> = self
             .visible_rects(cfg)
             .into_iter()
@@ -1052,6 +1057,25 @@ impl Session {
                 name: t.name.clone(),
                 panes: t.layout.panes(),
                 focused_pane: t.focused_pane,
+            })
+            .collect();
+
+        // A project's saved notes, read from the cache the tick already refreshed. `peek`
+        // rather than `get` for the same reason `repo_info` uses it: a snapshot describes the
+        // session as of this tick, and a directory read per attached client per frame is not
+        // something a sidebar row is worth.
+        let memories: Vec<crate::proto::MemoryInfo> = self
+            .spaces
+            .iter()
+            .flat_map(|s| {
+                notes.peek(&s.cwd).iter().map(|n| crate::proto::MemoryInfo {
+                    id: n.id,
+                    space: s.id,
+                    name: n.name.clone(),
+                    title: n.title.clone(),
+                    bytes: n.bytes,
+                    age: n.modified.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+                })
             })
             .collect();
 
@@ -1120,6 +1144,7 @@ impl Session {
             tasks_claimed: 0,
             cards_due: 0,
             triggers_armed: 0,
+            memories,
         }
     }
 }
@@ -1192,6 +1217,11 @@ pub struct AgentRuntime {
     /// it is not. Held here rather than re-parsed per snapshot: detection already has the
     /// lines in hand, and every reader after it has only the wire types.
     pub question: Option<crate::proto::Question>,
+    /// Where a service is answering, read off its screen while it is up.
+    ///
+    /// Held here for the same reason `question` is: detection is the one place holding both
+    /// the screen and the state, and by the time a snapshot is built the lines are gone.
+    pub endpoint: Option<String>,
     /// Counted from lifecycle hooks.
     pub activity: crate::proto::Activity,
     /// Files touched this turn. Kept as a set so a file edited five times counts once.
@@ -1202,6 +1232,20 @@ pub struct AgentRuntime {
     /// the value stops matching the moment the agent changes state, which is precisely when
     /// telling it again would be useful rather than noise.
     pub nudged_since: Option<std::time::Instant>,
+    /// When this agent was last told to save a memory, if it has been.
+    ///
+    /// A timestamp rather than a `since` key, because the thing it guards is not a state the
+    /// agent is in — it is a line on its screen that comes and goes. Cleared once the warning
+    /// has been gone *and* the cooldown has passed, so the next time it fills up earns a fresh
+    /// nudge and a status line that flickers for a tick does not: an agent's warning briefly
+    /// scrolling out of the detection window is a redraw, not a compaction. Observed in
+    /// testing as a second nudge thirty seconds after the first.
+    pub memory_nudged: Option<std::time::Instant>,
+    /// The agent's own screen is warning that it is nearly out of context.
+    ///
+    /// Read during detection, which is the one place holding the screen, and acted on in the
+    /// tick, which is the one place holding the bus.
+    pub context_low: bool,
     /// The `since` value at which an alert about this agent was last sent outside horde.
     ///
     /// Same key as `nudged_since`, for the same reason: one wait earns one notification. An
@@ -1223,6 +1267,7 @@ impl AgentRuntime {
             reason: self.reason.clone(),
             activity: self.activity.clone(),
             question: self.question.clone(),
+            endpoint: self.endpoint.clone(),
         }
     }
 

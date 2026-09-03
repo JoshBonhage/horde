@@ -135,6 +135,8 @@ pub struct StatusBar<'a> {
     pub theme: &'a Theme,
     pub mode: Mode,
     pub prefix: String,
+    /// A note picked up in the sidebar and not yet dropped.
+    pub carrying: Option<crate::client::Carry>,
 }
 
 impl Widget for StatusBar<'_> {
@@ -147,6 +149,33 @@ impl Widget for StatusBar<'_> {
         let panel = Style::default().bg(color(t.ui.panel_bg));
 
         let mut left: Vec<Span<'static>> = Vec::new();
+
+        // A drag in flight owns the bar. Everything else here is a standing count you can
+        // read at leisure; this is a gesture you are in the middle of, and it has to say both
+        // what you picked up and what you are about to drop it on — a drag whose target you
+        // only learn after releasing is a guess, and this one puts text in an agent's context.
+        if let Some(c) = &self.carrying {
+            left.push(chip(" CARRYING ", t.ui.accent_alt, t));
+            left.push(Span::styled(format!(" ◈ {} ", c.name), panel.fg(color(t.ui.text))));
+            match &c.over {
+                Some((_, name)) => {
+                    left.push(Span::styled("⇢ ".to_string(), panel.fg(color(t.ui.text_faint))));
+                    left.push(Span::styled(
+                        name.clone(),
+                        panel.fg(color(t.ui.done)).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                // Named as a state you are in, not as an error: you have not done anything
+                // wrong yet, you are just not over anything.
+                None => left.push(Span::styled(
+                    "drop on an agent · esc to cancel".to_string(),
+                    panel.fg(color(t.ui.text_faint)),
+                )),
+            }
+            let lw: usize = left.iter().map(|s| s.content.chars().count()).sum();
+            put_line(buf, area.x, area.y, lw.min(area.width as usize) as u16, Line::from(left));
+            return;
+        }
 
         // The mode chip is the most important thing on this bar: without it there is no
         // feedback that the prefix key registered.
@@ -322,6 +351,7 @@ mod tests {
                     reason: "t".into(),
                     activity: Default::default(),
                     question: None,
+                    endpoint: None,
                 }),                spawned_by: None,
                 exited: false,
                 scroll_offset: 0,
@@ -374,6 +404,7 @@ mod tests {
             cards_due: 0,
             triggers_armed: 0,
             recents: Vec::new(),
+            memories: Vec::new(),
         }
     }
 
@@ -393,7 +424,8 @@ mod tests {
         let area = TRect::new(0, 0, w, 1);
         let mut buf = Buffer::empty(area);
         let theme = Theme::horde();
-        StatusBar { snap, theme: &theme, mode, prefix: "ctrl+b".into() }.render(area, &mut buf);
+        StatusBar { snap, theme: &theme, mode, prefix: "ctrl+b".into(), carrying: None }
+            .render(area, &mut buf);
         buf
     }
 

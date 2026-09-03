@@ -413,6 +413,7 @@ mod tests {
                 reason: "t".into(),
                 activity: Default::default(),
                 question: None,
+                endpoint: None,
             }),            spawned_by: None,
             exited: false,
             scroll_offset: 0,
@@ -461,6 +462,7 @@ mod tests {
             cards_due: 0,
             triggers_armed: 0,
             recents: Vec::new(),
+            memories: Vec::new(),
         }
     }
 
