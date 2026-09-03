@@ -18,7 +18,7 @@ pub mod settings;
 pub mod ui;
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Stdout;
+use std::io::{BufWriter, Stdout, Write as _};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -519,6 +519,10 @@ pub struct App {
     /// happens to overwrite that exact cell. `/clear` was the manual way out; this is the
     /// automatic one.
     pub needs_clear: bool,
+    /// Where the cursor goes and, when it belongs to a program rather than to horde's own
+    /// editor, what shape it asked for. Recorded during render and written out after the
+    /// frame rather than handed to ratatui -- see the draw loop.
+    pub cursor_at: Option<(u16, u16, Option<u8>)>,
     /// Screen row to menu-item index, recorded during render for mouse hit-testing.
     pub menu_hits: Vec<(u16, usize)>,
     /// Rect the menu occupies, so clicks outside it can dismiss it.
@@ -609,6 +613,7 @@ impl App {
             greeted: false,
             warned_version: false,
             needs_clear: false,
+            cursor_at: None,
             menu_hits: Vec::new(),
             menu_rect: crate::proto::Rect::default(),
             settings_cat_hits: Vec::new(),
@@ -816,7 +821,23 @@ pub async fn attach(cfg: Config, warnings: Vec<String>) -> Result<()> {
     result
 }
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+/// One frame's escape stream can run to tens of kilobytes. `std::io::Stdout` is a
+/// `LineWriter` with a 1KB buffer, so writing a frame through it unbuffered means dozens of
+/// `write` syscalls, each one a partial repaint the terminal renders on its own schedule --
+/// which is what a sweeping, torn frame looks like. Buffer the whole frame and flush it once.
+type Term = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
+/// Big enough that no realistic frame reaches it, so a frame is one flush.
+const OUT_BUF: usize = 1 << 20;
+
+/// Begin synchronized output, then hide the cursor.
+///
+/// Terminals that understand `?2026` hold the whole frame back and present it in one go, so a
+/// clear-and-repaint never shows as a flash. Hiding the cursor covers the ones that do not:
+/// without it the hardware cursor visibly walks the screen, stopping at every run the diff
+/// writes. Both are the frame's opening bytes, before ratatui writes a single cell.
+const FRAME_BEGIN: &[u8] = b"\x1b[?2026h\x1b[?25l";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
 
 fn setup_terminal() -> Result<(Term, Vec<String>)> {
     enable_raw_mode()?;
@@ -833,6 +854,7 @@ fn setup_terminal() -> Result<(Term, Vec<String>)> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?2026l\x1b[0 q\x1b[?25h");
         let _ = out.execute(DisableBracketedPaste);
         let _ = out.execute(DisableMouseCapture);
         let _ = out.execute(LeaveAlternateScreen);
@@ -840,11 +862,15 @@ fn setup_terminal() -> Result<(Term, Vec<String>)> {
         default_hook(info);
     }));
 
-    Ok((Terminal::new(CrosstermBackend::new(stdout))?, notes))
+    let out = BufWriter::with_capacity(OUT_BUF, stdout);
+    Ok((Terminal::new(CrosstermBackend::new(out))?, notes))
 }
 
 fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
+    // End any frame still open and hand the cursor shape back to the shell -- horde only
+    // borrowed it from whichever pane last asked for one.
+    term.backend_mut().write_all(b"\x1b[?2026l\x1b[0 q")?;
     // Pictures are not part of the screen horde is about to leave, so leaving without taking
     // them down leaves them over whatever shell comes back.
     if kitty::supported() {
@@ -895,6 +921,9 @@ async fn run_loop(
     let mut anim = tokio::time::interval(beat);
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut needs_draw = true;
+    // 0 is "whatever the host was using", which is what the cursor still is before the first
+    // frame, and never a code any pane asks for.
+    let mut last_shape: u8 = 0;
 
     loop {
         // Arriving at or leaving the start screen starts and stops the walk across the
@@ -919,6 +948,7 @@ async fn run_loop(
             // `resize` to the size it already is reaches the same reset — clear the viewport,
             // reset the back buffer — and on a fullscreen viewport it has nothing to restore,
             // so it never asks.
+            term.backend_mut().write_all(FRAME_BEGIN)?;
             if std::mem::take(&mut app.needs_clear) {
                 let size = term.size()?;
                 term.resize(size.into())?;
@@ -933,6 +963,25 @@ async fn run_loop(
                 let _ = app.placed.sync(&mut std::io::stdout(), &want);
                 app.images = want;
             }
+            // Last, while the cursor is still hidden, and shown only once it is where it
+            // belongs. ratatui's own `set_cursor_position` shows first and moves second, which
+            // leaves the cursor visible for one round trip at whichever cell the diff happened
+            // to write last -- a sidebar spinner, usually, not the prompt. Pictures go out
+            // above, so this closes over them too.
+            let cursor = app.cursor_at;
+            let out = term.backend_mut();
+            if let Some((x, y, shape)) = cursor {
+                // Shape only on a change: DECSCUSR restarts the blink phase, so re-sending it
+                // every frame gives a blinking cursor that never gets far enough into its
+                // cycle to blink. `None` is horde's own caret, which asks for no shape at all.
+                if let Some(shape) = shape.filter(|s| *s != last_shape) {
+                    write!(out, "\x1b[{shape} q")?;
+                    last_shape = shape;
+                }
+                write!(out, "\x1b[{};{}H\x1b[?25h", y + 1, x + 1)?;
+            }
+            out.write_all(SYNC_END)?;
+            out.flush()?;
             needs_draw = false;
         }
         if app.quit {

@@ -639,8 +639,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             // open that is the prompt, not the text — put it in both places and the one you
             // are actually editing is anybody's guess.
             if vim_mode.prompt().is_none() {
-                if let Some(pos) = cursor_at {
-                    f.set_cursor_position(pos);
+                if let Some((x, y)) = cursor_at {
+                    app.cursor_at = Some((x, y, None));
                 }
             }
         }
@@ -719,7 +719,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     )),
                 );
                 let cx = x + 1 + typed.chars().count() as u16;
-                f.set_cursor_position((cx.min(x + col.saturating_sub(1)), foot));
+                app.cursor_at = Some((cx.min(x + col.saturating_sub(1)), foot, None));
             }
             // What is wrong with the line you are on outranks the list of keys: the keys do
             // not change, and this does. Nowhere else has room for the message — the margin
@@ -982,7 +982,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     // Panes
-    let mut cursor_at: Option<(u16, u16)> = None;
+    let mut cursor_at: Option<(u16, u16, Option<u8>)> = None;
     for pane in &snap.panes {
         if pane.cell.is_empty() {
             continue; // not on screen
@@ -1032,7 +1032,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if focused {
             if let Some(c) = app.cursors.get(&pane.id) {
                 if c.visible && c.x < pane.content.w && c.y < pane.content.h {
-                    cursor_at = Some((pane.content.x + c.x, pane.content.y + c.y));
+                    cursor_at =
+                        Some((pane.content.x + c.x, pane.content.y + c.y, Some(c.shape)));
                 }
             }
         }
@@ -1147,10 +1148,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     overlays::toasts(f, area, app);
 
-    // Only show a cursor when keystrokes actually reach a pane.
-    match (cursor_at, &app.mode) {
-        (Some((x, y)), Mode::Terminal) => f.set_cursor_position((x, y)),
-        _ => {}
+    // Only show a pane's cursor when keystrokes actually reach it. Recorded rather than
+    // handed to `f.set_cursor_position`, because the draw loop places it itself -- while it is
+    // still hidden -- after the frame's cells are on the wire.
+    if let (Some(c), Mode::Terminal) = (cursor_at, &app.mode) {
+        app.cursor_at = Some(c);
     }
 }
 
@@ -1721,7 +1723,10 @@ mod frame_tests {
         let (w, h) = (60u16, 24u16);
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
-        let cursor = term.get_cursor_position().unwrap();
+        // Off `app` rather than off the terminal: the draw loop places the cursor itself,
+        // after the frame and while it is still hidden, so ratatui is never told about it.
+        let (cx, cy, _) = app.cursor_at.expect("the editor put a cursor somewhere");
+        let cursor = ratatui::layout::Position { x: cx, y: cy };
         let buf = term.backend().buffer().clone();
         let rows: Vec<String> = (0..h)
             .map(|y| {

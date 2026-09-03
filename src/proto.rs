@@ -23,7 +23,7 @@ pub type PaneId = u32;
 /// `ServerFrame`, is a wire-format change even though `serde(default)` makes it look additive.
 /// The attach handshake compares this number over newline JSON, before either side switches to
 /// postcard, which is why it can report the mismatch instead of failing to parse it.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 // ---------------------------------------------------------------------------
 // Control channel
@@ -160,6 +160,11 @@ pub struct CursorPos {
     pub y: u16,
     /// False when the pane hides its cursor, or when the pane isn't focused.
     pub visible: bool,
+    /// DECSCUSR code the pane asked for: 1/2 block, 3/4 underline, 5/6 bar (odd blinks).
+    ///
+    /// Carried through so a pane that asked for a bar gets a bar. A multiplexer that always
+    /// draws a block is the most visible way it stops feeling like the terminal underneath.
+    pub shape: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,7 +1337,7 @@ mod digest_tests {
     /// and the only defence is the handshake — so the version has to move with the shape.
     #[test]
     fn the_protocol_version_covers_the_current_wire_shape() {
-        assert_eq!(PROTOCOL_VERSION, 20, "bump this whenever a wire struct or enum changes");
+        assert_eq!(PROTOCOL_VERSION, 21, "bump this whenever a wire struct or enum changes");
     }
 
     /// The assert above is a reminder, not a detector. It fires when you *do* bump the

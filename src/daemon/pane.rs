@@ -746,7 +746,7 @@ impl Pane {
         let Some(pty) = self.pty() else {
             // A doc has no cursor. Reporting one would put a block on a file nobody is
             // typing into.
-            return CursorPos { x: 0, y: 0, visible: false };
+            return CursorPos { x: 0, y: 0, visible: false, shape: 0 };
         };
         let grid = pty.term.grid();
         let Point { line, column } = grid.cursor.point;
@@ -759,6 +759,7 @@ impl Pane {
             visible: pty.term.mode().contains(TermMode::SHOW_CURSOR)
                 && y >= 0
                 && y < self.rows as i32,
+            shape: decscusr(pty.term.cursor_style()),
         }
     }
 
@@ -1284,9 +1285,48 @@ pub fn default_shell() -> String {
     }
 }
 
+/// The DECSCUSR code for a pane's cursor style, so the client can ask the host terminal for
+/// the same shape the program inside the pane asked for.
+///
+/// `HollowBlock` and `Hidden` have no DECSCUSR code of their own — a hollow block is what a
+/// terminal already draws for an unfocused cursor, and a hidden one is handled by
+/// `CursorPos::visible`, so both fall back to a block.
+fn decscusr(style: alacritty_terminal::vte::ansi::CursorStyle) -> u8 {
+    use alacritty_terminal::vte::ansi::CursorShape::*;
+    let base = match style.shape {
+        Block | HollowBlock | Hidden => 1,
+        Underline => 3,
+        Beam => 5,
+    };
+    if style.blinking {
+        base
+    } else {
+        base + 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape a pane asks for is the shape the host terminal is asked for.
+    ///
+    /// Odd codes blink and even ones are steady, which is the opposite of what reading
+    /// "blinking" as a flag suggests, so it is worth pinning down.
+    #[test]
+    fn cursor_styles_map_onto_their_decscusr_codes() {
+        use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
+        let code = |shape, blinking| decscusr(CursorStyle { shape, blinking });
+        assert_eq!(code(CursorShape::Block, true), 1);
+        assert_eq!(code(CursorShape::Block, false), 2);
+        assert_eq!(code(CursorShape::Underline, true), 3);
+        assert_eq!(code(CursorShape::Underline, false), 4);
+        assert_eq!(code(CursorShape::Beam, true), 5);
+        assert_eq!(code(CursorShape::Beam, false), 6);
+        // No DECSCUSR code of their own; a block is the honest fallback.
+        assert_eq!(code(CursorShape::HollowBlock, false), 2);
+        assert_eq!(code(CursorShape::Hidden, false), 2);
+    }
 
     /// A program that asks the terminal what colour it is has to be told the truth.
     ///
