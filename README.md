@@ -67,13 +67,17 @@ cargo install horde
 horde
 ```
 
-That is the multiplexer, and it is complete on its own. Add the **kit** when you want notes, a kanban board, a file editor with language servers, and inline images:
+That is the multiplexer, and it is complete on its own. Everything above this line, and everything in [Agents that work together](#agents-that-work-together), works with that install.
+
+### The kit
+
+Some of what is below is an optional layer called the **kit**: a kanban board (`ctrl+b T`), a vault of notes agents can write to, a file editor with language servers, a dependency graph, and inline images. It ships in the same binary behind a build flag:
 
 ```sh
 cargo install horde --features full
 ```
 
-Both builds read the same config. `[kit] enabled = true` turns the kit on in a plain build, `false` turns it off in a full one, and neither needs a reinstall. [docs/kit.md](docs/kit.md) explains the split.
+Both builds read the same config. `[kit] enabled = true` turns the kit on in a plain build, `false` turns it off in a full one, and neither needs a reinstall. Sections that need it say so at the top. [docs/kit.md](docs/kit.md) explains why it is a flag and not a plugin.
 
 <details>
 <summary><b>Installing from a clone</b></summary>
@@ -327,6 +331,8 @@ Tabs are layouts inside a project. Use them to separate views like `agents`, `lo
 ---
 
 ## Your own board, next to theirs
+
+> **Kit.** This needs `cargo install horde --features full`, or `[kit] enabled = true`. See [Install](#install).
 
 `ctrl+b T` opens a kanban: columns you name, cards with due dates, tags, descriptions and a comment thread. Drag a card with the mouse, or `H` and `L` it across. `v` swaps the columns for a flat list sorted by what is due next.
 
