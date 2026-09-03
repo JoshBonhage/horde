@@ -30,6 +30,15 @@ pub fn config_dir() -> PathBuf {
     base.join("horde")
 }
 
+/// Where user-written themes live: one `<name>.toml` per theme.
+///
+/// A directory rather than more `[theme]` keys in `config.toml` because a theme is a whole
+/// palette, it is the kind of thing people copy from each other, and one file you can send
+/// somebody beats forty lines they have to splice into a config they already have.
+pub fn themes_dir() -> PathBuf {
+    config_dir().join("themes")
+}
+
 pub fn socket_path() -> PathBuf {
     std::env::var_os("HORDE_SOCKET")
         .map(PathBuf::from)
@@ -868,12 +877,12 @@ impl Config {
         }
 
         if let Some(name) = &raw.theme.name {
-            match Theme::by_name(name) {
-                Some(t) => cfg.theme = t,
-                None => warnings.push(format!(
-                    "unknown theme {name:?}; known themes: {}",
-                    Theme::names().join(", ")
-                )),
+            // `load` rather than `by_name`: a theme file with a bad colour in it has to say
+            // so. Swallowed as "unknown theme" it reads as a typo in the name, and you go
+            // looking in the wrong file.
+            match Theme::load(name) {
+                Ok(t) => cfg.theme = t,
+                Err(e) => warnings.push(e),
             }
         }
         cfg.theme.apply_overrides(&raw.theme.custom);

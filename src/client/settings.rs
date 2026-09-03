@@ -285,8 +285,8 @@ pub fn bump(cfg: &mut Config, field: Field, delta: i32) -> (String, Value) {
             let next = wrap(cur, names.len(), delta);
             // Rebuilding from the palette drops any [theme.custom] overrides held in
             // memory; they are reapplied when the config is next loaded from disk.
-            cfg.theme = Theme::by_name(names[next]).unwrap_or_else(Theme::horde);
-            ("theme.name".into(), Value::Str(names[next].into()))
+            cfg.theme = Theme::by_name(&names[next]).unwrap_or_else(Theme::horde);
+            ("theme.name".into(), Value::Str(names[next].clone()))
         }
         Field::Sidebar => {
             cfg.sidebar = !cfg.sidebar;
@@ -510,7 +510,9 @@ prefix = \"ctrl+b\"
 scrollback = 10000
 
 [theme]
-# horde · tokyo-night · catppuccin · gruvbox · terminal
+# horde · tokyo-night · catppuccin · gruvbox · nord · rose-pine
+# rose-pine-dawn (light) · solarized-light (light) · terminal
+# ...or any theme of your own: `horde theme edit gruvbox --as mine`
 name = \"horde\"
 
 # [theme.custom]

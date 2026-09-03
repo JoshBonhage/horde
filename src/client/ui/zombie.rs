@@ -209,7 +209,7 @@ pub fn palette(t: &Theme) -> Palette {
     // background. Pulled toward the ink and then slightly back toward the surface, it stops
     // reading as a health indicator and starts reading as something that died a while ago.
     let skin = mix(mix(t.ui.ok, ink, 0.3), t.ui.bg, 0.2);
-    let cloth = mix(t.ui.text_faint, ink, 0.2);
+    let cloth = separate(mix(t.ui.text_faint, ink, 0.2), skin, dark, lit, 0.06);
     Palette::new(
         t.ui.bg,
         vec![
@@ -229,6 +229,36 @@ pub fn palette(t: &Theme) -> Palette {
             ('h', mix(t.ui.border, ink, 0.25)),
         ],
     )
+}
+
+/// Push `c` away from `from` until their luminance differs by at least `want`.
+///
+/// The figure is built out of two theme colours -- `ok` for flesh, `text_faint` for cloth --
+/// that no theme promises to keep apart. Most keep them apart by accident; solarized-light
+/// puts an olive green and a warm grey within a hundredth of each other, and the zombie comes
+/// out a single-coloured blob. A theme somebody writes themselves has nothing checking it at
+/// all, so this guarantees the gap rather than hoping for it.
+///
+/// Away from whichever pole is further, so the nudge never walks the colour into the
+/// background it also has to stay legible against.
+fn separate(c: Rgb, from: Rgb, dark: Rgb, lit: Rgb, want: f32) -> Rgb {
+    let lum = |c: Rgb| (0.2126 * c.r as f32 + 0.7152 * c.g as f32 + 0.0722 * c.b as f32) / 255.0;
+    let gap = lum(c) - lum(from);
+    if gap.abs() >= want {
+        return c;
+    }
+    // Toward the pole `from` is furthest from, so the two move apart rather than together.
+    let toward = if (lum(from) - lum(dark)).abs() > (lum(from) - lum(lit)).abs() { dark } else { lit };
+    // Enough to clear `want` with room over, then stop: this is a legibility floor, not a
+    // restyle, and a colour dragged all the way to a pole is no longer the theme's.
+    let mut out = c;
+    for step in 1..=8 {
+        out = mix(c, toward, step as f32 * 0.08);
+        if (lum(out) - lum(from)).abs() >= want {
+            break;
+        }
+    }
+    out
 }
 
 /// The tall figure: 14 × 20 pixels, which is 14 columns by 10 rows of cells.

@@ -375,6 +375,205 @@ impl Theme {
         t.derive_syntax()
     }
 
+
+    pub fn nord() -> Theme {
+        let mut t = Theme::horde();
+        t.name = "nord".into();
+        t.ansi = [
+            rgb(0x3b, 0x42, 0x52),
+            rgb(0xbf, 0x61, 0x6a),
+            rgb(0xa3, 0xbe, 0x8c),
+            rgb(0xeb, 0xcb, 0x8b),
+            rgb(0x81, 0xa1, 0xc1),
+            rgb(0xb4, 0x8e, 0xad),
+            rgb(0x88, 0xc0, 0xd0),
+            rgb(0xe5, 0xe9, 0xf0),
+            rgb(0x4c, 0x56, 0x6a),
+            rgb(0xd0, 0x87, 0x70),
+            rgb(0xb9, 0xd0, 0xa4),
+            rgb(0xf0, 0xd8, 0xa8),
+            rgb(0x9a, 0xb6, 0xd4),
+            rgb(0xc9, 0xa8, 0xc4),
+            rgb(0x8f, 0xbc, 0xbb),
+            rgb(0xec, 0xef, 0xf4),
+        ];
+        t.fg = rgb(0xd8, 0xde, 0xe9);
+        t.bg = rgb(0x2e, 0x34, 0x40);
+        t.cursor = rgb(0x88, 0xc0, 0xd0);
+        t.ui.accent = rgb(0x88, 0xc0, 0xd0);
+        t.ui.accent_alt = rgb(0x81, 0xa1, 0xc1);
+        t.ui.bg = rgb(0x2e, 0x34, 0x40);
+        t.ui.panel_bg = rgb(0x29, 0x2e, 0x39);
+        t.ui.title_bg = rgb(0x3b, 0x42, 0x52);
+        t.ui.text = rgb(0xd8, 0xde, 0xe9);
+        t.ui.text_dim = rgb(0x9b, 0xa7, 0xbb);
+        t.ui.text_faint = rgb(0x66, 0x72, 0x86);
+        t.ui.border = rgb(0x3b, 0x42, 0x52);
+        t.ui.border_focus = rgb(0x88, 0xc0, 0xd0);
+        t.ui.working = rgb(0xeb, 0xcb, 0x8b);
+        t.ui.blocked = rgb(0xbf, 0x61, 0x6a);
+        t.ui.done = rgb(0xa3, 0xbe, 0x8c);
+        t.ui.idle = rgb(0x66, 0x72, 0x86);
+        t.ui.unknown = rgb(0x4c, 0x56, 0x6a);
+        t.ui.serving = rgb(0x81, 0xa1, 0xc1);
+        t.ui.ok = rgb(0xa3, 0xbe, 0x8c);
+        t.ui.warn = rgb(0xeb, 0xcb, 0x8b);
+        t.ui.error = rgb(0xbf, 0x61, 0x6a);
+        t.ui.selection = rgb(0x43, 0x4c, 0x5e);
+        t.derive_syntax()
+    }
+
+    pub fn rose_pine() -> Theme {
+        let mut t = Theme::horde();
+        t.name = "rose-pine".into();
+        t.ansi = [
+            rgb(0x26, 0x23, 0x3a),
+            rgb(0xeb, 0x6f, 0x92),
+            rgb(0x31, 0x74, 0x8f),
+            rgb(0xf6, 0xc1, 0x77),
+            rgb(0x9c, 0xcf, 0xd8),
+            rgb(0xc4, 0xa7, 0xe7),
+            rgb(0xeb, 0xbc, 0xba),
+            rgb(0xe0, 0xde, 0xf4),
+            rgb(0x6e, 0x6a, 0x86),
+            rgb(0xf2, 0x8a, 0xa8),
+            rgb(0x3f, 0x93, 0xb3),
+            rgb(0xf9, 0xd0, 0x99),
+            rgb(0xb5, 0xdf, 0xe6),
+            rgb(0xd6, 0xbe, 0xf2),
+            rgb(0xf2, 0xcd, 0xcb),
+            rgb(0xf0, 0xef, 0xfa),
+        ];
+        t.fg = rgb(0xe0, 0xde, 0xf4);
+        t.bg = rgb(0x19, 0x17, 0x24);
+        t.cursor = rgb(0xeb, 0xbc, 0xba);
+        t.ui.accent = rgb(0xeb, 0xbc, 0xba);
+        t.ui.accent_alt = rgb(0x9c, 0xcf, 0xd8);
+        t.ui.bg = rgb(0x19, 0x17, 0x24);
+        t.ui.panel_bg = rgb(0x13, 0x11, 0x1c);
+        t.ui.title_bg = rgb(0x26, 0x23, 0x3a);
+        t.ui.text = rgb(0xe0, 0xde, 0xf4);
+        t.ui.text_dim = rgb(0x90, 0x8c, 0xaa);
+        t.ui.text_faint = rgb(0x6e, 0x6a, 0x86);
+        t.ui.border = rgb(0x26, 0x23, 0x3a);
+        t.ui.border_focus = rgb(0xeb, 0xbc, 0xba);
+        t.ui.working = rgb(0xf6, 0xc1, 0x77);
+        t.ui.blocked = rgb(0xeb, 0x6f, 0x92);
+        t.ui.done = rgb(0x9c, 0xcf, 0xd8);
+        t.ui.idle = rgb(0x6e, 0x6a, 0x86);
+        t.ui.unknown = rgb(0x55, 0x51, 0x6b);
+        t.ui.serving = rgb(0xc4, 0xa7, 0xe7);
+        t.ui.ok = rgb(0x9c, 0xcf, 0xd8);
+        t.ui.warn = rgb(0xf6, 0xc1, 0x77);
+        t.ui.error = rgb(0xeb, 0x6f, 0x92);
+        t.ui.selection = rgb(0x2a, 0x27, 0x3f);
+        t.derive_syntax()
+    }
+
+    /// The first light theme horde has had.
+    ///
+    /// Light is not dark with the two ends swapped. Three things have to be re-decided rather
+    /// than inverted: `text_faint` has to stay *readable* on paper where a dark theme can let
+    /// it fall away to nothing, `selection` has to darken the ground instead of lightening
+    /// it, and the ANSI normals have to be the darker halves of each hue or a yellow string
+    /// on a near-white background is a blank line.
+    pub fn rose_pine_dawn() -> Theme {
+        let mut t = Theme::horde();
+        t.name = "rose-pine-dawn".into();
+        t.ansi = [
+            rgb(0xf2, 0xe9, 0xe1),
+            rgb(0xb4, 0x63, 0x7a),
+            rgb(0x28, 0x69, 0x83),
+            rgb(0xea, 0x9d, 0x34),
+            rgb(0x56, 0x94, 0x9f),
+            rgb(0x90, 0x7a, 0xa9),
+            rgb(0xd7, 0x82, 0x7e),
+            rgb(0x57, 0x52, 0x79),
+            rgb(0x9d, 0x8b, 0x8b),
+            rgb(0xc4, 0x76, 0x8c),
+            rgb(0x35, 0x7b, 0x95),
+            rgb(0xf0, 0xaf, 0x55),
+            rgb(0x6b, 0xa6, 0xb1),
+            rgb(0xa2, 0x8c, 0xbb),
+            rgb(0xe2, 0x95, 0x91),
+            rgb(0x57, 0x52, 0x79),
+        ];
+        t.fg = rgb(0x57, 0x52, 0x79);
+        t.bg = rgb(0xfa, 0xf4, 0xed);
+        t.cursor = rgb(0xd7, 0x82, 0x7e);
+        t.ui.accent = rgb(0xd7, 0x82, 0x7e);
+        t.ui.accent_alt = rgb(0x28, 0x69, 0x83);
+        t.ui.bg = rgb(0xfa, 0xf4, 0xed);
+        t.ui.panel_bg = rgb(0xff, 0xfa, 0xf3);
+        t.ui.title_bg = rgb(0xf2, 0xe9, 0xe1);
+        t.ui.text = rgb(0x57, 0x52, 0x79);
+        t.ui.text_dim = rgb(0x79, 0x73, 0x93);
+        // Deliberately darker than a dark theme's faint. On paper, "barely there" and
+        // "illegible" are a few percent apart.
+        t.ui.text_faint = rgb(0x9d, 0x8b, 0x8b);
+        t.ui.border = rgb(0xdf, 0xd9, 0xd2);
+        t.ui.border_focus = rgb(0xd7, 0x82, 0x7e);
+        t.ui.working = rgb(0xea, 0x9d, 0x34);
+        t.ui.blocked = rgb(0xb4, 0x63, 0x7a);
+        t.ui.done = rgb(0x28, 0x69, 0x83);
+        t.ui.idle = rgb(0x9d, 0x8b, 0x8b);
+        t.ui.unknown = rgb(0xb5, 0xa9, 0xa9);
+        t.ui.serving = rgb(0x56, 0x94, 0x9f);
+        t.ui.ok = rgb(0x28, 0x69, 0x83);
+        t.ui.warn = rgb(0xea, 0x9d, 0x34);
+        t.ui.error = rgb(0xb4, 0x63, 0x7a);
+        // Darker than the page, not lighter: on light ground a highlight is a shadow.
+        t.ui.selection = rgb(0xea, 0xdf, 0xd4);
+        t.derive_syntax()
+    }
+
+    pub fn solarized_light() -> Theme {
+        let mut t = Theme::horde();
+        t.name = "solarized-light".into();
+        t.ansi = [
+            rgb(0x07, 0x36, 0x42),
+            rgb(0xdc, 0x32, 0x2f),
+            rgb(0x85, 0x99, 0x00),
+            rgb(0xb5, 0x89, 0x00),
+            rgb(0x26, 0x8b, 0xd2),
+            rgb(0xd3, 0x36, 0x82),
+            rgb(0x2a, 0xa1, 0x98),
+            rgb(0xee, 0xe8, 0xd5),
+            rgb(0x58, 0x6e, 0x75),
+            rgb(0xcb, 0x4b, 0x16),
+            rgb(0x93, 0xa1, 0xa1),
+            rgb(0x83, 0x94, 0x96),
+            rgb(0x65, 0x7b, 0x83),
+            rgb(0x6c, 0x71, 0xc4),
+            rgb(0x35, 0xb6, 0xac),
+            rgb(0xfd, 0xf6, 0xe3),
+        ];
+        t.fg = rgb(0x65, 0x7b, 0x83);
+        t.bg = rgb(0xfd, 0xf6, 0xe3);
+        t.cursor = rgb(0x26, 0x8b, 0xd2);
+        t.ui.accent = rgb(0x26, 0x8b, 0xd2);
+        t.ui.accent_alt = rgb(0x2a, 0xa1, 0x98);
+        t.ui.bg = rgb(0xfd, 0xf6, 0xe3);
+        t.ui.panel_bg = rgb(0xee, 0xe8, 0xd5);
+        t.ui.title_bg = rgb(0xe4, 0xdd, 0xc8);
+        t.ui.text = rgb(0x07, 0x36, 0x42);
+        t.ui.text_dim = rgb(0x58, 0x6e, 0x75);
+        t.ui.text_faint = rgb(0x93, 0xa1, 0xa1);
+        t.ui.border = rgb(0xdc, 0xd5, 0xc0);
+        t.ui.border_focus = rgb(0x26, 0x8b, 0xd2);
+        t.ui.working = rgb(0xb5, 0x89, 0x00);
+        t.ui.blocked = rgb(0xdc, 0x32, 0x2f);
+        t.ui.done = rgb(0x85, 0x99, 0x00);
+        t.ui.idle = rgb(0x93, 0xa1, 0xa1);
+        t.ui.unknown = rgb(0xb0, 0xba, 0xba);
+        t.ui.serving = rgb(0x2a, 0xa1, 0x98);
+        t.ui.ok = rgb(0x85, 0x99, 0x00);
+        t.ui.warn = rgb(0xb5, 0x89, 0x00);
+        t.ui.error = rgb(0xdc, 0x32, 0x2f);
+        t.ui.selection = rgb(0xe4, 0xdd, 0xc8);
+        t.derive_syntax()
+    }
+
     /// Follow the host terminal's own ANSI palette. Cell colors that are still "default"
     /// are passed through untouched so the pane looks exactly as it would outside horde.
     pub fn terminal() -> Theme {
@@ -400,21 +599,87 @@ impl Theme {
         self.space_accent_overrides[i].unwrap_or(self.ansi[ACCENT_SLOTS[i]])
     }
 
-    pub fn by_name(name: &str) -> Option<Theme> {
-        Some(
-            match name {
-                "horde" => Theme::horde(),
-                "tokyo-night" => Theme::tokyo_night(),
-                "catppuccin" => Theme::catppuccin(),
-                "gruvbox" => Theme::gruvbox(),
-                "terminal" => Theme::terminal(),
-                _ => return None,
-            }
-        )
+    /// A theme compiled into horde. Never touches the disk.
+    ///
+    /// Separate from [`Theme::by_name`] because a theme file's `base` must resolve to a
+    /// built-in: letting one file base itself on another is a cycle waiting to happen, and
+    /// nobody has asked for it.
+    pub fn builtin(name: &str) -> Option<Theme> {
+        Some(match name {
+            "horde" => Theme::horde(),
+            "tokyo-night" => Theme::tokyo_night(),
+            "catppuccin" => Theme::catppuccin(),
+            "gruvbox" => Theme::gruvbox(),
+            "nord" => Theme::nord(),
+            "rose-pine" => Theme::rose_pine(),
+            "rose-pine-dawn" => Theme::rose_pine_dawn(),
+            "solarized-light" => Theme::solarized_light(),
+            "terminal" => Theme::terminal(),
+            _ => return None,
+        })
     }
 
-    pub fn names() -> &'static [&'static str] {
-        &["horde", "tokyo-night", "catppuccin", "gruvbox", "terminal"]
+    /// A theme by name: a built-in, or one of the user's own from `themes/`.
+    ///
+    /// Built-ins win. Someone who writes `gruvbox.toml` gets the bundled gruvbox and a
+    /// warning from `named`, rather than a theme that silently is not the one everyone else
+    /// means by that word.
+    pub fn by_name(name: &str) -> Option<Theme> {
+        Theme::builtin(name).or_else(|| Theme::from_file(name).ok().flatten())
+    }
+
+    /// A theme by name, with a sentence to print when it does not load.
+    ///
+    /// `by_name` swallows a broken theme file as "not found", which is right for the places
+    /// that only want a palette and wrong for config loading: a typo in a colour should say
+    /// which line, not silently leave you on the default and let you wonder.
+    pub fn load(name: &str) -> Result<Theme, String> {
+        if let Some(t) = Theme::builtin(name) {
+            return Ok(t);
+        }
+        match Theme::from_file(name) {
+            Ok(Some(t)) => Ok(t),
+            Err(e) => Err(e),
+            Ok(None) => Err(format!(
+                "unknown theme {name:?}; known themes: {}",
+                Theme::names().join(", ")
+            )),
+        }
+    }
+
+    pub fn builtin_names() -> &'static [&'static str] {
+        &[
+            "horde",
+            "tokyo-night",
+            "catppuccin",
+            "gruvbox",
+            "nord",
+            "rose-pine",
+            "rose-pine-dawn",
+            "solarized-light",
+            "terminal",
+        ]
+    }
+
+    /// Every theme that can be selected: the built-ins, then the user's own, alphabetically.
+    ///
+    /// Reads the directory each call rather than caching, because the settings page's theme
+    /// picker is the obvious place to notice a theme you just wrote, and a cache would mean
+    /// restarting horde to see it.
+    pub fn names() -> Vec<String> {
+        let mut out: Vec<String> = Theme::builtin_names().iter().map(|s| s.to_string()).collect();
+        let Ok(dir) = std::fs::read_dir(crate::config::themes_dir()) else { return out };
+        let mut mine: Vec<String> = dir
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                (path.extension()? == "toml").then(|| path.file_stem()?.to_str().map(String::from))?
+            })
+            .filter(|n| !Theme::builtin_names().contains(&n.as_str()))
+            .collect();
+        mine.sort();
+        out.extend(mine);
+        out
     }
 
     /// Apply `[theme.custom]` overrides from config.
@@ -441,6 +706,56 @@ impl Theme {
         if let Some(c) = o.bg.as_deref().and_then(parse_color) {
             self.bg = c;
         }
+        // All sixteen or none: a table where four entries moved and twelve did not is not a
+        // palette, it is two palettes fighting. A short or unparseable list leaves the base
+        // theme's table alone rather than half-applying.
+        if let Some(list) = &o.ansi {
+            let parsed: Vec<Rgb> = list.iter().filter_map(|s| parse_color(s)).collect();
+            if parsed.len() == 16 {
+                self.ansi.copy_from_slice(&parsed);
+            }
+        }
+        // The syntax palette is computed from `ui` and `ansi`, both of which may have just
+        // moved. Without this a custom theme recolours everything except code.
+        self.syntax = Syntax::from(&self.ui, &self.ansi);
+    }
+
+    /// Load a theme from `~/.config/horde/themes/<name>.toml`.
+    ///
+    /// Returns `Err` with something worth printing when the file is there but wrong, and
+    /// `Ok(None)` when it simply is not there — the caller wants to tell those apart, because
+    /// a typo in a theme name and a broken theme file need different sentences.
+    pub fn from_file(name: &str) -> Result<Option<Theme>, String> {
+        Theme::from_dir(&crate::config::themes_dir(), name)
+    }
+
+    /// [`Theme::from_file`], against a named directory.
+    ///
+    /// Split out so the loader can be tested against a temp directory rather than by setting
+    /// `HORDE_CONFIG_DIR` -- tests share a process, and an env var one of them writes is an
+    /// env var all the others read.
+    pub fn from_dir(dir: &std::path::Path, name: &str) -> Result<Option<Theme>, String> {
+        // A name is a filename. Anything with a separator in it is either a mistake or an
+        // attempt to read a file somewhere else, and neither should be honoured.
+        if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+            return Err(format!("{name:?} is not a usable theme name"));
+        }
+        let path = dir.join(format!("{name}.toml"));
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let file: ThemeFile =
+            toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let base_name = file.base.as_deref().unwrap_or("horde");
+        let mut theme = Theme::builtin(base_name)
+            .ok_or_else(|| format!("{}: unknown base theme {base_name:?}", path.display()))?;
+        theme.apply_overrides(&file.colors);
+        // The file's own name, not the base's: this is a theme in its own right and has to
+        // come back out of `[theme] name` as the thing that was asked for.
+        theme.name = name.to_string();
+        Ok(Some(theme))
     }
 
     /// Resolve a terminal cell color to RGB.
@@ -600,11 +915,226 @@ pub struct ThemeOverrides {
     pub selection: Option<String>,
     pub fg: Option<String>,
     pub cursor: Option<String>,
+    /// ANSI 0-15, all sixteen or none.
+    ///
+    /// The chrome colours above only restyle what horde draws. These are what every program
+    /// *inside* a pane paints with, so without them a custom theme repaints the borders and
+    /// leaves vim looking like the theme you were trying to replace.
+    ///
+    /// All-or-nothing rather than sparse because a half-replaced ANSI table is the one way to
+    /// get a palette that is neither of the two themes it came from.
+    pub ansi: Option<Vec<String>>,
+}
+
+/// A theme read from `~/.config/horde/themes/<name>.toml`.
+///
+/// The same fields as `[theme.custom]` plus a `base` to start from, because "gruvbox but the
+/// accent is orange" should be three lines rather than a full palette. Flattened so a theme
+/// file is a flat list of colours with no section headers to remember.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeFile {
+    /// The built-in this starts from. Defaults to `horde`.
+    pub base: Option<String>,
+    #[serde(flatten)]
+    pub colors: ThemeOverrides,
+}
+
+/// A theme file to start editing, written out from a built-in.
+///
+/// Not a full dump. Every field horde reads would be ninety lines of hex, and the reader's
+/// job then starts with working out which nine of them matter. `base` carries the rest, and
+/// what is written here is the palette people actually reach for -- with the ANSI sixteen
+/// commented out, because they are the ones you want when you want them and noise otherwise.
+pub fn starter_file(t: &Theme) -> String {
+    let hex = |c: Rgb| format!("\"#{:02x}{:02x}{:02x}\"", c.r, c.g, c.b);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# A horde theme. Anything you leave out follows `base`, so this file can stay short.\n\
+         # Colours may be \"#rgb\", \"#rrggbb\", \"rgb(r, g, b)\" or an ANSI name like \"cyan\".\n\
+         base = \"{}\"\n\n",
+        t.name
+    ));
+    let rows: [(&str, Rgb, &str); 12] = [
+        ("accent", t.ui.accent, "focused borders, the active tab, a finished agent"),
+        ("accent_alt", t.ui.accent_alt, "the second highlight, where two would collide"),
+        ("bg", t.ui.bg, "the page behind panes, and the terminal background"),
+        ("panel_bg", t.ui.panel_bg, "sidebar and drawers, a shade off `bg`"),
+        ("text", t.ui.text, ""),
+        ("text_dim", t.ui.text_dim, ""),
+        ("text_faint", t.ui.text_faint, "comments, and anything you are meant to skip"),
+        ("border", t.ui.border, ""),
+        ("working", t.ui.working, "an agent mid-turn"),
+        ("blocked", t.ui.blocked, "an agent waiting on you"),
+        ("serving", t.ui.serving, "a dev server that is up"),
+        ("selection", t.ui.selection, "on a light theme this should darken, not lighten"),
+    ];
+    for (name, color, note) in rows {
+        let note = if note.is_empty() { String::new() } else { format!("   # {note}") };
+        out.push_str(&format!("{name} = {}{note}\n", hex(color)));
+    }
+    out.push_str(
+        "\n# The sixteen colours every program *inside* a pane paints with. All or nothing:\n\
+         # a half-replaced table is two palettes fighting. Uncomment to take them over.\n",
+    );
+    out.push_str("# ansi = [\n");
+    const SLOTS: [&str; 16] = [
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+        "bright black", "bright red", "bright green", "bright yellow",
+        "bright blue", "bright magenta", "bright cyan", "bright white",
+    ];
+    for (i, c) in t.ansi.iter().enumerate() {
+        out.push_str(&format!("#   {}, # {}\n", hex(*c), SLOTS[i]));
+    }
+    out.push_str("# ]\n");
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The file `horde theme edit` writes has to be a file `horde` can read.
+    ///
+    /// These are two separate pieces of code -- a formatter and a serde struct -- and nothing
+    /// but this holds them together. A `deny_unknown_fields` struct plus a generator that
+    /// emits one key it does not know about means the first thing a new user does with the
+    /// feature is hit an error.
+    #[test]
+    fn the_starter_file_round_trips_through_the_parser() {
+        for name in Theme::builtin_names() {
+            let base = Theme::builtin(name).unwrap();
+            let text = starter_file(&base);
+            let parsed: ThemeFile = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("{name}: the file we write does not parse: {e}\n{text}"));
+            assert_eq!(parsed.base.as_deref(), Some(*name));
+
+            // And the colours in it round-trip to the same theme, so an untouched copy is
+            // genuinely the theme it says it is rather than a near-miss.
+            let mut rebuilt = Theme::builtin(name).unwrap();
+            rebuilt.apply_overrides(&parsed.colors);
+            assert_eq!(rebuilt.ui.accent, base.ui.accent, "{name}");
+            assert_eq!(rebuilt.ui.bg, base.ui.bg, "{name}");
+            assert_eq!(rebuilt.ui.selection, base.ui.selection, "{name}");
+        }
+    }
+
+    /// The ANSI block is commented out, so an untouched copy must leave the base's table
+    /// alone rather than arriving as an empty list that wipes it.
+    #[test]
+    fn an_untouched_copy_keeps_the_base_ansi_table() {
+        let base = Theme::gruvbox();
+        let parsed: ThemeFile = toml::from_str(&starter_file(&base)).unwrap();
+        assert!(parsed.colors.ansi.is_none(), "the ansi block should still be commented out");
+        let mut rebuilt = Theme::gruvbox();
+        rebuilt.apply_overrides(&parsed.colors);
+        assert_eq!(rebuilt.ansi, base.ansi);
+    }
+
+    /// All sixteen or none. Four moved and twelve not is not a palette, it is two palettes.
+    #[test]
+    fn a_short_or_broken_ansi_list_leaves_the_table_alone() {
+        let base = Theme::horde();
+        for list in [
+            vec!["#ff0000".to_string(); 15],
+            vec!["#ff0000".to_string(); 17],
+            {
+                let mut v = vec!["#ff0000".to_string(); 16];
+                v[3] = "not a colour".into();
+                v
+            },
+        ] {
+            let mut t = Theme::horde();
+            t.apply_overrides(&ThemeOverrides { ansi: Some(list), ..Default::default() });
+            assert_eq!(t.ansi, base.ansi, "a partial table was applied");
+        }
+        // ...and a complete one is.
+        let mut t = Theme::horde();
+        t.apply_overrides(&ThemeOverrides {
+            ansi: Some(vec!["#ff0000".to_string(); 16]),
+            ..Default::default()
+        });
+        assert_eq!(t.ansi[0], Rgb::new(255, 0, 0));
+        // The syntax palette is built from `ansi` and `ui`, so it has to have been recomputed.
+        assert_eq!(t.syntax.type_name, Rgb::new(255, 0, 0), "syntax still on the old table");
+    }
+
+    /// The whole point, end to end: three lines on disk become a theme.
+    #[test]
+    fn a_three_line_theme_file_inherits_everything_it_does_not_say() {
+        let dir = std::env::temp_dir().join(format!("horde-theme-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mine.toml"),
+            "base = \"gruvbox\"\naccent = \"#ff8800\"\n",
+        )
+        .unwrap();
+
+        let t = Theme::from_dir(&dir, "mine").unwrap().expect("the file is there");
+        assert_eq!(t.name, "mine", "a theme file is a theme in its own right");
+        assert_eq!(t.ui.accent, Rgb::new(0xff, 0x88, 0x00), "the one line it did say");
+        // ...and everything it did not.
+        let gruvbox = Theme::gruvbox();
+        assert_eq!(t.ansi, gruvbox.ansi, "the ANSI table should still be gruvbox's");
+        assert_eq!(t.ui.panel_bg, gruvbox.ui.panel_bg);
+        // Syntax follows the accent, because keywords are painted with it.
+        assert_eq!(t.syntax.keyword, Rgb::new(0xff, 0x88, 0x00));
+
+        // A file that is not there is not an error; a file that is there and wrong is.
+        assert!(Theme::from_dir(&dir, "absent").unwrap().is_none());
+        std::fs::write(dir.join("bad.toml"), "base = \"nope\"\n").unwrap();
+        assert!(Theme::from_dir(&dir, "bad").is_err(), "an unknown base must say so");
+        std::fs::write(dir.join("junk.toml"), "accent = [1, 2\n").unwrap();
+        assert!(Theme::from_dir(&dir, "junk").is_err(), "broken TOML must say so");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A built-in always wins, so nobody's `gruvbox.toml` quietly redefines what everyone
+    /// else means by the word.
+    #[test]
+    fn a_user_theme_cannot_shadow_a_builtin() {
+        assert_eq!(Theme::by_name("gruvbox").unwrap().ui.accent, Theme::gruvbox().ui.accent);
+        for n in Theme::builtin_names() {
+            assert!(Theme::builtin(n).is_some(), "{n} is listed but does not build");
+        }
+    }
+
+    /// A theme name is a filename, and a filename with a separator in it is either a mistake
+    /// or an attempt to read something that is not a theme.
+    #[test]
+    fn a_theme_name_cannot_escape_the_themes_directory() {
+        for bad in ["../config", "a/b", "", ".ssh/id_rsa"] {
+            assert!(Theme::from_file(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    /// Both light themes have to actually be light, or they are a dark theme with a typo.
+    /// The chrome is checked together because a light page with dark panels beside it is the
+    /// classic half-converted theme.
+    #[test]
+    fn the_light_themes_are_light_all_the_way_through() {
+        let lum =
+            |c: Rgb| (0.2126 * c.r as f32 + 0.7152 * c.g as f32 + 0.0722 * c.b as f32) / 255.0;
+        for name in ["rose-pine-dawn", "solarized-light"] {
+            let t = Theme::builtin(name).unwrap();
+            assert!(lum(t.ui.bg) > 0.8, "{name}: the page is not light ({:.2})", lum(t.ui.bg));
+            assert!(lum(t.ui.panel_bg) > 0.8, "{name}: the panels are dark beside a light page");
+            assert!(lum(t.ui.text) < 0.5, "{name}: the text is not dark");
+            // On paper a highlight is a shadow. A selection lighter than the page it sits on
+            // is invisible, which is the single most common way a light theme is wrong.
+            assert!(
+                lum(t.ui.selection) < lum(t.ui.bg),
+                "{name}: the selection is lighter than the page"
+            );
+            // Faint text still has to be readable, which is where inverted dark themes fail.
+            assert!(
+                lum(t.ui.bg) - lum(t.ui.text_faint) > 0.15,
+                "{name}: faint text vanishes into the page"
+            );
+        }
+    }
 
     #[test]
     fn parses_every_supported_color_form() {
@@ -641,7 +1171,7 @@ mod tests {
     #[test]
     fn every_named_theme_loads() {
         for n in Theme::names() {
-            assert_eq!(&Theme::by_name(n).expect(n).name, n);
+            assert_eq!(Theme::by_name(&n).unwrap_or_else(|| panic!("{n}")).name, n);
         }
         assert!(Theme::by_name("nope").is_none());
     }
@@ -679,7 +1209,7 @@ mod tests {
     #[test]
     fn every_theme_hands_out_distinct_visible_project_accents() {
         for name in Theme::names() {
-            let t = Theme::by_name(name).unwrap();
+            let t = Theme::by_name(&name).unwrap();
             let ramp = t.space_accents();
             for (i, c) in ramp.iter().enumerate() {
                 assert_ne!(*c, t.ui.panel_bg, "{name} slot {i} is invisible on the panel");

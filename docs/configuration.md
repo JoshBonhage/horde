@@ -37,7 +37,9 @@ scrollback = 10000
 shell = "/bin/zsh"          # defaults to $SHELL
 
 [theme]
-# horde · tokyo-night · catppuccin · gruvbox · terminal
+# horde · tokyo-night · catppuccin · gruvbox · nord · rose-pine
+# rose-pine-dawn (light) · solarized-light (light) · terminal
+# ...or the name of any theme of your own in ~/.config/horde/themes/
 name = "horde"
 # Colours projects are tinted with, by position. Six slots; a short list replaces only the
 # ones you name. A space stores which *slot* it uses, not a colour, so retinting here moves
@@ -52,6 +54,8 @@ working = "#f0c674"
 #         border_focus working blocked done idle unknown serving ok warn error selection
 #         fg cursor
 # accepts #rgb, #rrggbb, rgb(r,g,b), or an ANSI colour name
+# ...plus `ansi`, the sixteen colours programs inside a pane paint with. All sixteen or
+# none: a half-replaced table is two palettes fighting, so a short list is ignored.
 
 # Roles you have named, and how each is drawn. Declaring one styles it; it does not permit
 # it — `horde pane role %2 anything` works whether or not it appears here.
@@ -170,6 +174,46 @@ Without that, roles would fragment and stop being the thing they exist to be.
 
 An undeclared role still works, and gets a glyph of `◆` and a colour derived from its name,
 stable across runs and projects. `[[roles]]` only chooses how a role looks.
+
+## Themes of your own
+
+`[theme.custom]` restyles the theme you are on. A **theme file** is a theme in its own right:
+it has a name, it shows up in the settings-page picker, and it is one file you can send
+somebody.
+
+```sh
+horde theme list                          # built-ins, then yours
+horde theme edit gruvbox --as mine        # writes ~/.config/horde/themes/mine.toml
+```
+
+Then `[theme] name = "mine"`.
+
+The file is a `base` plus whatever you change. Everything you leave out follows the base, so a
+real theme can be three lines:
+
+```toml
+# ~/.config/horde/themes/mine.toml
+base = "gruvbox"
+accent = "#ff8800"
+bg = "#0a0a0a"
+```
+
+`base` must be a built-in — a theme file cannot base itself on another theme file, because
+that is a cycle nobody has asked for. A built-in name always wins, so writing `gruvbox.toml`
+gets you the bundled gruvbox rather than quietly redefining the word for yourself.
+
+`horde theme edit` writes the colours worth touching plus the ANSI sixteen, commented out.
+Uncomment them to take over what programs *inside* your panes paint with — the chrome keys
+only restyle what horde draws, so without `ansi` your custom theme recolours the borders and
+leaves vim looking like the theme you were replacing.
+
+## Light themes
+
+`rose-pine-dawn` and `solarized-light`. Light is not dark inverted, and three things are
+decided differently in them: `text_faint` stays readable rather than fading to nothing,
+`selection` *darkens* the page instead of lightening it, and the ANSI normals are the darker
+half of each hue so a yellow string is not a blank line. If you write your own light theme,
+those are the three that will catch you.
 
 ## `theme = "terminal"`
 

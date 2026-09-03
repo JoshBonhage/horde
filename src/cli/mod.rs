@@ -32,6 +32,23 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+pub enum ThemeCmd {
+    /// Every theme horde can use: the built-ins, then your own.
+    List,
+    /// Write a theme out to `themes/<name>.toml` so you can edit it.
+    ///
+    /// The file is a `base` plus the colours worth touching, not a full palette dump:
+    /// anything left out keeps following the base, so a two-line file stays a two-line file.
+    Edit {
+        /// The theme to start from. Defaults to the one in your config.
+        name: Option<String>,
+        /// What to call the copy. Defaults to `<name>-mine`.
+        #[arg(long = "as")]
+        rename: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum Command {
     /// Run the daemon in the foreground (normally started automatically).
     Daemon {
@@ -49,6 +66,14 @@ pub enum Command {
         /// Binary to hand over to. Defaults to the one running this command.
         #[arg(long)]
         exe: Option<String>,
+    },
+    /// List themes, or write one out as a file you can edit.
+    ///
+    ///   horde theme list
+    ///   horde theme edit gruvbox --as mine    # ~/.config/horde/themes/mine.toml
+    Theme {
+        #[command(subcommand)]
+        cmd: ThemeCmd,
     },
     /// Show daemon status.
     Status,
@@ -643,6 +668,7 @@ pub fn run(cmd: Command) -> Result<()> {
             println!("daemon stopped");
         }
 
+        Command::Theme { cmd } => return theme_cmd(cmd),
         Command::Status => {
             let v = call("server.status", json!({}))?;
             print_kv(&v);
@@ -1734,6 +1760,61 @@ mod tests {
                 assert!(!now);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+}
+
+
+/// `horde theme list` / `horde theme edit`.
+///
+/// Both are offline: a theme is a file on disk and a palette compiled in, so neither needs a
+/// daemon. That matters for `edit` in particular -- the point is to write the file *before*
+/// starting horde with it.
+fn theme_cmd(cmd: ThemeCmd) -> Result<()> {
+    use std::io::Write as _;
+    let dir = crate::config::themes_dir();
+    match cmd {
+        ThemeCmd::List => {
+            let builtin = crate::theme::Theme::builtin_names();
+            for name in crate::theme::Theme::names() {
+                let own = if builtin.contains(&name.as_str()) { "" } else { "  (yours)" };
+                println!("{name}{own}");
+            }
+            println!("\nyour themes live in {}", dir.display());
+            Ok(())
+        }
+        ThemeCmd::Edit { name, rename } => {
+            // The configured theme is the one you are looking at, which is almost always the
+            // one you want to start from.
+            let from = match name {
+                Some(n) => n,
+                None => crate::config::Config::load().0.theme.name,
+            };
+            let base = crate::theme::Theme::builtin(&from).ok_or_else(|| {
+                anyhow!(
+                    "{from:?} is not a built-in theme. A copy has to start from one of: {}",
+                    crate::theme::Theme::builtin_names().join(", ")
+                )
+            })?;
+            let to = rename.unwrap_or_else(|| format!("{from}-mine"));
+            if crate::theme::Theme::builtin(&to).is_some() {
+                return Err(anyhow!(
+                    "{to:?} is a built-in theme name, and a built-in always wins — \
+                     pick another with --as"
+                ));
+            }
+            let path = dir.join(format!("{to}.toml"));
+            if path.exists() {
+                return Err(anyhow!("{} already exists", path.display()));
+            }
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+            let mut f = std::fs::File::create(&path)
+                .with_context(|| format!("writing {}", path.display()))?;
+            write!(f, "{}", crate::theme::starter_file(&base))?;
+            println!("wrote {}", path.display());
+            println!("edit it, then set `[theme] name = \"{to}\"` in config.toml");
+            Ok(())
         }
     }
 }

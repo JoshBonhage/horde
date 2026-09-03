@@ -24,7 +24,9 @@ scrollback = 10000
 # ---------------------------------------------------------------------------
 
 [theme]
-# horde · tokyo-night · catppuccin · gruvbox · terminal
+# horde · tokyo-night · catppuccin · gruvbox · nord · rose-pine
+# rose-pine-dawn (light) · solarized-light (light) · terminal
+# ...or any theme of your own: `horde theme edit gruvbox --as mine`
 name = "horde"
 
 [ui]
