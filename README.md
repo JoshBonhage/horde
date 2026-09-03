@@ -1,8 +1,9 @@
 <div align="center">
 
-<img src="assets/banner.svg" alt="horde — a terminal multiplexer for coding agents" width="100%">
+<img src="assets/logo.png" alt="horde" width="520">
 
-<br>
+**An agent-aware terminal multiplexer.** A background daemon owns every PTY, so your coding
+agents keep working when you close the terminal — and horde knows which ones need you.
 
 ![Rust](https://img.shields.io/badge/Rust-1.88+-2ea986?style=for-the-badge&labelColor=1a3b3b)
 ![Platform](https://img.shields.io/badge/macOS%20%C2%B7%20Linux-086c69?style=for-the-badge&labelColor=1a3b3b)
@@ -128,6 +129,7 @@ horde status          # what the daemon thinks is going on
 horde roster          # every agent: name, state, how long, and why
 horde digest          # what happened while you were away
 horde worktree list   # every tree horde made, and who is in each
+horde theme list      # every palette, the built-ins and your own
 horde stop            # stop the daemon and everything it owns
 ```
 
