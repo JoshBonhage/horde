@@ -90,6 +90,7 @@ struct RawConfig {
     vault: RawVault,
     #[serde(default)]
     setup: RawSetup,
+    kit: RawKit,
     #[serde(default)]
     keys: HashMap<String, String>,
     #[serde(default)]
@@ -193,6 +194,13 @@ struct RawSetup {
     done: Option<bool>,
 }
 
+/// One `[kit]` block.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawKit {
+    enabled: Option<bool>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawVault {
@@ -289,6 +297,7 @@ const SECTIONS: &[&str] = &[
     "models",
     "lsp",
     "approvals",
+    "kit",
 ];
 
 /// Deserialize one piece of the file, reporting a problem against that piece.
@@ -358,6 +367,7 @@ fn read_sections(text: &str, warnings: &mut Vec<String>) -> Option<RawConfig> {
             "ui" => raw.ui = part(value, &named, warnings).unwrap_or_default(),
             "vault" => raw.vault = part(value, &named, warnings).unwrap_or_default(),
             "setup" => raw.setup = part(value, &named, warnings).unwrap_or_default(),
+            "kit" => raw.kit = part(value, &named, warnings).unwrap_or_default(),
             "agents" => raw.agents = part(value, &named, warnings).unwrap_or_default(),
             "kanban" => raw.kanban = part(value, &named, warnings).unwrap_or_default(),
             "notifications" => {
@@ -642,6 +652,15 @@ pub struct Config {
     /// Recorded rather than inferred — see [`RawSetup`]. False means nobody has been walked
     /// through setup on this machine, whatever else the config file happens to contain.
     pub setup_done: bool,
+    /// Whether the knowledge-and-task kit is switched on: the vault, the board, the graph,
+    /// the file viewer and editor, LSP.
+    ///
+    /// Defaults to whether the binary was built with `--features full`, and is overridable
+    /// either way in `[kit]`. Both directions matter: someone on a plain build who wants to
+    /// try the kit should not have to reinstall to find out, and someone on a full build who
+    /// only wants the multiplexer should not have to either. The feature flag decides what
+    /// you get by default and what is compiled in; this decides what is switched on.
+    pub kit: bool,
     /// Whether triggers may fire at all. Off by default: acting with nobody watching is a
     /// different promise from running side by side, and has to be asked for.
     pub unattended: bool,
@@ -773,6 +792,7 @@ impl Default for Config {
             task_nudge: false,
             max_fleet: 6,
             setup_done: false,
+            kit: cfg!(feature = "full"),
             board: true,
             // Empty: anyone may add. Naming roles here is opting into a hierarchy, which is a
             // choice about how you work rather than a default worth having.
@@ -1040,6 +1060,10 @@ impl Config {
         cfg.setup_done = raw.setup.done.unwrap_or(cfg.setup_done);
         cfg.board = raw.agents.board.unwrap_or(cfg.board);
 
+        if let Some(on) = raw.kit.enabled {
+            cfg.kit = on;
+        }
+
         // Approvals. Every field that decides *whether* a prompt is answered is required, and a
         // rule missing one is dropped with a reason rather than widened to a default — the
         // defaults that would make sense here ("any question", "any answer") are exactly the
@@ -1133,6 +1157,12 @@ impl Config {
         // `delivery` says where horde's *own* notifications go, and `off` still means silence.
         cfg.notify_command =
             raw.notifications.command.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+
+        // Before the rebinds, so `keys.kanban = "…"` in a config on a kit-less build reports
+        // an unknown action rather than silently rebinding a key that will never fire.
+        if !cfg.kit {
+            cfg.keys.without_kit();
+        }
 
         for (name, spec) in &raw.keys {
             match cfg.keys.rebind(name, spec) {
@@ -1545,6 +1575,8 @@ impl Default for Keymap {
             // Doors into the leader table that do not depend on the leader chord itself.
             // `prefix space` always works, whatever `ctrl+space` is doing in your terminal.
             ("leader", Trigger::Prefix(d("space")), Action::Leader),
+            // Kit bindings. Filtered out by `Keymap::without_kit` when the kit is off, so a
+            // plain build does not advertise keys that land on a toast.
             ("dashboard", Trigger::Prefix(d("0")), Action::Dashboard),
             ("notes", Trigger::Prefix(d("N")), Action::Notes),
             ("vault", Trigger::Prefix(d("V")), Action::Vault),
@@ -1629,7 +1661,53 @@ impl Default for Keymap {
     }
 }
 
+/// Actions that only exist when the kit is on.
+///
+/// One list, consulted by everything that has to decide whether to offer the kit: the keymap,
+/// the command palette, the menu, and `run_action` itself. Kept as data rather than as a
+/// `matches!` at each site because the sites drift apart otherwise — a binding that still
+/// fires an action nothing handles is how you get a key that lands on a toast.
+pub const KIT_ACTIONS: &[Action] = &[
+    Action::Dashboard,
+    Action::Notes,
+    Action::Vault,
+    Action::NoteNew,
+    Action::Files,
+    Action::Graph,
+    Action::Kanban,
+];
+
+impl Action {
+    /// Whether this action belongs to the kit rather than to the multiplexer.
+    pub fn is_kit(&self) -> bool {
+        KIT_ACTIONS.contains(self)
+    }
+}
+
 impl Keymap {
+    /// Drop every binding that would fire a kit action.
+    ///
+    /// The default map is built with no config in hand, so the filter happens on load. A key
+    /// left bound to something the build will not do is worse than an unbound key: it appears
+    /// in `?` help and in the settings page as though it works.
+    pub fn without_kit(&mut self) {
+        let mut kept = Vec::with_capacity(self.bindings.len());
+        let mut names: Vec<(String, usize)> = Vec::new();
+        let old: Vec<(String, usize)> =
+            self.names.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for (i, (trigger, action)) in self.bindings.drain(..).enumerate() {
+            if action.is_kit() {
+                continue;
+            }
+            if let Some((name, _)) = old.iter().find(|(_, idx)| *idx == i) {
+                names.push((name.clone(), kept.len()));
+            }
+            kept.push((trigger, action));
+        }
+        self.bindings = kept;
+        self.names = names.into_iter().collect();
+    }
+
     /// Point an existing action at a different key. `"prefix+x"` binds under the prefix,
     /// anything else binds directly.
     pub fn rebind(&mut self, name: &str, spec: &str) -> Result<()> {
@@ -2370,6 +2448,50 @@ bogus_action = "prefix+q"
                 "SECTIONS advertises `{section}` but read_sections does not route it: {warnings:?}"
             );
         }
+    }
+
+    /// The feature flag sets a default, not a ceiling: a plain build has to be able to switch
+    /// the kit on, and a full build has to be able to switch it off. Otherwise "try the kit"
+    /// and "I only wanted the multiplexer" both mean reinstalling.
+    #[test]
+    fn the_kit_switch_overrides_the_build_in_both_directions() {
+        let on = write_tmp("kit-on", "[kit]\nenabled = true\n");
+        assert!(Config::load_from(&on).0.kit, "config could not switch the kit on");
+        let _ = std::fs::remove_file(on);
+
+        let off = write_tmp("kit-off", "[kit]\nenabled = false\n");
+        assert!(!Config::load_from(&off).0.kit, "config could not switch the kit off");
+        let _ = std::fs::remove_file(off);
+
+        // And with nothing said, the build decides.
+        let quiet = write_tmp("kit-quiet", "scrollback = 100\n");
+        assert_eq!(Config::load_from(&quiet).0.kit, cfg!(feature = "full"));
+        let _ = std::fs::remove_file(quiet);
+    }
+
+    /// A key still bound to a kit action on a kit-less build is worse than no key at all: it
+    /// shows up in `?` help and on the settings page as though pressing it will do something.
+    #[test]
+    fn a_kitless_config_binds_no_key_to_a_kit_action() {
+        let p = write_tmp("kitless-keys", "[kit]\nenabled = false\n");
+        let (cfg, _) = Config::load_from(&p);
+        let stragglers: Vec<&Action> =
+            cfg.keys.bindings.iter().map(|(_, a)| a).filter(|a| a.is_kit()).collect();
+        assert!(stragglers.is_empty(), "still bound: {stragglers:?}");
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// ...and the opposite, or the filter could pass by deleting the whole map.
+    #[test]
+    fn a_kit_config_keeps_the_kit_keys_and_the_multiplexer_keys_both() {
+        let p = write_tmp("kitful-keys", "[kit]\nenabled = true\n");
+        let (cfg, _) = Config::load_from(&p);
+        assert!(cfg.keys.bindings.iter().any(|(_, a)| a.is_kit()), "the kit lost its keys");
+        assert!(
+            cfg.keys.bindings.iter().any(|(_, a)| matches!(a, Action::Detach)),
+            "the multiplexer lost its keys"
+        );
+        let _ = std::fs::remove_file(p);
     }
 
     /// The documented example is the first config most people copy, so one stale key there costs

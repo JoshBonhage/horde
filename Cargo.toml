@@ -67,7 +67,22 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 #   cargo build --no-default-features --features lang-markdown
 #     ... for a build that only knows notes, about 1 MiB of grammars.
 [features]
-default = ["languages"]
+# The multiplexer alone. This is horde, and it is complete: panes, tabs, spaces, agents,
+# the bus, worktrees. No grammars, so none of the compiled-C weight below.
+default = []
+
+# The knowledge-and-task kit layered over it: vault and notes, the board, the graph, the
+# file viewer and editor, LSP, inline images, syntax highlighting.
+#
+#   cargo install horde                    # the multiplexer
+#   cargo install horde --features full    # and the kit
+#
+# A build flag rather than a separate crate because the kit reaches into the same panes,
+# panels and protocol the multiplexer owns. What the flag *sets* is the default for
+# `[kit] enabled` in config, so a plain build can still switch the kit on and a full build
+# can switch it off — neither needs reinstalling to change its mind. See `docs/kit.md`.
+full = ["languages"]
+
 languages = [
     "lang-markdown", "lang-rust", "lang-typescript", "lang-javascript",
     "lang-python", "lang-json", "lang-toml", "lang-bash",

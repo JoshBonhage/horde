@@ -63,7 +63,7 @@ horde does. And when you're not there at all, it can act on its own.
 ## Quick start
 
 ```sh
-cargo build --release
+cargo build --release                               # or --features full, see below
 rm -f ~/.local/bin/horde && cp target/release/horde ~/.local/bin/
 codesign --force --sign - ~/.local/bin/horde        # macOS
 horde                                               # start the daemon, then attach
@@ -82,6 +82,21 @@ with `SIGKILL` and no output at all, including `horde --version`, while the same
 from anywhere else. It looks exactly like a broken daemon and isn't. Re-signing clears it.
 
 `ctrl+b d` detaches and your agents keep running. `ctrl+b ?` lists every key.
+
+### …and the kit, if you want it
+
+```sh
+cargo install horde                    # the multiplexer. 8.2 MiB
+cargo install horde --features full    # and the kit. 14.8 MiB
+```
+
+The **kit** is an optional layer: a vault of notes, a kanban board, a dependency graph, a file
+viewer and editor, language servers, inline images. The multiplexer is complete without it —
+nothing in the kit is load-bearing for panes, tabs, spaces, agents, the bus or worktrees.
+
+The flag sets a default rather than a ceiling: `[kit] enabled = true` switches it on in a plain
+build, `false` switches it off in a full one, and neither needs reinstalling to change its mind.
+[docs/kit.md](docs/kit.md) has the rest, including why it is a build flag and not a plugin.
 
 Upgrading a live session hands every PTY to the new binary over a socket, same pids
 throughout — but `horde upgrade` re-executes whichever binary is at the path the daemon was

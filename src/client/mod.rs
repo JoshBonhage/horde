@@ -1098,7 +1098,11 @@ fn shape_changed(old: &Snapshot, new: &Snapshot) -> bool {
 ///
 /// A pure function of the config so all three cases can be asserted, which none of them were.
 fn greet_mode(cfg: &Config) -> Mode {
-    if !cfg.setup_done {
+    if !cfg.kit {
+        // Nothing to arrive at: the walkthrough asks about the vault, and the dashboard is
+        // the kit's own front page. A plain build opens where it always did.
+        Mode::Terminal
+    } else if !cfg.setup_done {
         Mode::Setup { step: ui::setup::Step::Vault }
     } else if cfg.dashboard {
         Mode::Dashboard { sel: 0 }
@@ -4428,6 +4432,17 @@ fn run_action(
     action: Action,
     out: &mpsc::UnboundedSender<ClientFrame>,
 ) -> Result<()> {
+    // The backstop. Bindings are filtered on load and the palette and menu do not offer these,
+    // so reaching here means something got past all three — a stale config, a rebind, a
+    // `horde` subcommand. Saying so beats a keypress that silently does nothing.
+    if !app.cfg.kit && action.is_kit() {
+        app.toast(
+            NoticeLevel::Warn,
+            "that is part of the kit — install with `cargo install horde --features full`, \
+             or set `[kit] enabled = true`",
+        );
+        return Ok(());
+    }
     match action {
         Action::Cmd(cmd) => {
             // The redraw command is the escape hatch for a screen that has gone wrong, and
@@ -4999,7 +5014,8 @@ mod tests {
         // which is exactly what copying config.example.toml leaves you with.
         std::fs::write(
             &path,
-            "[vault]\nhome = \"~/notes\"\n\n[triggers]\nunattended = true\n",
+            "[kit]\nenabled = true\n\n[vault]\nhome = \"~/notes\"\n\n\
+             [triggers]\nunattended = true\n",
         )
         .unwrap();
         let (cfg, warnings) = Config::load_from(&path);
@@ -5011,7 +5027,7 @@ mod tests {
         );
 
         // And once it has run, it is not offered again.
-        std::fs::write(&path, "[setup]\ndone = true\n").unwrap();
+        std::fs::write(&path, "[kit]\nenabled = true\n\n[setup]\ndone = true\n").unwrap();
         let (cfg, _) = Config::load_from(&path);
         assert!(cfg.setup_done);
         assert!(
@@ -5027,7 +5043,7 @@ mod tests {
     /// both and used to swallow them.
     #[test]
     fn once_setup_is_done_the_start_screen_is_the_one_you_configured() {
-        let mut cfg = Config::default();
+        let mut cfg = kit_config();
         cfg.setup_done = true;
         cfg.dashboard = true;
         assert!(matches!(greet_mode(&cfg), Mode::Dashboard { .. }));
@@ -5192,8 +5208,15 @@ mod tests {
     // the daemon go, so asserting on it is how "did this key reach the pane or not" gets
     // answered without a socket.
 
+    /// The kit is on here whatever this build's default is: a test about the vault or the
+    /// board is describing what the kit does, not which flags CI passed. The tests that are
+    /// *about* the switch set it themselves.
+    fn kit_config() -> Config {
+        Config { kit: true, ..Config::default() }
+    }
+
     fn app_with_snapshot() -> App {
-        let mut app = App::new(Config::default());
+        let mut app = App::new(kit_config());
         app.snapshot = Some(crate::client::roster::tests::snap());
         app
     }
@@ -7290,7 +7313,7 @@ mod tests {
     fn every_attach_opens_on_the_start_screen() {
         for panes in [0, 3] {
             let mut app =
-                App::new_for_test(Config { setup_done: true, ..Config::default() });
+                App::new_for_test(Config { setup_done: true, ..kit_config() });
             let mut snap = crate::client::roster::tests::snap();
             snap.panes.truncate(panes);
             apply_frame(&mut app, ServerFrame::Snapshot(Box::new(snap)), &sink());

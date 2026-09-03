@@ -132,6 +132,15 @@ fn handle(eng: &mut Engine, req: &Request) -> R {
             "the task board is off — set agents.board = true in config.toml to enable it",
         ));
     }
+    // Same rule as the board above, for the same reason: an agent that read about
+    // `horde note` in a skill must be told the vault is not in this build, not handed an
+    // error from somewhere three layers down that reads like a bug.
+    if req.method.starts_with("vault.") && !eng.cfg.kit {
+        return Err(failed(
+            "the vault is part of the kit, which this build does not have switched on — \
+             install with `cargo install horde --features full`, or set [kit] enabled = true",
+        ));
+    }
     match req.method.as_str() {
         // -- server ------------------------------------------------------
         "ping" => Ok(json!({ "type": "pong", "protocol": crate::proto::PROTOCOL_VERSION })),
@@ -1323,6 +1332,36 @@ pub fn command_names() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The agent-facing half of the kit switch.
+    ///
+    /// An agent reads `horde note` in a skill file and calls it; on a build without the kit
+    /// that has to come back as a sentence naming the switch, not as an error from three
+    /// layers down that reads like a bug. Checked here rather than at the CLI because every
+    /// caller — `horde note`, the socket API, another agent — arrives through this door.
+    #[test]
+    fn the_vault_says_which_switch_is_off_rather_than_failing_obscurely() {
+        let mut eng = super::super::tests::engine_with_shell(Some("cat"));
+
+        eng.cfg.kit = false;
+        let req = Request {
+            id: "1".into(),
+            method: "vault.list".into(),
+            params: serde_json::json!({}),
+        };
+        let err = handle(&mut eng, &req).expect_err("the vault must refuse without the kit");
+        let text = format!("{err:?}");
+        assert!(text.contains("kit"), "the refusal does not name the kit: {text}");
+        assert!(text.contains("--features full"), "nor how to get it: {text}");
+
+        // And with the kit on it is handled rather than refused for this reason.
+        eng.cfg.kit = true;
+        let out = handle(&mut eng, &req);
+        assert!(
+            !format!("{out:?}").contains("--features full"),
+            "still refused with the kit on: {out:?}"
+        );
+    }
 
     /// An agent's spawn is scoped to the agent, not to the human's eyes.
     ///
